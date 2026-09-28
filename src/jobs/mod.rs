@@ -101,6 +101,16 @@ impl JobScheduler {
             info!("Federation discovery job started");
         }
 
+        // Announce this PDS to its relays (#462); a no-op unless federation and
+        // crawling are both on.
+        if self.context.federation_enabled {
+            crate::api::federation_crawl::spawn_crawl_requests(
+                &self.context,
+                None,
+                crate::api::federation_crawl::CrawlTrigger::Boot,
+            );
+        }
+
         // Spawn nonce cleanup job (Phase 4)
         if self.context.federation_enabled && self.context.nonce_store.is_some() {
             tokio::spawn(Self::nonce_cleanup_job(Arc::clone(&self)));

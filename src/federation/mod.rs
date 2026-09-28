@@ -8,6 +8,7 @@
 
 pub mod authentication;
 pub mod blob_fetch;
+pub mod crawl;
 pub mod discovery;
 pub mod dns_resolver;
 pub mod dpop;

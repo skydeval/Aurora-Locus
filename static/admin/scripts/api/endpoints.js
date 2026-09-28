@@ -104,6 +104,7 @@
     dismissPendingDiscovery: (body) => C().post('tools.aurora.ops.dismissPendingDiscovery', body),
     // v0.9 Federation Pattern-1 Phase D (#354) — relay runtime-switch (SuperAdmin).
     addRelayUrl: (body) => C().post('tools.aurora.ops.addRelayUrl', body),
+    requestRelayCrawl: (body) => C().post('tools.aurora.ops.requestRelayCrawl', body || {}),
     removeRelayUrl: (body) => C().post('tools.aurora.ops.removeRelayUrl', body),
     setFederationRelays: (body) => C().post('tools.aurora.ops.setFederationRelays', body),
     getVersionInfo: () => C().get('tools.aurora.ops.getVersionInfo'),

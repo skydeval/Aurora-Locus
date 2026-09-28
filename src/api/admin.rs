@@ -460,6 +460,12 @@ pub fn routes() -> (Router<AppContext>, Arc<RouteRegistry>) {
             post(set_federation_relays),
             CapsBuilder::new(Family::Ops),
         )
+        // #462 — ask relays to crawl this PDS now.
+        .route_with_caps(
+            "/xrpc/tools.aurora.ops.requestRelayCrawl",
+            post(request_relay_crawl),
+            CapsBuilder::new(Family::Ops),
+        )
         // ---- tools.aurora.moderator.* (chainlink #100 / Phase 3.3) ----
         //
         // Moderator-tier read endpoints. Five queries with shared
@@ -9878,6 +9884,72 @@ async fn set_federation_relays(
     Ok(Json(serde_json::json!({ "success": true, "relayUrls": req.relay_urls })))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestRelayCrawlRequest {
+    /// One relay from the live set; absent means every live relay.
+    #[serde(default)]
+    url: Option<String>,
+}
+
+/// `tools.aurora.ops.requestRelayCrawl` (#462, SuperAdmin) — ask relays to
+/// crawl this PDS now, one attempt each, and report per-relay results. Refused
+/// unless crawling is active (federation enabled and `federation.crawl_enabled`
+/// on), so the call never contradicts the advertised crawl setting.
+async fn request_relay_crawl(
+    State(ctx): State<AppContext>,
+    auth: AdminAuthContext,
+    Json(req): Json<RequestRelayCrawlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use crate::api::federation_crawl as crawl;
+    require_superadmin(&auth)?;
+    if !ctx.federation_enabled {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "FederationDisabled",
+            "federation is disabled".to_string(),
+        ));
+    }
+    if !crawl::crawl_active(&ctx).await {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "CrawlDisabled",
+            "relay crawl is disabled; enable it before requesting a crawl".to_string(),
+        ));
+    }
+    let live = crawl::live_relays(&ctx).await;
+    let targets = match req.url {
+        Some(url) if live.contains(&url) => vec![url],
+        Some(url) => {
+            return Err(json_error(
+                StatusCode::NOT_FOUND,
+                "NotPresent",
+                format!("{url} is not in the live relay set"),
+            ))
+        }
+        None => live,
+    };
+    if targets.is_empty() {
+        return Err(json_error(
+            StatusCode::CONFLICT,
+            "NoRelays",
+            "the live relay set is empty".to_string(),
+        ));
+    }
+    let results = crawl::request_crawl_from(
+        &ctx,
+        &targets,
+        crawl::CrawlTrigger::Manual,
+        &auth.did,
+        &[std::time::Duration::ZERO],
+    )
+    .await;
+    Ok(Json(serde_json::json!({
+        "hostname": crawl::crawl_hostname(&ctx),
+        "results": results,
+    })))
+}
+
 /// Relay server info
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -12429,7 +12501,7 @@ mod tests {
             r#""listAppeals","#,
             r#""getAppeal""#,
             r#"],"#,
-            // tools.aurora.ops (51 endpoints)
+            // tools.aurora.ops (52 endpoints)
             r#""tools.aurora.ops":["#,
             r#""getStats","#,
             r#""listAccounts","#,
@@ -12472,6 +12544,7 @@ mod tests {
             r#""addRelayUrl","#,
             r#""removeRelayUrl","#,
             r#""setFederationRelays","#,
+            r#""requestRelayCrawl","#,
             r#""triggerRotation","#,
             // v0.9 Arc D (#225) — kryphocron operator read cohort.
             r#""getSubstrateInfo","#,
@@ -13410,6 +13483,119 @@ mod tests {
             count_chain_rows(&ctx, "account.update_handle", Some("did:plc:hh")).await,
             0
         );
+    }
+
+    // ---------- #462: tools.aurora.ops.requestRelayCrawl ----------
+
+    async fn crawl_ctx(federation: bool, crawl: bool, relays: Vec<String>) -> AppContext {
+        create_test_context_with(move |c| {
+            c.federation.enabled = federation;
+            c.federation.crawl_enabled = crawl;
+            c.federation.relay_urls = relays;
+        })
+        .await
+    }
+
+    async fn call_request_crawl(
+        ctx: &AppContext,
+        auth: AdminAuthContext,
+        url: Option<&str>,
+    ) -> Result<serde_json::Value, (StatusCode, String)> {
+        request_relay_crawl(
+            State(ctx.clone()),
+            auth,
+            Json(RequestRelayCrawlRequest {
+                url: url.map(str::to_string),
+            }),
+        )
+        .await
+        .map(|Json(v)| v)
+        .map_err(|(status, Json(body))| (status, body["error"].as_str().unwrap_or("").to_string()))
+    }
+
+    #[tokio::test]
+    async fn request_relay_crawl_asks_every_live_relay() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let a = crate::federation::crawl::test_relay::start(&[200]).await;
+        let b = crate::federation::crawl::test_relay::start(&[500]).await;
+        let ctx = crawl_ctx(true, true, vec![a.url.clone(), b.url.clone()]).await;
+
+        let body = call_request_crawl(&ctx, superadmin_test_auth(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(body["hostname"], "localhost:2583");
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["url"], a.url.as_str());
+        assert_eq!(results[0]["ok"], true);
+        assert_eq!(results[1]["ok"], false);
+        assert_eq!(results[1]["attempts"], 1, "manual requests do not back off");
+        assert_eq!(a.received().len(), 1);
+        assert_eq!(b.received().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn request_relay_crawl_targets_one_relay() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let a = crate::federation::crawl::test_relay::start(&[200]).await;
+        let b = crate::federation::crawl::test_relay::start(&[200]).await;
+        let ctx = crawl_ctx(true, true, vec![a.url.clone(), b.url.clone()]).await;
+
+        let body = call_request_crawl(&ctx, superadmin_test_auth(), Some(&b.url))
+            .await
+            .unwrap();
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert!(a.received().is_empty());
+        assert_eq!(b.received().len(), 1);
+
+        let err = call_request_crawl(
+            &ctx,
+            superadmin_test_auth(),
+            Some("https://elsewhere.example"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, (StatusCode::NOT_FOUND, "NotPresent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_relay_crawl_refusals() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let relays = vec!["https://relay.example".to_string()];
+
+        let ctx = crawl_ctx(true, true, relays.clone()).await;
+        let err = call_request_crawl(&ctx, admin_test_auth(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN, "SuperAdmin only");
+
+        let ctx = crawl_ctx(false, true, relays.clone()).await;
+        let err = call_request_crawl(&ctx, superadmin_test_auth(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            (StatusCode::CONFLICT, "FederationDisabled".to_string())
+        );
+
+        let ctx = crawl_ctx(true, false, relays).await;
+        let err = call_request_crawl(&ctx, superadmin_test_auth(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, (StatusCode::CONFLICT, "CrawlDisabled".to_string()));
+
+        let ctx = crawl_ctx(true, true, vec![]).await;
+        let err = call_request_crawl(&ctx, superadmin_test_auth(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, (StatusCode::CONFLICT, "NoRelays".to_string()));
     }
 
     // ---------- #460: getRelayConfig reports the LIVE relay set ----------

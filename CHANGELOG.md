@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The PDS asks its relays to crawl it (`com.atproto.sync.requestCrawl`) when federation and relay crawl are both on: at startup, as soon as relay crawl is switched on, and for each relay added to the relay set, retrying failures with backoff and recording each request in the audit trail. Previously nothing told a relay the PDS existed, so a new PDS was never indexed unless the operator called each relay by hand. SuperAdmins can also request a crawl on demand (`tools.aurora.ops.requestRelayCrawl`, for all relays or one)
+
 ### Changed
 
 - `.env.example` sets `RUST_LOG=info` (was `info,aurora_locus=debug`), so a copied example config doesn't write debug-level logs

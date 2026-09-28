@@ -241,7 +241,18 @@ async fn switch_relay_set(
         }
     }
 
-    // 5. Success audit.
+    // 5. Ask newly added relays to crawl this PDS (#462; no-op unless crawling
+    //    is active).
+    let added = crate::api::federation_crawl::newly_added(&current, &new_relays);
+    if !added.is_empty() {
+        crate::api::federation_crawl::spawn_crawl_requests(
+            ctx,
+            Some(added),
+            crate::api::federation_crawl::CrawlTrigger::RelayAdded,
+        );
+    }
+
+    // 6. Success audit.
     let (action, payload) = match &op {
         RelayOp::Add { url } => (
             ACTION_RELAY_ADDED,

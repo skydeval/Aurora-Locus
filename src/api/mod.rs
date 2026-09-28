@@ -24,6 +24,7 @@ pub mod auto_label_rules;
 pub mod escalation_rules;
 pub mod federation_discovery;
 pub mod federation_peers;
+pub mod federation_crawl;
 pub mod federation_relays;
 pub mod integration_hooks;
 pub mod lexicon_migration;

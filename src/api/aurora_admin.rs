@@ -5404,6 +5404,16 @@ pub async fn set_runtime_setting(
             .await?
     };
 
+    // #462 — switching crawling on announces this PDS to its relays right away
+    // (spawn_crawl_requests re-checks that crawling is active).
+    if input.key == FEDERATION_CRAWL_ENABLED_KEY && input.value == serde_json::Value::Bool(true) {
+        crate::api::federation_crawl::spawn_crawl_requests(
+            &ctx,
+            None,
+            crate::api::federation_crawl::CrawlTrigger::CrawlEnabled,
+        );
+    }
+
     // v0.9 Arc D (#223) — propagate a cadence change to the live
     // aurora-locus-standard rotation oracle, so it takes effect on the next
     // encode without a restart (§6.4.2). In-memory atomic store; the next
@@ -6922,6 +6932,47 @@ mod tests {
         .await;
         assert!(!off.federation_enabled);
         assert!(off.federation_auth.is_none(), "subsystems down when disabled");
+    }
+
+    /// #462 wiring tripwire: switching `federation.crawl_enabled` on through
+    /// the real setter must announce this PDS to the live relays, not just
+    /// store the flag.
+    #[tokio::test]
+    async fn enabling_crawl_at_runtime_requests_a_crawl() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let relay = crate::federation::crawl::test_relay::start(&[200]).await;
+        let url = relay.url.clone();
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(move |c| {
+            c.federation.enabled = true;
+            c.federation.crawl_enabled = false;
+            c.federation.relay_urls = vec![url];
+        })
+        .await;
+
+        let _ = set_runtime_setting(
+            State(ctx.clone()),
+            c4_super(),
+            Json(SetRuntimeSettingInput {
+                key: FEDERATION_CRAWL_ENABLED_KEY.to_string(),
+                value: serde_json::json!(true),
+                rationale: "announce to relays".to_string(),
+            }),
+        )
+        .await
+        .expect("save ok");
+
+        for _ in 0..100 {
+            if !relay.received().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            relay.received(),
+            vec![serde_json::json!({ "hostname": "localhost:2583" })]
+        );
     }
 
     #[tokio::test]
