@@ -657,9 +657,11 @@ pub async fn seed_peer_allowlist(ctx: &AppContext) -> Result<SeedOutcome, PdsErr
 
 /// Phase D (#354 / addendum §A6) — boot-seed `federation.policy.relay-urls` from
 /// `FederationConfig.relay_urls`. Gated on `federation_enabled`: a disabled
-/// deployment skips (the empty relay set is its correct steady state); an enabled
-/// deployment with no configured relays is a real error (min-1 invariant) that
-/// raises the boot-seed-failure flag. Idempotent (seed-if-absent).
+/// deployment skips. An enabled deployment seeds whatever is configured, and an
+/// empty list is a valid seed (#460: relays are optional; before, it raised the
+/// boot-seed-failure flag and froze every federation-policy mutation).
+/// Idempotent (seed-if-absent): after first boot the stored set is the truth
+/// and the env value is ignored.
 pub async fn seed_relay_urls(
     ctx: &AppContext,
     federation_enabled: bool,
@@ -668,12 +670,6 @@ pub async fn seed_relay_urls(
         return Ok(SeedOutcome::SkippedNoFallback);
     }
     let relays = ctx.config.federation.relay_urls.clone();
-    if relays.is_empty() {
-        return Err(PdsError::SeedFailedMinimumViolation {
-            key: FEDERATION_POLICY_RELAY_URLS_KEY.to_string(),
-            reason: "federation enabled but FederationConfig.relay_urls is empty".to_string(),
-        });
-    }
 
     let exists = sqlx::query("SELECT 1 FROM runtime_settings WHERE key = $1")
         .bind(FEDERATION_POLICY_RELAY_URLS_KEY)
@@ -866,6 +862,15 @@ pub async fn run_federation_boot_seed(ctx: &AppContext) {
     record(FEDERATION_ENABLED_KEY, seed_federation_enabled(ctx).await);
     // §2.2 (#398) — service.public_url.
     record(SERVICE_PUBLIC_URL_KEY, seed_service_public_url(ctx).await);
+
+    // #460 — the live relay set follows the stored set, not the env seed, so a
+    // relay change made in the panel survives a restart.
+    crate::api::federation_relays::load_live_relays_from_store(ctx).await;
+
+    // #463 — clear pending discoveries left by the removed relay "discovery".
+    if let Err(e) = crate::api::federation_discovery::purge_urlless_pending_discoveries(ctx).await {
+        tracing::error!(error = ?e, "pending-discovery purge failed");
+    }
 
     if !failed_keys.is_empty() {
         let _ = emit(
@@ -1191,22 +1196,57 @@ mod tests {
             SeedOutcome::SkippedNoFallback
         );
 
-        // Enabled but no relays configured → real error (min-1 violation).
-        assert!(matches!(
-            seed_relay_urls(&ctx, true).await,
-            Err(PdsError::SeedFailedMinimumViolation { .. })
-        ));
+        // Enabled with no relays configured → seeds the empty set (#460; this
+        // used to fail the boot seed and freeze federation-policy mutations).
+        assert_eq!(
+            seed_relay_urls(&ctx, true).await.unwrap(),
+            SeedOutcome::Seeded { entries_seeded: 0 }
+        );
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM runtime_settings WHERE key = $1")
+                .bind(FEDERATION_POLICY_RELAY_URLS_KEY)
+                .fetch_optional(&ctx.account_db)
+                .await
+                .unwrap();
+        assert_eq!(stored.as_deref(), Some("[]"));
+        assert_eq!(
+            seed_relay_urls(&ctx, true).await.unwrap(),
+            SeedOutcome::AlreadySeeded
+        );
     }
 
     #[tokio::test]
-    async fn boot_seed_failure_sets_flag_and_audit() {
+    async fn federation_without_relays_boots_clean() {
         let _g = serial().lock().await;
-        // Federation enabled with NO relays → relay-urls seed fails → flag set.
         let ctx = test_support::create_test_context_with(|c| {
             c.federation.enabled = true;
             c.federation.relay_urls = vec![];
         })
         .await;
+        run_federation_boot_seed(&ctx).await;
+        use std::sync::atomic::Ordering;
+        assert!(!ctx.boot_seed_failed.load(Ordering::Acquire));
+        assert!(guard_boot_seed(&ctx).is_ok());
+    }
+
+    #[tokio::test]
+    async fn boot_seed_failure_sets_flag_and_audit() {
+        let _g = serial().lock().await;
+        let ctx = test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.relay_urls = vec!["https://relay.example".to_string()];
+        })
+        .await;
+        // Make the relay-urls seed's INSERT fail at the database, so exactly one
+        // key fails while the others seed.
+        sqlx::query(
+            "CREATE TRIGGER fail_relay_seed BEFORE INSERT ON runtime_settings \
+             WHEN NEW.key = 'federation.policy.relay-urls' \
+             BEGIN SELECT RAISE(ABORT, 'injected seed failure'); END",
+        )
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
         run_federation_boot_seed(&ctx).await;
         use std::sync::atomic::Ordering;
         assert!(ctx.boot_seed_failed.load(Ordering::Acquire));

@@ -53,6 +53,7 @@ const ACTION_PENDING_DISMISSED: &str = "federation.pending_discovery_dismissed";
 const ACTION_PENDING_DISMISS_ABORTED: &str = "federation.pending_discovery_dismiss_aborted";
 const ACTION_PENDING_EVICTED: &str = "federation.pending_discovery_evicted";
 const ACTION_SURFACING_ABORTED: &str = "federation.pending_discovery_surfacing_aborted";
+const ACTION_PENDING_PURGED: &str = "federation.pending_discoveries_purged";
 
 const MODE_ALLOWLIST_ONLY: &str = "allowlist-only";
 const MODE_AUTO_ACCEPT: &str = "auto-accept";
@@ -302,7 +303,7 @@ pub async fn process_scan(
             SOURCE_DIAGNOSTIC,
             serde_json::json!({
                 "scan_id": scan_id,
-                "relays": ctx.config.federation.relay_urls,
+                "source": "known_instances",
                 "mode": mode.as_str(),
                 "discovered_count": instances.len(),
             }),
@@ -342,6 +343,51 @@ pub async fn seed_pending_discoveries(ctx: &AppContext) -> Result<SeedOutcome, P
         "pending-discoveries surface seeded at boot",
     )
     .await
+}
+
+/// Remove pending-discovery entries that have no URL (#463). Every one of them
+/// came from the removed relay "discovery", which recorded user accounts from a
+/// relay's `listRepos` as PDS instances; a real peer always has a URL. Runs at
+/// every boot and is a no-op once the queue is clean. Emits one
+/// `pending_discoveries_purged` audit entry when it removes anything. Returns
+/// the number of entries removed.
+pub async fn purge_urlless_pending_discoveries(ctx: &AppContext) -> Result<usize, FedPeerError> {
+    for _ in 0..MAX_CAS_RETRIES {
+        let raw = read_runtime_row_value(ctx, FEDERATION_POLICY_PENDING_DISCOVERIES_KEY).await;
+        let pending = parse_pending(&raw);
+        let before = pending.len();
+        let kept: Vec<PendingEntry> = pending
+            .into_iter()
+            .filter(|e| !e.url.trim().is_empty())
+            .collect();
+        let removed = before - kept.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let new =
+            serde_json::to_string(&kept).map_err(|e| FedPeerError::Internal(e.to_string()))?;
+        if write_pending(ctx, raw.as_deref(), &new, SYSTEM_DID).await? {
+            if let Err(e) = emit(
+                ctx,
+                SYSTEM_DID,
+                ACTION_PENDING_PURGED,
+                SOURCE_DIAGNOSTIC,
+                serde_json::json!({ "removed": removed, "remaining": kept.len(), "reason": "no_url" }),
+                "removed pending discoveries without a URL (relay listRepos accounts)",
+            )
+            .await
+            {
+                tracing::error!(error = ?e, "pending-discovery purge: audit emit failed");
+            }
+            tracing::info!(
+                removed,
+                remaining = kept.len(),
+                "purged URL-less pending discoveries"
+            );
+            return Ok(removed);
+        }
+    }
+    Err(FedPeerError::CasExhausted)
 }
 
 /// Seed-if-absent for a single scalar runtime key + a one-shot seed audit.
@@ -577,6 +623,34 @@ mod tests {
             set_discovery_mode(&ctx, "did:plc:op", "bogus").await,
             Err(FedPeerError::InvalidMode(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_urlless_pending_entries_once() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let ctx = crate::api::federation_peers::test_support::ctx_with_peers(&[]).await;
+        seed_pending_discoveries(&ctx).await.unwrap();
+        // What the removed relay "discovery" left behind (accounts, no URL)
+        // alongside one real peer.
+        let instances = [
+            inst("did:plc:account1", ""),
+            inst("did:plc:real", "https://real.example"),
+            inst("did:plc:account2", "  "),
+        ];
+        process_scan(&ctx, &instances, DiscoveryMode::AllowlistOnly, false).await;
+        assert_eq!(read_pending(&ctx).await.len(), 3);
+
+        assert_eq!(purge_urlless_pending_discoveries(&ctx).await.unwrap(), 2);
+        let pending = read_pending(&ctx).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].did, "did:plc:real");
+        assert_eq!(audit_count(&ctx, ACTION_PENDING_PURGED).await, 1);
+
+        // Idempotent: a clean queue is left alone, with no further audit.
+        assert_eq!(purge_urlless_pending_discoveries(&ctx).await.unwrap(), 0);
+        assert_eq!(audit_count(&ctx, ACTION_PENDING_PURGED).await, 1);
     }
 
     #[tokio::test]

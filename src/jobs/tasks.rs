@@ -206,7 +206,7 @@ pub async fn cleanup_mod_event_seq(ctx: &AppContext) -> PdsResult<u64> {
 /// Trigger PDS discovery refresh (Phase 1)
 pub async fn refresh_pds_discovery(ctx: &AppContext) -> PdsResult<usize> {
     if let Some(discovery) = &ctx.pds_discovery {
-        discovery.refresh_instances().await?;
+        discovery.refresh_instances().await;
         let instances = discovery.get_known_instances().await;
         Ok(instances.len())
     } else {

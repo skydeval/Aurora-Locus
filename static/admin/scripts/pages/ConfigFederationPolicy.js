@@ -57,7 +57,7 @@
       '<p class="settings-help">For live federation status (peer count, recent events, last activity), see <a href="#ops/federation">Operations → Federation</a>.</p>' +
       '<div class="settings-grid">' +
       card('Federation', 'fed-enabled', 'The master federation switch (seeded from <code>PDS_FEDERATION_ENABLED</code>). Restart-required: saving records the change; restart to apply it. Disabling also refuses inbound federation requests immediately, before the restart.') +
-      card('Relay binding (boot seed)', 'fed-relays', 'The boot-time relay set, used at first startup when no runtime relay configuration exists. The <strong>live</strong> relay set is managed at <a href="#ops/federation">Operations → Federation</a>, where changes take effect without a restart. To change the boot default, set <code>PDS_FEDERATION_RELAY_URLS</code> and restart — this only affects fresh deployments with no runtime relay set.') +
+      card('Relay binding (boot seed)', 'fed-relays', 'The boot-time relay set, used at first startup when no runtime relay configuration exists. The <strong>live</strong> relay set (the relays this PDS asks to crawl it) is managed below and at <a href="#ops/federation">Operations → Federation</a>; changes take effect without a restart and survive restarts. <code>PDS_FEDERATION_RELAY_URLS</code> only seeds a fresh deployment with no stored relay set.') +
       card('AppView URL', 'fed-appview', 'Upstream AppView base URL (seeded from <code>PDS_APPVIEW_URL</code>). Editable; takes effect immediately on save.') +
       card('Trusted peer allowlist', 'fed-peers', 'Seeded at boot from <code>PDS_FEDERATION_PEER_PDS</code> (<code>did@url,…</code>); now runtime-mutable below (SuperAdmin). Controls the trusted-issuer allowlist and discovery bootstrap.') +
       card('Firehose', 'fed-firehose', 'Advertised firehose flag (seeded from <code>PDS_FEDERATION_FIREHOSE_ENABLED</code>). Editable; takes effect immediately on save.') +
@@ -86,7 +86,7 @@
       '<hr class="config-section-divider">' +
       '<section class="installed-themes-section">' +
       '  <h3>Peer discovery <span class="role-tag">SuperAdmin only</span></h3>' +
-      '  <p class="settings-help">How peers discovered via relays are handled. <strong>Allowlist-only</strong>: surface for review below. <strong>Auto-accept</strong>: trust automatically. <strong>Disabled</strong>: skip scheduled scans.</p>' +
+      '  <p class="settings-help">How newly discovered peers are handled. Relays are not a discovery source (their repo listings name accounts, not PDS hosts), so scans only re-check known instances. <strong>Allowlist-only</strong>: surface for review below. <strong>Auto-accept</strong>: trust automatically. <strong>Disabled</strong>: skip scheduled scans.</p>' +
       (isSuper ?
         '  <label style="display:block;">Discovery mode ' +
         '    <select id="fed-discovery-mode">' +
@@ -95,7 +95,7 @@
         '      <option value="discovery-disabled">Disabled (no scheduled discovery)</option>' +
         '    </select></label>' +
         '  <div id="fed-discovery-warning" style="display:none; padding:0.5rem; border-left:3px solid #b45309; background:#fef3c7; margin:0.4rem 0;">' +
-        '<strong>Auto-accept delegates trust to your relays.</strong> Any peer a relay reports will be trusted for federation without review. Use only with relays you fully trust.</div>'
+        '<strong>Auto-accept trusts discovered peers without review.</strong> Any peer a discovery scan finds will be trusted for federation. Use only when every discovery source is fully trusted.</div>'
         : '  <p class="settings-help">SuperAdmin role required to manage discovery.</p>') +
       '  <h4 style="margin-top:0.8rem;">Pending discoveries</h4>' +
       '  <p class="settings-help">Peers seen during scans, awaiting review. Bounded to the 100 most-recently-seen.</p>' +
@@ -106,7 +106,7 @@
       '<section class="installed-themes-section">' +
       '  <h3>Relay servers <span class="role-tag">SuperAdmin only</span></h3>' +
       '  <div id="fed-bootseed-banner" style="display:none; padding:0.5rem; border-left:3px solid #b91c1c; background:#fee2e2; margin-bottom:0.6rem;"></div>' +
-      '  <p class="settings-help">The relays this PDS connects to for the firehose. Changes take effect immediately (the firehose respawns against the new set). At least 1, at most 10.</p>' +
+      '  <p class="settings-help">The relays this PDS announces itself to: each is asked to crawl this PDS (<code>requestCrawl</code>) while Relay crawl is on. Changes take effect immediately. At most 10; the set may be empty.</p>' +
       '  <div id="fed-relays-manage">' + (isSuper ? 'Loading…' : '<p class="settings-help">SuperAdmin role required to manage relays.</p>') + '</div>' +
       (isSuper ?
         '  <div id="fed-relay-error" style="margin:0.4rem 0;"></div>' +
@@ -118,7 +118,7 @@
         '    <label style="display:block;">Relay URLs (one per line) <textarea id="fed-relay-switch-list" rows="3" style="width:100%;" placeholder="https://relay1\\nhttps://relay2"></textarea></label>' +
         '    <label style="display:block;">Transition mode ' +
         '      <select id="fed-relay-transition"><option value="graceful">graceful</option><option value="abrupt">abrupt</option></select></label>' +
-        '    <p class="settings-help" title="In v0.9 both modes perform the same firehose-respawn switch; your selection is recorded in the audit log. Reserved for future connection-draining work.">Transition mode is recorded in the audit log; both modes behave identically in v0.9.</p>' +
+        '    <p class="settings-help">Transition mode is recorded in the audit log; both modes behave identically.</p>' +
         '    <button type="button" class="btn-primary" id="fed-relay-switch">Replace relay set</button>' +
         '  </fieldset>'
         : '') +
@@ -421,7 +421,7 @@
   function renderRelayManagement(relays) {
     const host = document.getElementById('fed-relays-manage');
     if (!host) return;
-    if (!relays.length) { host.innerHTML = '<p class="settings-help">No relays bound.</p>'; return; }
+    if (!relays.length) { host.innerHTML = '<p class="settings-help">No relays. This PDS is not announced to any relay.</p>'; return; }
     host.innerHTML = relays.map(function (u) {
       return '<div class="hook-row" style="border-bottom:1px solid #ddd; padding:0.3rem 0;">' +
         '<code>' + esc(u) + '</code>' +
@@ -474,7 +474,7 @@
     if (!url) { global.AuroraToast.warning('URL is required.'); return; }
     try {
       await global.AuroraEndpoints.ops.addRelayUrl({ url: url });
-      global.AuroraToast.success('Relay added; firehose respawning.');
+      global.AuroraToast.success('Relay added.');
       document.getElementById('fed-relay-url').value = '';
       await loadPolicy();
     } catch (e) { handleRelayError(e, 'Add failed.'); }
@@ -484,7 +484,7 @@
     if (recoveryActive) { global.AuroraToast.danger('Disabled during recovery mode.'); return; }
     const r = await global.AuroraModal.destructiveConfirm({
       heading: 'Remove relay',
-      body: 'Remove ' + url + ' from the relay set? The firehose will respawn against the remaining relays.',
+      body: 'Remove ' + url + ' from the relay set? This PDS stops announcing itself to it.',
       confirmLabel: 'Remove relay',
     });
     if (!r.confirmed) return;
@@ -501,10 +501,17 @@
     const mode = (document.getElementById('fed-relay-transition') || {}).value || 'graceful';
     clearRelayError();
     const urls = raw.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
-    if (!urls.length) { global.AuroraToast.warning('At least 1 relay URL is required.'); return; }
+    if (!urls.length) {
+      const r = await global.AuroraModal.destructiveConfirm({
+        heading: 'Clear relay set',
+        body: 'Remove every relay? This PDS will not be announced to any relay until one is added.',
+        confirmLabel: 'Clear relays',
+      });
+      if (!r.confirmed) return;
+    }
     try {
       await global.AuroraEndpoints.ops.setFederationRelays({ relayUrls: urls, transitionMode: mode });
-      global.AuroraToast.success('Relay set replaced; firehose respawning.');
+      global.AuroraToast.success(urls.length ? 'Relay set replaced.' : 'Relay set cleared.');
       await loadPolicy();
     } catch (e) { handleRelayError(e, 'Replace failed.'); }
   }
@@ -678,7 +685,7 @@
     if (mode === 'auto-accept') {
       const r = await global.AuroraModal.destructiveConfirm({
         heading: 'Switch to auto-accept?',
-        body: 'Auto-accept trusts any peer your relays report, without review. Use only with fully-trusted relays.',
+        body: 'Auto-accept trusts any peer a discovery scan finds, without review. Use only when every discovery source is fully trusted.',
         confirmLabel: 'Enable auto-accept',
       });
       if (!r.confirmed) { await loadDiscovery(); return; }

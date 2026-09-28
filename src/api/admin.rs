@@ -9478,10 +9478,11 @@ struct FederationStatusResponse {
     enabled: bool,
     /// Service DID for this PDS
     service_did: String,
-    /// Number of configured relay servers
+    /// Number of relays in the live relay set
     relay_count: usize,
-    /// Whether relay client is connected
-    relay_connected: bool,
+    /// Whether this PDS is asking its relays to crawl it (#462): federation
+    /// enabled and relay crawl on
+    crawl_active: bool,
     /// Whether PDS discovery is enabled
     discovery_enabled: bool,
     /// Whether federated search is enabled
@@ -9499,7 +9500,8 @@ async fn get_federation_status(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> Result<Json<FederationStatusResponse>, (StatusCode, String)> {
-    let relay_connected = ctx.relay_client.is_some();
+    let relay_count = crate::api::federation_crawl::live_relays(&ctx).await.len();
+    let crawl_active = crate::api::federation_crawl::crawl_active(&ctx).await;
     let discovery_enabled = ctx.pds_discovery.is_some();
     let search_enabled = ctx.federated_search.is_some();
 
@@ -9510,22 +9512,19 @@ async fn get_federation_status(
         0
     };
 
-    // Get config info
-    let federation_config = &ctx.config.federation;
-
-    let status = if !federation_config.enabled {
-        "disabled".to_string()
-    } else if relay_connected {
-        "connected".to_string()
+    // There is no relay connection to report (#459: a PDS is crawled, it does
+    // not hold a relay firehose open), so status is simply on or off.
+    let status = if ctx.federation_enabled {
+        "active".to_string()
     } else {
-        "enabled_disconnected".to_string()
+        "disabled".to_string()
     };
 
     Ok(Json(FederationStatusResponse {
-        enabled: federation_config.enabled,
+        enabled: ctx.federation_enabled,
         service_did: ctx.config.service.service_did.clone(),
-        relay_count: federation_config.relay_urls.len(),
-        relay_connected,
+        relay_count,
+        crawl_active,
         discovery_enabled,
         search_enabled,
         known_instances,
@@ -9950,74 +9949,51 @@ async fn request_relay_crawl(
     })))
 }
 
-/// Relay server info
+/// One relay in the live set.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayServerInfo {
     url: String,
-    status: String,
 }
 
-/// Response for getRelayConfig endpoint
+/// Response for getRelayConfig (#460): the live relay set and whether this PDS
+/// is currently announcing itself to it.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RelayConfigResponse {
-    /// Configured relay servers
+    /// The live relay set (runtime changes included; may be empty)
     servers: Vec<RelayServerInfo>,
-    /// Reconnect interval in seconds
-    reconnect_interval: u64,
-    /// Buffer size for events
-    buffer_size: usize,
-    /// Whether compression is enabled
-    compression_enabled: bool,
-    /// Overall relay status
+    /// `disabled` (federation off), `no_servers` (empty set) or `active`
     status: String,
+    /// Whether requestCrawl is being sent: federation enabled and relay crawl on
+    crawl_active: bool,
+    /// The hostname announced to relays (host of the public service URL)
+    hostname: Option<String>,
 }
 
-/// Get relay configuration
-///
-/// Returns the current relay client configuration and server list.
+/// Get the live relay set and crawl state.
 async fn get_relay_config(
     State(ctx): State<AppContext>,
     _auth: AdminAuthContext,
 ) -> Result<Json<RelayConfigResponse>, (StatusCode, String)> {
-    let federation_config = &ctx.config.federation;
-    let has_relay = ctx.relay_client.is_some();
-
-    // The LIVE relay set (runtime relay switches land here), not the boot
-    // `PDS_FEDERATION_RELAY_URLS` seed (#460).
-    let live_relays: Vec<String> = match ctx.relay_client.as_ref() {
-        Some(client) => client.lock().await.servers().to_vec(),
-        None => federation_config.relay_urls.clone(),
-    };
-    let servers: Vec<RelayServerInfo> = live_relays
-        .iter()
-        .map(|url: &String| RelayServerInfo {
-            url: url.clone(),
-            status: if has_relay {
-                "configured".to_string()
-            } else {
-                "disabled".to_string()
-            },
-        })
+    use crate::api::federation_crawl as crawl;
+    let servers: Vec<RelayServerInfo> = crawl::live_relays(&ctx)
+        .await
+        .into_iter()
+        .map(|url| RelayServerInfo { url })
         .collect();
-
-    let status = if !federation_config.enabled {
-        "disabled".to_string()
+    let status = if !ctx.federation_enabled {
+        "disabled"
     } else if servers.is_empty() {
-        "no_servers".to_string()
-    } else if has_relay {
-        "active".to_string()
+        "no_servers"
     } else {
-        "inactive".to_string()
+        "active"
     };
-
     Ok(Json(RelayConfigResponse {
         servers,
-        reconnect_interval: 5, // Default from RelayConfig
-        buffer_size: 1000,     // Default from RelayConfig
-        compression_enabled: true,
-        status,
+        status: status.to_string(),
+        crawl_active: crawl::crawl_active(&ctx).await,
+        hostname: crawl::crawl_hostname(&ctx),
     }))
 }
 
@@ -10070,70 +10046,59 @@ async fn list_known_instances(
     Ok(Json(ListKnownInstancesResponse { instances, total }))
 }
 
-/// Trigger PDS discovery
-///
-/// Initiates discovery of PDS instances from configured relay servers.
+/// Re-check the known-instance registry now: prune stale instances and run
+/// the discovery scan over what remains (configured peers), honouring the
+/// discovery mode. #463: relays are no longer a discovery source (their
+/// `listRepos` lists accounts, not PDS hosts).
 async fn trigger_pds_discovery(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if let Some(ref discovery) = ctx.pds_discovery {
-        match discovery.discover_from_relays().await {
-            Ok(instances) => {
-                let rationale = format!("discovered {} PDS instances", instances.len());
-                audit_chain::insert_chain_entry_pool(
-                    &ctx.account_db,
-                    ctx.config.database.backend,
-                    AppendEntryParams {
-                        source: "manual",
-                        payload: None,
-                        actor_did: &auth.did,
-                        action: "federation.discover",
-                        subject: None,
-                        rationale: &rationale,
-                        snapshot_id: None,
-                        event_id: None,
-                        cascade_subjects: &[],
-                        cascade_snapshot_ids: &[],
-                    },
-                )
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-                // v0.9 Federation Pattern-1 Phase C (#353 / Step 7): manual
-                // scans bypass the scheduler-level discovery-disabled
-                // short-circuit (operator-initiated), but per-peer processing
-                // still honors the active mode. No scheduled_discovery_ran audit
-                // (manual keeps its own federation.discover above).
-                let mode = crate::api::federation_discovery::current_mode(&ctx).await;
-                crate::api::federation_discovery::process_scan(&ctx, &instances, mode, false).await;
-
-                tracing::info!(
-                    "Admin {} triggered PDS discovery: {} instances found",
-                    auth.did,
-                    instances.len()
-                );
-
-                Ok(Json(serde_json::json!({
-                    "success": true,
-                    "discovered_count": instances.len(),
-                    "message": format!("Discovered {} PDS instances", instances.len()),
-                })))
-            }
-            Err(e) => {
-                tracing::warn!("PDS discovery failed: {}", e);
-                Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Discovery failed: {}", e),
-                ))
-            }
-        }
-    } else {
-        Err((
+    let Some(ref discovery) = ctx.pds_discovery else {
+        return Err((
             StatusCode::BAD_REQUEST,
             "Federation discovery is not enabled".to_string(),
-        ))
-    }
+        ));
+    };
+    discovery.refresh_instances().await;
+    let instances = discovery.get_known_instances().await;
+    let rationale = format!("scanned {} known PDS instances", instances.len());
+    audit_chain::insert_chain_entry_pool(
+        &ctx.account_db,
+        ctx.config.database.backend,
+        AppendEntryParams {
+            source: "manual",
+            payload: None,
+            actor_did: &auth.did,
+            action: "federation.discover",
+            subject: None,
+            rationale: &rationale,
+            snapshot_id: None,
+            event_id: None,
+            cascade_subjects: &[],
+            cascade_snapshot_ids: &[],
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // v0.9 Federation Pattern-1 Phase C (#353 / Step 7): manual scans bypass
+    // the scheduler-level discovery-disabled short-circuit (operator-initiated),
+    // but per-peer processing still honors the active mode. No
+    // scheduled_discovery_ran audit (manual keeps its own federation.discover).
+    let mode = crate::api::federation_discovery::current_mode(&ctx).await;
+    crate::api::federation_discovery::process_scan(&ctx, &instances, mode, false).await;
+
+    tracing::info!(
+        "Admin {} triggered PDS discovery: {} known instances",
+        auth.did,
+        instances.len()
+    );
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "discovered_count": instances.len(),
+        "message": format!("Scanned {} known PDS instances", instances.len()),
+    })))
 }
 
 /// Get nonce store status (service auth nonces)

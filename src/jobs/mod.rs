@@ -574,22 +574,18 @@ impl JobScheduler {
             if let Some(discovery) = &scheduler.context.pds_discovery {
                 info!("Running PDS discovery refresh");
 
-                match discovery.refresh_instances().await {
-                    Ok(_) => {
-                        let instances = discovery.get_known_instances().await;
-                        info!("PDS discovery: {} instance(s) found", instances.len());
-                        // Mode-aware per-peer processing + scheduled_discovery_ran
-                        // audit (the scan_id is generated inside process_scan).
-                        crate::api::federation_discovery::process_scan(
-                            &scheduler.context,
-                            &instances,
-                            mode,
-                            true,
-                        )
-                        .await;
-                    }
-                    Err(e) => error!("Failed to refresh PDS instances: {}", e),
-                }
+                discovery.refresh_instances().await;
+                let instances = discovery.get_known_instances().await;
+                info!("PDS discovery: {} known instance(s)", instances.len());
+                // Mode-aware per-peer processing + scheduled_discovery_ran
+                // audit (the scan_id is generated inside process_scan).
+                crate::api::federation_discovery::process_scan(
+                    &scheduler.context,
+                    &instances,
+                    mode,
+                    true,
+                )
+                .await;
             }
         }
     }

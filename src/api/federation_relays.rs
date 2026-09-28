@@ -69,6 +69,31 @@ async fn read_relays(ctx: &AppContext) -> (Vec<String>, Option<String>) {
     (relays, raw)
 }
 
+/// Replace the live relay set with the stored `federation.policy.relay-urls`
+/// (#460). Called once at boot after seeding: the env value only seeds the
+/// store on first boot, and every later change lands in the store, so the
+/// store is the truth. A missing or unparseable row leaves the live set as is.
+pub async fn load_live_relays_from_store(ctx: &AppContext) {
+    let Some(client) = ctx.relay_client.as_ref() else {
+        return;
+    };
+    let Some(raw) = read_runtime_row_value(ctx, FEDERATION_POLICY_RELAY_URLS_KEY).await else {
+        return;
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(stored) => {
+            tracing::info!(
+                relays = stored.len(),
+                "live relay set loaded from the runtime store"
+            );
+            client.lock().await.reconfigure(&stored);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "stored relay set is unparseable; keeping the env seed")
+        }
+    }
+}
+
 /// `addRelayUrl` — append a relay, validate, switch. No `transition_mode`.
 pub async fn add_relay_url(ctx: &AppContext, operator_did: &str, url: &str) -> FedResult<()> {
     guard_recovery()?;
@@ -86,7 +111,8 @@ pub async fn add_relay_url(ctx: &AppContext, operator_did: &str, url: &str) -> F
     switch_relay_set(ctx, operator_did, relays, RelayOp::Add { url: url.to_string() }).await
 }
 
-/// `removeRelayUrl` — drop a relay, enforce min-1, switch. No `transition_mode`.
+/// `removeRelayUrl` — drop a relay and switch. The set may become empty (#460).
+/// No `transition_mode`.
 pub async fn remove_relay_url(ctx: &AppContext, operator_did: &str, url: &str) -> FedResult<()> {
     guard_recovery()?;
     let (relays, _) = read_relays(ctx).await;
@@ -94,15 +120,10 @@ pub async fn remove_relay_url(ctx: &AppContext, operator_did: &str, url: &str) -
         return Err(FedPeerError::NotPresent(url.to_string()));
     }
     let remaining: Vec<String> = relays.into_iter().filter(|u| u != url).collect();
-    if remaining.is_empty() {
-        return Err(FedPeerError::InvalidUrl(
-            "cannot remove the last relay (minimum 1 required)".to_string(),
-        ));
-    }
     switch_relay_set(ctx, operator_did, remaining, RelayOp::Remove { url: url.to_string() }).await
 }
 
-/// `setFederationRelays` — full-replace + switch. Carries `transition_mode`
+/// `setFederationRelays` — full-replace + switch; an empty list is allowed (#460). Carries `transition_mode`
 /// (audit-only — both values execute the same live-set swap).
 pub async fn set_federation_relays(
     ctx: &AppContext,
@@ -111,11 +132,6 @@ pub async fn set_federation_relays(
     transition_mode: &str,
 ) -> FedResult<()> {
     guard_recovery()?;
-    if relays.is_empty() {
-        return Err(FedPeerError::InvalidUrl(
-            "at least 1 relay is required".to_string(),
-        ));
-    }
     if relays.len() > MAX_RELAYS {
         return Err(FedPeerError::InvalidUrl(format!(
             "at most {MAX_RELAYS} relays allowed"
@@ -234,13 +250,6 @@ async fn switch_relay_set(
 
     let duration_ms = switch_start.elapsed().as_millis() as u64;
 
-    // 4. Refresh the discovery relay-list cache (best-effort).
-    if let Some(discovery) = ctx.pds_discovery.as_ref() {
-        if let Err(e) = discovery.refresh_relay_list(&new_relays).await {
-            tracing::error!(error = %e, "relay switch: discovery relay-list refresh failed");
-        }
-    }
-
     // 5. Ask newly added relays to crawl this PDS (#462; no-op unless crawling
     //    is active).
     let added = crate::api::federation_crawl::newly_added(&current, &new_relays);
@@ -315,6 +324,64 @@ mod tests {
         .await
     }
 
+    async fn live(ctx: &AppContext) -> Vec<String> {
+        ctx.relay_client
+            .as_ref()
+            .unwrap()
+            .lock()
+            .await
+            .servers()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn federation_without_relays_can_add_one_from_the_panel() {
+        let _g = serial().lock().await;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.relay_urls = vec![];
+        })
+        .await;
+        assert!(
+            ctx.relay_client.is_some(),
+            "relay set exists even when empty"
+        );
+        add_relay_url(&ctx, "did:plc:op", "https://r1.example")
+            .await
+            .unwrap();
+        assert_eq!(live(&ctx).await, vec!["https://r1.example".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn boot_loads_the_live_set_from_the_store() {
+        let _g = serial().lock().await;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.relay_urls = vec!["https://env-seed.example".to_string()];
+        })
+        .await;
+        // A previous boot's operator edit, already in the store.
+        sqlx::query(
+            "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(FEDERATION_POLICY_RELAY_URLS_KEY)
+        .bind(r#"["https://stored.example"]"#)
+        .bind("2026-01-01T00:00:00Z")
+        .bind("did:plc:op")
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        assert_eq!(
+            live(&ctx).await,
+            vec!["https://env-seed.example".to_string()]
+        );
+
+        crate::api::federation_peers::run_federation_boot_seed(&ctx).await;
+
+        assert_eq!(live(&ctx).await, vec!["https://stored.example".to_string()]);
+    }
+
     async fn audit_count(ctx: &AppContext, action: &str) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_chain_entry WHERE action = $1")
             .bind(action)
@@ -349,7 +416,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_then_absent_min_one_enforced() {
+    async fn remove_then_absent_and_last_relay_removable() {
         let _g = serial().lock().await;
         let ctx = ctx_with_relays().await;
         // Seed two relays via a full replace, then remove one.
@@ -365,11 +432,13 @@ mod tests {
         let (relays, _) = read_relays(&ctx).await;
         assert_eq!(relays, vec!["https://b.example".to_string()]);
         assert_eq!(audit_count(&ctx, ACTION_RELAY_REMOVED).await, 1);
-        // Removing the last relay is rejected (min-1).
-        assert!(matches!(
-            remove_relay_url(&ctx, "did:plc:op", "https://b.example").await,
-            Err(FedPeerError::InvalidUrl(_))
-        ));
+        // Removing the last relay is allowed (#460): the set may be empty.
+        remove_relay_url(&ctx, "did:plc:op", "https://b.example")
+            .await
+            .unwrap();
+        let (relays, _) = read_relays(&ctx).await;
+        assert!(relays.is_empty());
+        assert!(live(&ctx).await.is_empty(), "live set emptied too");
         // Removing an absent relay → NotPresent.
         assert!(matches!(
             remove_relay_url(&ctx, "did:plc:op", "https://absent.example").await,
@@ -392,11 +461,20 @@ mod tests {
         let (relays, _) = read_relays(&ctx).await;
         assert_eq!(relays.len(), 2);
         assert_eq!(audit_count(&ctx, ACTION_RELAY_SWITCHED).await, 1);
-        // Empty → reject.
-        assert!(matches!(
-            set_federation_relays(&ctx, "did:plc:op", vec![], "graceful").await,
-            Err(FedPeerError::InvalidUrl(_))
-        ));
+        // Empty is allowed (#460).
+        set_federation_relays(&ctx, "did:plc:op", vec![], "graceful")
+            .await
+            .unwrap();
+        assert!(read_relays(&ctx).await.0.is_empty());
+        assert!(live(&ctx).await.is_empty());
+        set_federation_relays(
+            &ctx,
+            "did:plc:op",
+            vec!["https://x.example".to_string()],
+            "graceful",
+        )
+        .await
+        .unwrap();
         // >10 → reject.
         let too_many: Vec<String> = (0..11).map(|i| format!("https://r{i}.example")).collect();
         assert!(matches!(

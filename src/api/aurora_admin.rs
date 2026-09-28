@@ -4472,7 +4472,8 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
             .is_some_and(|s| matches!(s, "allowlist-only" | "auto-accept" | "discovery-disabled")),
         FEDERATION_POLICY_PENDING_DISCOVERIES_KEY => is_valid_pending_discoveries(value),
         // v0.9 Federation Pattern-1 Phase D (#354 / addendum §A6) — relay-urls
-        // tightens from accept-any: JSON array, HTTPS, no-dup, 1..=10 entries.
+        // tightens from accept-any: JSON array, HTTPS, no-dup, 0..=10 entries
+        // (#460: empty is valid — relays are optional).
         FEDERATION_POLICY_RELAY_URLS_KEY => is_valid_relay_urls(value),
         // Key-rotation arc B2 (#373 / §4.6) — a strict bool. Rejects strings
         // ("true"), numbers (1), and any non-boolean shape so the gate-check's
@@ -4506,12 +4507,13 @@ fn is_valid_http_url(s: &str) -> bool {
 }
 
 /// v0.9 Federation Pattern-1 Phase D (#354) — relay-urls structural validator:
-/// a JSON array of 1..=10 unique HTTPS URL strings.
+/// a JSON array of at most 10 unique HTTPS URL strings. Empty is valid
+/// (#460): a PDS with no relays is simply not announced anywhere.
 fn is_valid_relay_urls(value: &serde_json::Value) -> bool {
     let Some(arr) = value.as_array() else {
         return false;
     };
-    if arr.is_empty() || arr.len() > 10 {
+    if arr.len() > 10 {
         return false;
     }
     let mut seen = std::collections::HashSet::new();

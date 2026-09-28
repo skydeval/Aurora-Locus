@@ -1,21 +1,25 @@
-// Allow dead_code - PDS discovery features for future use
-#![allow(dead_code)]
-
-//! PDS discovery for finding other instances in the federation
+//! The registry of known peer PDS instances.
 //!
-//! Enables automatic discovery of PDS instances through:
-//! - DNS records
-//! - Well-known endpoints
-//! - Relay server registries
-//! - Manual configuration
+//! Instances come from the configured peers (`PDS_FEDERATION_PEER_PDS`,
+//! registered at startup) and dev tooling. Federated search resolves peers
+//! through it, and the discovery scan re-checks it against the trusted-peer
+//! allowlist.
+//!
+//! (#463) This module used to also "discover" instances from each relay's
+//! `com.atproto.sync.listRepos`, which lists user *accounts*, not PDS hosts:
+//! every scan recorded up to a page of random network accounts as PDS
+//! instances with no URL, and in allowlist-only mode pushed each into the
+//! pending-discoveries queue. Relay-based discovery is gone.
 
-use crate::error::{PdsError, PdsResult};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::info;
+
+/// How long an instance with a `last_seen` stamp stays known without being
+/// seen again.
+const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
 /// PDS instance information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -35,181 +39,24 @@ pub struct PdsInstance {
     /// Number of users (if public)
     pub user_count: Option<i64>,
 
-    /// Last seen timestamp
+    /// Last seen timestamp (unix seconds); `None` for configured peers, which
+    /// never go stale
     pub last_seen: Option<i64>,
 
     /// Supported features
     pub features: Vec<String>,
 }
 
-/// PDS discovery service
+/// The known-instance registry.
+#[derive(Default)]
 pub struct PdsDiscovery {
-    http_client: Client,
     known_instances: Arc<RwLock<HashMap<String, PdsInstance>>>,
-    /// v0.9 Federation Pattern-1 Phase D (#354 / addendum §A5): the relay list
-    /// is runtime-mutable now, so it is read fresh (snapshot-clone) per scan and
-    /// swapped by `refresh_relay_list` on an operator relay switch.
-    relay_servers: Arc<RwLock<Vec<String>>>,
 }
 
 impl PdsDiscovery {
-    /// Create a new PDS discovery service
-    pub fn new(relay_servers: Vec<String>) -> Self {
-        Self {
-            http_client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap(),
-            known_instances: Arc::new(RwLock::new(HashMap::new())),
-            relay_servers: Arc::new(RwLock::new(relay_servers)),
-        }
-    }
-
-    /// v0.9 Federation Pattern-1 Phase D (#354) — swap the relay list used by
-    /// subsequent discovery scans. Called from the relay-switch primitive after
-    /// the CAS-write succeeds. Write-lock held only for the swap.
-    pub async fn refresh_relay_list(&self, new_relays: &[String]) -> PdsResult<()> {
-        let mut current = self.relay_servers.write().await;
-        *current = new_relays.to_vec();
-        Ok(())
-    }
-
-    /// Discover PDS instances from relay servers
-    pub async fn discover_from_relays(&self) -> PdsResult<Vec<PdsInstance>> {
-        let mut all_instances = Vec::new();
-
-        // Snapshot-clone the relay list under a brief read-lock, then iterate the
-        // clone — the per-relay HTTP awaits must NOT hold the lock (would starve
-        // `refresh_relay_list` writers). Mirrors the TrustedPeerSet snapshot.
-        let relay_servers = {
-            let guard = self.relay_servers.read().await;
-            guard.clone()
-        };
-        for relay_url in &relay_servers {
-            match self.fetch_instances_from_relay(relay_url).await {
-                Ok(instances) => {
-                    info!(
-                        "Discovered {} PDS instances from relay {}",
-                        instances.len(),
-                        relay_url
-                    );
-                    all_instances.extend(instances);
-                }
-                Err(e) => {
-                    warn!("Failed to discover from relay {}: {}", relay_url, e);
-                }
-            }
-        }
-
-        // Update known instances
-        let mut known = self.known_instances.write().await;
-        for instance in &all_instances {
-            known.insert(instance.did.clone(), instance.clone());
-        }
-
-        Ok(all_instances)
-    }
-
-    /// Fetch PDS instances from a relay server
-    async fn fetch_instances_from_relay(&self, relay_url: &str) -> PdsResult<Vec<PdsInstance>> {
-        let url = format!("{}/xrpc/com.atproto.sync.listRepos", relay_url);
-
-        debug!("Fetching PDS list from relay: {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to connect to relay: {}", e)))?;
-
-        if !response.status().is_success() {
-            return Err(PdsError::Internal(format!(
-                "Relay returned error: {}",
-                response.status()
-            )));
-        }
-
-        // Parse response
-        let relay_response: RelayResponse = response
-            .json()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to parse relay response: {}", e)))?;
-
-        // Convert to PdsInstance format
-        let instances: Vec<PdsInstance> = relay_response
-            .repos
-            .into_iter()
-            .map(|repo| {
-                // Extract PDS URL from repo DID
-                // In practice, would resolve DID to get PDS endpoint
-                PdsInstance {
-                    did: repo.did,
-                    url: String::new(), // Would be filled by DID resolution
-                    name: None,
-                    open_registrations: false,
-                    user_count: None,
-                    last_seen: Some(chrono::Utc::now().timestamp()),
-                    features: vec![],
-                }
-            })
-            .collect();
-
-        Ok(instances)
-    }
-
-    /// Discover PDS via well-known endpoint
-    pub async fn discover_via_wellknown(&self, domain: &str) -> PdsResult<PdsInstance> {
-        // Arc 12 §5.3.2 Gap 1: localhost-aware scheme for
-        // remote peer URLs so two-instance Phase B against
-        // localhost:2584 doesn't try https://.
-        let scheme = crate::config::derive_url_scheme(domain);
-        let url = format!("{}://{}/.well-known/atproto-did", scheme, domain);
-
-        debug!("Discovering PDS via well-known: {}", url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PdsError::NotFound(format!("Failed to fetch well-known: {}", e)))?;
-
-        let did = response
-            .text()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to read response: {}", e)))?;
-
-        // Fetch PDS info
-        let pds_url = format!("{}://{}", scheme, domain);
-        self.fetch_pds_info(&pds_url, &did).await
-    }
-
-    /// Fetch PDS server information
-    async fn fetch_pds_info(&self, pds_url: &str, did: &str) -> PdsResult<PdsInstance> {
-        let url = format!("{}/xrpc/com.atproto.server.describeServer", pds_url);
-
-        let response = self
-            .http_client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to fetch PDS info: {}", e)))?;
-
-        let info: ServerDescription = response
-            .json()
-            .await
-            .map_err(|e| PdsError::Internal(format!("Failed to parse PDS info: {}", e)))?;
-
-        Ok(PdsInstance {
-            did: did.to_string(),
-            url: pds_url.to_string(),
-            name: None,
-            open_registrations: !info.invite_code_required.unwrap_or(true),
-            user_count: None,
-            last_seen: Some(chrono::Utc::now().timestamp()),
-            features: vec![],
-        })
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Get all known PDS instances
@@ -218,7 +65,7 @@ impl PdsDiscovery {
         known.values().cloned().collect()
     }
 
-    /// Add a manually configured PDS instance
+    /// Add (or replace) a known PDS instance
     pub async fn add_instance(&self, instance: PdsInstance) {
         let mut known = self.known_instances.write().await;
         known.insert(instance.did.clone(), instance);
@@ -230,58 +77,31 @@ impl PdsDiscovery {
         known.get(did).cloned()
     }
 
-    /// Find PDS instances that accept registrations
-    pub async fn find_open_instances(&self) -> Vec<PdsInstance> {
-        let known = self.known_instances.read().await;
-        known
-            .values()
-            .filter(|instance| instance.open_registrations)
-            .cloned()
-            .collect()
-    }
-
-    /// Update instance list (should be called periodically)
-    pub async fn refresh_instances(&self) -> PdsResult<()> {
-        info!("Refreshing PDS instance list...");
-
-        // Discover from relays
-        self.discover_from_relays().await?;
-
-        // Remove stale instances (not seen in 7 days)
-        let cutoff = chrono::Utc::now().timestamp() - (7 * 24 * 60 * 60);
+    /// Drop instances not seen for seven days. Instances without a `last_seen`
+    /// stamp (configured peers) are kept.
+    pub async fn refresh_instances(&self) {
+        let cutoff = chrono::Utc::now().timestamp() - STALE_AFTER_SECS;
         let mut known = self.known_instances.write().await;
-        known.retain(|_, instance| instance.last_seen.map(|ts| ts > cutoff).unwrap_or(true));
-
+        known.retain(|_, instance| instance.last_seen.is_none_or(|ts| ts > cutoff));
         info!("Instance list refreshed: {} known instances", known.len());
-
-        Ok(())
     }
-}
-
-/// Response from relay server
-#[derive(Debug, Deserialize)]
-struct RelayResponse {
-    repos: Vec<RepoEntry>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement pagination for relay discovery
-    cursor: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RepoEntry {
-    did: String,
-}
-
-/// Server description response
-#[derive(Debug, Deserialize)]
-struct ServerDescription {
-    #[serde(rename = "inviteCodeRequired")]
-    invite_code_required: Option<bool>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instance(did: &str, last_seen: Option<i64>) -> PdsInstance {
+        PdsInstance {
+            did: did.to_string(),
+            url: format!("https://{}.example.com", did.trim_start_matches("did:plc:")),
+            name: None,
+            open_registrations: false,
+            user_count: None,
+            last_seen,
+            features: vec![],
+        }
+    }
 
     #[test]
     fn test_pds_instance_serialization() {
@@ -298,95 +118,53 @@ mod tests {
         let json = serde_json::to_string(&instance).unwrap();
         let deserialized: PdsInstance = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.did, "did:plc:test123");
-        assert!(deserialized.open_registrations);
-        assert_eq!(deserialized.features.len(), 2);
+        assert_eq!(deserialized, instance);
     }
 
     #[tokio::test]
-    async fn test_pds_discovery_creation() {
-        let discovery = PdsDiscovery::new(vec![
-            "https://relay1.example.com".to_string(),
-            "https://relay2.example.com".to_string(),
-        ]);
-
-        assert_eq!(discovery.relay_servers.read().await.len(), 2);
-
-        let instances = discovery.get_known_instances().await;
-        assert_eq!(instances.len(), 0); // No instances discovered yet
-    }
-
-    /// v0.9 Federation Pattern-1 Phase D (#354) — `refresh_relay_list` swaps the
-    /// relay list used by subsequent scans.
-    #[tokio::test]
-    async fn refresh_relay_list_swaps_relays() {
-        let discovery = PdsDiscovery::new(vec!["https://r1.example".to_string()]);
-        assert_eq!(discovery.relay_servers.read().await.len(), 1);
-        discovery
-            .refresh_relay_list(&[
-                "https://r2.example".to_string(),
-                "https://r3.example".to_string(),
-            ])
-            .await
-            .unwrap();
-        let current = discovery.relay_servers.read().await;
-        assert_eq!(current.len(), 2);
-        assert_eq!(current[0], "https://r2.example");
+    async fn new_registry_is_empty() {
+        let discovery = PdsDiscovery::new();
+        assert!(discovery.get_known_instances().await.is_empty());
     }
 
     #[tokio::test]
     async fn test_add_and_find_instance() {
-        let discovery = PdsDiscovery::new(vec![]);
-
-        let instance = PdsInstance {
-            did: "did:plc:test123".to_string(),
-            url: "https://pds.example.com".to_string(),
-            name: None,
-            open_registrations: true,
-            user_count: None,
-            last_seen: Some(chrono::Utc::now().timestamp()),
-            features: vec![],
-        };
-
-        discovery.add_instance(instance.clone()).await;
+        let discovery = PdsDiscovery::new();
+        discovery
+            .add_instance(instance(
+                "did:plc:test123",
+                Some(chrono::Utc::now().timestamp()),
+            ))
+            .await;
 
         let found = discovery.find_by_did("did:plc:test123").await;
-        assert!(found.is_some());
-        assert_eq!(found.unwrap().url, "https://pds.example.com");
+        assert_eq!(found.unwrap().url, "https://test123.example.com");
+        assert!(discovery.find_by_did("did:plc:absent").await.is_none());
     }
 
     #[tokio::test]
-    async fn test_find_open_instances() {
-        let discovery = PdsDiscovery::new(vec![]);
-
-        // Add open instance
+    async fn refresh_drops_stale_instances_and_keeps_configured_peers() {
+        let discovery = PdsDiscovery::new();
+        let now = chrono::Utc::now().timestamp();
         discovery
-            .add_instance(PdsInstance {
-                did: "did:plc:open".to_string(),
-                url: "https://open.example.com".to_string(),
-                name: None,
-                open_registrations: true,
-                user_count: None,
-                last_seen: Some(chrono::Utc::now().timestamp()),
-                features: vec![],
-            })
+            .add_instance(instance("did:plc:fresh", Some(now)))
+            .await;
+        discovery
+            .add_instance(instance("did:plc:stale", Some(now - STALE_AFTER_SECS - 60)))
+            .await;
+        discovery
+            .add_instance(instance("did:plc:configured", None))
             .await;
 
-        // Add closed instance
-        discovery
-            .add_instance(PdsInstance {
-                did: "did:plc:closed".to_string(),
-                url: "https://closed.example.com".to_string(),
-                name: None,
-                open_registrations: false,
-                user_count: None,
-                last_seen: Some(chrono::Utc::now().timestamp()),
-                features: vec![],
-            })
-            .await;
+        discovery.refresh_instances().await;
 
-        let open_instances = discovery.find_open_instances().await;
-        assert_eq!(open_instances.len(), 1);
-        assert_eq!(open_instances[0].did, "did:plc:open");
+        let mut dids: Vec<String> = discovery
+            .get_known_instances()
+            .await
+            .into_iter()
+            .map(|i| i.did)
+            .collect();
+        dids.sort();
+        assert_eq!(dids, ["did:plc:configured", "did:plc:fresh"]);
     }
 }

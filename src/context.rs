@@ -709,17 +709,20 @@ impl AppContext {
         }
 
         // The live relay set: relays this PDS announces itself to (#459 — a PDS
-        // is crawled by relays; it never consumes a relay's firehose).
-        let relay_client = if federation_enabled && !config.federation.relay_urls.is_empty() {
+        // is crawled by relays; it never consumes a relay's firehose). Present
+        // whenever federation is on, even with no relays, so the panel can add
+        // one (#460). Starts from the env seed; the federation boot seed then
+        // replaces it with the stored runtime set.
+        let relay_client = if federation_enabled {
             tracing::info!(
-                "Federation enabled with {} relay(s)",
+                "Federation enabled with {} configured relay(s)",
                 config.federation.relay_urls.len()
             );
             Some(Arc::new(tokio::sync::Mutex::new(RelayClient::new(
                 config.federation.relay_urls.clone(),
             ))))
         } else {
-            tracing::info!("Federation disabled or no relays configured");
+            tracing::info!("Federation disabled - no relay set");
             None
         };
 
@@ -731,7 +734,7 @@ impl AppContext {
             let auth = Arc::new(FederationAuthenticator::new(Arc::clone(&identity_resolver)));
 
             // PDS discovery for finding other instances
-            let discovery = Arc::new(PdsDiscovery::new(config.federation.relay_urls.clone()));
+            let discovery = Arc::new(PdsDiscovery::new());
 
             // Arc 12 §5.3.2 Gap 3: at-startup bootstrap of
             // peer-PDS map from `config.federation.peer_pds`.

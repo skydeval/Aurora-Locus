@@ -146,7 +146,7 @@ async fn refresh_discovery(
     _admin: AdminAuthContext,
 ) -> PdsResult<Json<RefreshResponse>> {
     if let Some(discovery) = &ctx.pds_discovery {
-        discovery.refresh_instances().await?;
+        discovery.refresh_instances().await;
         let count = discovery.get_known_instances().await.len();
         Ok(Json(RefreshResponse {
             success: true,
