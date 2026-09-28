@@ -180,7 +180,13 @@
       throw err;
     }
     if (res.status === 204) return null;
-    return await res.json();
+    // A 2xx with an empty body is a success with no output, not a parse
+    // error: XRPC procedures without an output schema (e.g.
+    // com.atproto.admin.updateAccountHandle) answer a bare 200. res.json()
+    // throws on an empty body, which surfaced as "Update failed" after a
+    // change had already been applied (#457).
+    const text = await res.text();
+    return text.trim() === '' ? null : JSON.parse(text);
   }
 
   // ---- Proactive near-expiry refresh (#442, Phase 4 · Commit 5) ----

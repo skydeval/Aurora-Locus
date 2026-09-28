@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Admin handle changes (`com.atproto.admin.updateAccountHandle`) now publish the new handle to the PLC directory for did:plc accounts and announce it on the firehose, so AppViews accept it; previously only the local record changed, leaving the account's DID document on the old handle and the new handle shown as invalid. A failed PLC update now fails the change and leaves the account's handle as it was, and behind an entryway the change is refused (the entryway owns handles)
 - `com.atproto.identity.updateHandle` to a handle on this PDS's own domains no longer fails after already updating the PLC directory (it tried to verify the new handle over HTTPS before the PDS had stored it); both handle-change paths now finish every check before anything is published
 - The admin panel's Update handle, Update email and Send password reset actions send their request after the rationale is submitted (previously the modal closed and nothing happened)
+- The admin panel no longer reports "Update failed: JSON.parse: unexpected end of data" after actions that succeed with an empty response, such as changing an account's handle; the change had been applied, only the success was misreported
 
 ## [0.10.1] - 2026-07-27
 
