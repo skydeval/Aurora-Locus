@@ -1,5 +1,6 @@
 /// Identity API endpoints
 /// Implements com.atproto.identity.* endpoints for handle and DID resolution
+use crate::identity::handle_validation::is_under_service_handle_domain;
 use crate::{
     auth::AuthContext,
     error::{PdsError, PdsResult},
@@ -85,112 +86,104 @@ pub async fn update_handle(
         return Ok(Json(()));
     }
 
-    // Standalone path (unchanged).
-    // Validate handle format
-    if req.handle.is_empty() {
-        return Err(PdsError::Validation("Handle cannot be empty".to_string()));
-    }
-
-    // Basic handle validation (lowercase, alphanumeric + dots/hyphens)
-    if !req
-        .handle
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
-    {
-        return Err(PdsError::Validation(
-            "Handle contains invalid characters".to_string(),
-        ));
-    }
-
-    // Check handle length (max 253 chars for DNS compatibility)
-    if req.handle.len() > 253 {
-        return Err(PdsError::Validation(
-            "Handle too long (max 253 characters)".to_string(),
-        ));
-    }
-
-    // Normalize handle to lowercase
-    let new_handle = req.handle.to_lowercase();
-
-    // For did:plc, submit handle update to PLC directory.
-    //
-    // Arc 13 §6.3.6 / Step 1.2 snapshot-mutator pattern: fetch
-    // the last accepted op via `PlcClient::get_last_op` (§6.3.4),
-    // inherit ALL its fields (rotation_keys, verification_methods,
-    // services), mutate ONLY `also_known_as` for the new handle,
-    // set `prev` to the prior op's CID, sign with the PDS-wide
-    // rotation key (§6.3.2), submit. Diff-build is gone.
-    // v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): only did:plc accounts
-    // republish a handle change to the PLC directory. A did:web handle change has
-    // no PLC doc to republish — the local `actor.handle` UPDATE below runs for
-    // both methods, and a did:web account's served `alsoKnownAs` recomposes from
-    // `actor.handle` at the per-account serve route (Phase D). No method guard
-    // here: handle mutation is allowed for both, only the PLC submission is gated.
-    if crate::identity::did_method::is_plc(&did) {
-        use crate::crypto::plc::{register_plc_did, PlcOperationBuilder, PlcSigner};
-        use crate::crypto::plc_client::{PlcClient, PlcClientConfig};
-
-        let plc_client = PlcClient::new(PlcClientConfig {
-            plc_url: ctx.config.identity.did_plc_url.clone(),
-            ..Default::default()
-        })?;
-
-        // §6.3.4: full-fetch the last accepted op. Tombstoned →
-        // PdsError::DidTombstoned → HTTP 400 via IntoResponse.
-        let (last_op, last_cid) = plc_client.get_last_op(&did).await?;
-
-        // §6.3.6 mutator: inherit every field from last_op,
-        // override `also_known_as` with `[at://{new_handle}]`,
-        // set prev to last_cid, sign.
-        let unsigned = PlcOperationBuilder::new()
-            .rotation_keys(last_op.rotation_keys.clone())
-            .verification_methods(last_op.verification_methods.clone())
-            .services(last_op.services.clone())
-            .also_known_as(vec![format!("at://{}", new_handle)])
-            .prev(last_cid)
-            .build()?;
-
-        // §6.3.2: PDS-wide rotation key from config signs every
-        // update op (its did:key is in `rotation_keys` inherited
-        // from the genesis op, satisfying chainlink #61 §1.4.5
-        // signer-in-rotation-keys invariant).
-        let signer = PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
-        let signed_operation = signer.sign_operation(unsigned)?;
-
-        // Submit via the spec-correct register_plc_did helper
-        // (POSTs the signed op JSON to `{plc_url}/{did}`).
-        register_plc_did(
-            &ctx.config.identity.did_plc_url,
-            &did,
-            signed_operation,
-        )
-        .await?;
-
-        tracing::info!(
-            "Successfully submitted PLC handle update for {}: {}",
-            did,
-            new_handle
-        );
-    }
-
-    // Update handle via identity resolver
-    // This will verify the handle resolves to this DID
-    ctx.identity_resolver
-        .update_handle(&did, &new_handle)
-        .await?;
-
-    // Update account table with new handle
+    // Standalone path. Everything that can reject the change runs before the
+    // PLC publish, and the PLC publish runs before the DB update, so a failure
+    // at any step leaves the account's local handle unchanged (#456).
+    let new_handle = prepare_handle_change(&ctx, &did, &req.handle, false).await?;
+    publish_handle_to_plc(&ctx, &did, &new_handle).await?;
     let old_handle = ctx.account_manager.update_handle(&did, &new_handle).await?;
-
-    // Invalidate old handle in cache (force re-resolution)
-    ctx.identity_resolver.invalidate_handle(&old_handle).await?;
-
-    // Emit identity event to sequencer for firehose consumers
-    use crate::sequencer::events::IdentityEvent;
-    let identity_event = IdentityEvent::new(did.clone(), Some(new_handle.clone()));
-    ctx.sequencer.sequence_identity(identity_event).await?;
+    announce_handle_change(&ctx, &did, &old_handle, &new_handle).await?;
 
     Ok(Json(()))
+}
+
+/// Normalise and validate a requested handle change for `did` — the shared
+/// front half of the holder `updateHandle` and admin `updateAccountHandle`
+/// paths (#456). Runs before anything is published to the PLC directory, so
+/// every rejectable condition is caught while nothing has changed yet.
+///
+/// - lowercases, then applies the full `identity::validate_handle` rules;
+/// - rejects reserved handles unless `allow_reserved` (operators may assign
+///   them, as in the reference PDS's admin path);
+/// - for a handle outside this PDS's service handle domains, verifies it
+///   already resolves (DNS / HTTPS) to `did`. A handle under a service domain
+///   is not verified this way: this PDS is its authority, and it cannot
+///   resolve to `did` until the DB holds it — which is after this check;
+/// - rejects a handle another account already holds.
+///
+/// Returns the normalised handle.
+pub(crate) async fn prepare_handle_change(
+    ctx: &AppContext,
+    did: &str,
+    requested: &str,
+    allow_reserved: bool,
+) -> PdsResult<String> {
+    let domains = &ctx.config.identity.service_handle_domains;
+    let handle = crate::identity::validate_handle(&requested.to_lowercase(), domains)?;
+
+    if !allow_reserved && crate::identity::reserved_handles::is_reserved(&handle) {
+        return Err(PdsError::Validation(format!(
+            "Handle '{}' is reserved and cannot be used",
+            handle
+        )));
+    }
+
+    if !is_under_service_handle_domain(&handle, domains) {
+        let resolved = ctx.identity_resolver.resolve_handle(&handle).await?;
+        if resolved != did {
+            return Err(PdsError::Validation(format!(
+                "Handle {} does not resolve to DID {}",
+                handle, did
+            )));
+        }
+    }
+
+    ctx.account_manager
+        .ensure_handle_available(did, &handle)
+        .await?;
+    Ok(handle)
+}
+
+/// Publish a handle change to the PLC directory for a did:plc account (#456),
+/// signed with the PDS-wide rotation key. A no-op for did:web: there is no PLC
+/// doc, and the served `alsoKnownAs` recomposes from `actor.handle` at the
+/// per-account did:web serve route (v0.10 Arc 1 §6, AD-2 β).
+pub(crate) async fn publish_handle_to_plc(
+    ctx: &AppContext,
+    did: &str,
+    handle: &str,
+) -> PdsResult<()> {
+    if !crate::identity::did_method::is_plc(did) {
+        return Ok(());
+    }
+    let signer =
+        crate::crypto::plc::PlcSigner::from_hex(&ctx.config.authentication.plc_rotation_key)?;
+    ctx.plc_client.update_handle(did, handle, &signer).await
+}
+
+/// Announce a committed handle change (#456): drop cached resolutions for the
+/// old and new handle (local handles resolve from the actor table, so the next
+/// external lookup re-resolves fresh), then emit an `#identity` event so
+/// firehose consumers re-verify the account's handle.
+pub(crate) async fn announce_handle_change(
+    ctx: &AppContext,
+    did: &str,
+    old_handle: &str,
+    new_handle: &str,
+) -> PdsResult<()> {
+    if !old_handle.is_empty() && old_handle != new_handle {
+        ctx.identity_resolver.invalidate_handle(old_handle).await?;
+    }
+    ctx.identity_resolver.invalidate_handle(new_handle).await?;
+
+    use crate::sequencer::events::IdentityEvent;
+    ctx.sequencer
+        .sequence_identity(IdentityEvent::new(
+            did.to_string(),
+            Some(new_handle.to_string()),
+        ))
+        .await?;
+    Ok(())
 }
 
 /// com.atproto.identity.getRecommendedDidCredentials
@@ -1226,5 +1219,106 @@ mod tests {
         // rather than the hidden local DID.
         assert!(call(&ctx, "gone.nearhorizon.app").await.is_err());
         assert_eq!(mock.resolve_handle_calls(), 1);
+    }
+
+    // ── prepare_handle_change: shared handle-change pre-checks (#456) ──
+
+    #[tokio::test]
+    async fn prepare_handle_change_service_domain_handle_skips_resolution() {
+        let (ctx, mock) = ctx_with_mock().await;
+        let h = super::prepare_handle_change(&ctx, "did:plc:me", "Sky.NearHorizon.app", false)
+            .await
+            .unwrap();
+        assert_eq!(h, "sky.nearhorizon.app");
+        // This PDS is the authority for its own domains; it cannot verify a
+        // handle it has not stored yet, so it must not try.
+        assert_eq!(mock.resolve_handle_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn prepare_handle_change_custom_domain_must_resolve_to_the_did() {
+        let (ctx, mock) = ctx_with_mock().await;
+        mock.script_handle("me.example.com", "did:plc:me");
+        mock.script_handle("them.example.com", "did:plc:someone-else");
+
+        let h = super::prepare_handle_change(&ctx, "did:plc:me", "me.example.com", false)
+            .await
+            .unwrap();
+        assert_eq!(h, "me.example.com");
+
+        let err = super::prepare_handle_change(&ctx, "did:plc:me", "them.example.com", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::PdsError::Validation(_)),
+            "{err:?}"
+        );
+        assert_eq!(mock.resolve_handle_calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn prepare_handle_change_reserved_rule_applies_to_holders_only() {
+        let (ctx, _mock) = ctx_with_mock().await;
+        let err = super::prepare_handle_change(&ctx, "did:plc:me", "admin", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+        // An operator may assign it; the call then proceeds past the reserved
+        // rule to external verification (unscripted here, so it errors there).
+        let err = super::prepare_handle_change(&ctx, "did:plc:me", "admin", true)
+            .await
+            .unwrap_err();
+        assert!(!err.to_string().contains("reserved"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn prepare_handle_change_rejects_invalid_and_taken_handles() {
+        let (ctx, _mock) = ctx_with_mock().await;
+        seed_actor(&ctx, "did:plc:owner", "taken.nearhorizon.app").await;
+
+        for bad in ["", "sp ace.nearhorizon.app", "a..b.nearhorizon.app"] {
+            let err = super::prepare_handle_change(&ctx, "did:plc:me", bad, false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, crate::error::PdsError::Validation(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+        let err = super::prepare_handle_change(&ctx, "did:plc:me", "taken.nearhorizon.app", false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::PdsError::Conflict(_)),
+            "{err:?}"
+        );
+        // The owner re-submitting its own handle is not a conflict.
+        super::prepare_handle_change(&ctx, "did:plc:owner", "taken.nearhorizon.app", false)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn announce_handle_change_invalidates_both_handles_and_emits_identity() {
+        let (ctx, mock) = ctx_with_mock().await;
+        super::announce_handle_change(
+            &ctx,
+            "did:plc:me",
+            "old.nearhorizon.app",
+            "new.nearhorizon.app",
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.invalidate_calls(), 2);
+        let events = ctx
+            .sequencer
+            .get_events_for_did("did:plc:me", 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [crate::sequencer::SeqEvent::Identity { evt, .. }]
+                if evt.handle.as_deref() == Some("new.nearhorizon.app")
+        ));
     }
 }

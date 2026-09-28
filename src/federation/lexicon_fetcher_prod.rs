@@ -346,9 +346,6 @@ mod tests {
         ) -> crate::error::PdsResult<Option<String>> {
             unimplemented!()
         }
-        async fn update_handle(&self, _did: &str, _handle: &str) -> crate::error::PdsResult<()> {
-            unimplemented!()
-        }
         async fn invalidate_handle(&self, _handle: &str) -> crate::error::PdsResult<()> {
             unimplemented!()
         }

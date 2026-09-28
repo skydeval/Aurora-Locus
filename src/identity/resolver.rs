@@ -707,35 +707,6 @@ impl IdentityResolver {
         self.invalidate_did(did).await
     }
 
-    /// Update handle for a DID
-    ///
-    /// This updates the cache and should be called when a user changes their handle
-    pub async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
-        let normalized = handle.to_lowercase();
-
-        // Check if handle is reserved
-        if crate::identity::reserved_handles::is_reserved(&normalized) {
-            return Err(PdsError::Validation(format!(
-                "Handle '{}' is reserved and cannot be used",
-                normalized
-            )));
-        }
-
-        // Verify the handle resolves to this DID
-        let resolved_did = self.resolve_handle(&normalized).await?;
-        if resolved_did != did {
-            return Err(PdsError::IdentityResolution(format!(
-                "Handle {} does not resolve to DID {}",
-                handle, did
-            )));
-        }
-
-        // Update cache
-        self.cache.cache_handle(&normalized, did).await?;
-
-        Ok(())
-    }
-
     /// Get handle for a DID (reverse lookup)
     ///
     /// First checks cache, then falls back to examining DID document's alsoKnownAs
@@ -790,7 +761,6 @@ pub trait IdentityResolverApi: Send + Sync {
     async fn resolve_did(&self, did: &str) -> PdsResult<DidDocument>;
     async fn get_signing_key(&self, did: &str) -> PdsResult<Vec<u8>>;
     async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>>;
-    async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()>;
     async fn invalidate_handle(&self, handle: &str) -> PdsResult<()>;
     async fn invalidate_did(&self, did: &str) -> PdsResult<()>;
     async fn cleanup_cache(&self) -> PdsResult<()>;
@@ -809,9 +779,6 @@ impl IdentityResolverApi for IdentityResolver {
     }
     async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>> {
         IdentityResolver::get_handle_for_did(self, did).await
-    }
-    async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
-        IdentityResolver::update_handle(self, did, handle).await
     }
     async fn invalidate_handle(&self, handle: &str) -> PdsResult<()> {
         IdentityResolver::invalidate_handle(self, handle).await
@@ -973,18 +940,6 @@ pub mod test_doubles {
         async fn get_handle_for_did(&self, did: &str) -> PdsResult<Option<String>> {
             self.resolve_handle_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.dids_to_handles.lock().unwrap().get(did).cloned())
-        }
-
-        async fn update_handle(&self, did: &str, handle: &str) -> PdsResult<()> {
-            self.handles_to_dids
-                .lock()
-                .unwrap()
-                .insert(handle.to_string(), did.to_string());
-            self.dids_to_handles
-                .lock()
-                .unwrap()
-                .insert(did.to_string(), handle.to_string());
-            Ok(())
         }
 
         async fn invalidate_handle(&self, _handle: &str) -> PdsResult<()> {

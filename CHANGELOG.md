@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Handles under the PDS's handle domains now verify: `/.well-known/atproto-did` answers by the requested hostname, returning the account's DID for `<name>.<handle-domain>` (404 `User not found` for unknown, deactivated or taken-down accounts, and for unrelated hosts) while the service hostname still returns the server's DID. Previously every hostname got the server's DID, so Bluesky and other clients showed hosted handles as invalid
 - `com.atproto.identity.resolveHandle` resolves handles of this PDS's own active accounts locally before trying DNS/HTTPS (previously returned `HandleNotFound` for handles it hosts)
+- Admin handle changes (`com.atproto.admin.updateAccountHandle`) now publish the new handle to the PLC directory for did:plc accounts and announce it on the firehose, so AppViews accept it; previously only the local record changed, leaving the account's DID document on the old handle and the new handle shown as invalid. A failed PLC update now fails the change and leaves the account's handle as it was, and behind an entryway the change is refused (the entryway owns handles)
+- `com.atproto.identity.updateHandle` to a handle on this PDS's own domains no longer fails after already updating the PLC directory (it tried to verify the new handle over HTTPS before the PDS had stored it); both handle-change paths now finish every check before anything is published
 
 ## [0.10.1] - 2026-07-27
 

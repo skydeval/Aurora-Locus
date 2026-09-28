@@ -4415,11 +4415,26 @@ struct UpdateAccountHandleRequest {
 
 /// Update account handle
 ///
-/// v0.10 Arc 1 §6 served-identity-input audit (AD-2 β): the `did:` check below is
-/// a generic shape guard, not a method guard — it correctly admits did:web. A
-/// did:web handle change writes `actor.handle` (the served `alsoKnownAs`
-/// recomposes from it at the Phase D serve route) with **no PLC republish**;
-/// did:plc continues to republish. Method discrimination stays absent by design.
+/// Same identity semantics as the holder `com.atproto.identity.updateHandle`
+/// (#456), via the shared helpers in `api::identity`: the handle is normalised
+/// and validated (reserved handles allowed — an operator may assign them), a
+/// did:plc account's new handle is published to the PLC directory, and an
+/// `#identity` event is emitted so AppViews re-verify it. Before #456 this only
+/// wrote `actor.handle`, leaving the PLC doc's `alsoKnownAs` on the old handle
+/// and the new one failing bidirectional verification.
+///
+/// Ordering: every rejectable check → PLC publish → (handle UPDATE + audit
+/// chain entry, one transaction) → cache invalidation + identity event. A
+/// failed PLC publish returns an error with the DB untouched. The chain guard
+/// is taken only after the network call, so a slow directory never holds it.
+///
+/// v0.10 Arc 1 §6 (AD-2 β): the `did:` check is a shape guard, not a method
+/// guard — did:web is admitted, writes `actor.handle`, and skips the PLC
+/// publish (its served `alsoKnownAs` recomposes from `actor.handle`).
+///
+/// Behind an entryway the entryway owns handles and the PLC doc; a local-only
+/// rename would recreate the split this handler exists to avoid, and admin-tier
+/// entryway forwarding is not built, so the call is refused.
 async fn update_account_handle(
     State(ctx): State<AppContext>,
     auth: AdminAuthContext,
@@ -4430,10 +4445,38 @@ async fn update_account_handle(
         return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
     }
 
-    // Validate handle format (basic check)
-    if req.handle.is_empty() || req.handle.len() > 253 {
-        return Err((StatusCode::BAD_REQUEST, "Invalid handle format".to_string()));
+    if ctx.entryway_client.is_some() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "This PDS runs behind an entryway, which owns account handles; \
+             change the handle at the entryway"
+                .to_string(),
+        ));
     }
+
+    match ctx.account_manager.get_actor_serve_state(&req.did).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Account not found: {}", req.did),
+            ))
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+
+    let handle = crate::api::identity::prepare_handle_change(&ctx, &req.did, &req.handle, true)
+        .await
+        .map_err(|e| (handle_change_error_status(&e), e.to_string()))?;
+
+    crate::api::identity::publish_handle_to_plc(&ctx, &req.did, &handle)
+        .await
+        .map_err(|e| {
+            (
+                handle_change_error_status(&e),
+                format!("PLC directory update failed; handle not changed: {}", e),
+            )
+        })?;
 
     let subject = Subject::Repo {
         did: req.did.clone(),
@@ -4445,7 +4488,7 @@ async fn update_account_handle(
     let rationale = req
         .rationale
         .clone()
-        .unwrap_or_else(|| format!("change handle to {}", req.handle));
+        .unwrap_or_else(|| format!("change handle to {}", handle));
 
     // LB-1 Session 12 / chainlink #129: handle UPDATE + chain entry
     // in one transaction so a crash between the two leaves neither row.
@@ -4455,20 +4498,21 @@ async fn update_account_handle(
         .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    crate::account::AccountManager::update_handle_in_tx(&mut tx, &req.did, &req.handle)
-        .await
-        .map_err(|e| {
-            if matches!(e, PdsError::NotFound(_)) {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!("Account not found: {}", req.did),
-                )
-            } else if matches!(e, PdsError::Validation(_) | PdsError::Conflict(_)) {
-                (StatusCode::CONFLICT, e.to_string())
-            } else {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
-        })?;
+    let old_handle =
+        crate::account::AccountManager::update_handle_in_tx(&mut tx, &req.did, &handle)
+            .await
+            .map_err(|e| {
+                if matches!(e, PdsError::NotFound(_)) {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!("Account not found: {}", req.did),
+                    )
+                } else if matches!(e, PdsError::Validation(_) | PdsError::Conflict(_)) {
+                    (StatusCode::CONFLICT, e.to_string())
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            })?;
     audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,
@@ -4491,7 +4535,32 @@ async fn update_account_handle(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    crate::api::identity::announce_handle_change(&ctx, &req.did, &old_handle, &handle)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Handle changed to {} but the identity event was not emitted \
+                     (retrying the same change re-emits it): {}",
+                    handle, e
+                ),
+            )
+        })?;
+
     Ok(StatusCode::OK)
+}
+
+/// HTTP status for a failed handle-change pre-check or PLC publish (#456).
+fn handle_change_error_status(e: &PdsError) -> StatusCode {
+    match e {
+        PdsError::NotFound(_) => StatusCode::NOT_FOUND,
+        PdsError::Conflict(_) => StatusCode::CONFLICT,
+        PdsError::Validation(_) | PdsError::HandleNotFound(_) | PdsError::DidTombstoned(_) => {
+            StatusCode::BAD_REQUEST
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[derive(Deserialize)]
@@ -13345,6 +13414,224 @@ mod tests {
         assert_eq!(
             count_chain_rows(&ctx, "account.update_handle", Some("did:plc:hh")).await,
             0
+        );
+    }
+
+    // ---------- #456: admin handle change publishes to PLC + emits identity ----------
+
+    /// Handle-change fixture: a fresh ctx whose PLC client is a recording mock
+    /// (optionally failing), with `did` seeded under `handle`.
+    async fn handle_change_ctx(
+        did: &str,
+        handle: &str,
+        plc: MockPlcClient,
+    ) -> (AppContext, TestArc<MockPlcClient>) {
+        let mut ctx = create_test_context().await;
+        let plc = TestArc::new(plc);
+        ctx.plc_client = plc.clone();
+        seed_test_account(&ctx, did, handle, None).await;
+        (ctx, plc)
+    }
+
+    async fn rename(
+        ctx: &AppContext,
+        did: &str,
+        handle: &str,
+    ) -> Result<StatusCode, (StatusCode, String)> {
+        update_account_handle(
+            State(ctx.clone()),
+            admin_test_auth(),
+            Json(UpdateAccountHandleRequest {
+                did: did.to_string(),
+                handle: handle.to_string(),
+                rationale: Some("holder asked for a rename".to_string()),
+            }),
+        )
+        .await
+    }
+
+    async fn stored_handle(ctx: &AppContext, did: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT handle FROM actor WHERE did = ?")
+            .bind(did)
+            .fetch_one(&ctx.account_db)
+            .await
+            .unwrap()
+    }
+
+    /// Handles carried by the DID's `#identity` events, newest first.
+    async fn identity_event_handles(ctx: &AppContext, did: &str) -> Vec<Option<String>> {
+        ctx.sequencer
+            .get_events_for_did(did, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::sequencer::SeqEvent::Identity { evt, .. } => Some(evt.handle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_plc_account_publishes_and_announces() {
+        let did = "did:plc:renameplc";
+        let (ctx, plc) = handle_change_ctx(did, "old.localhost", MockPlcClient::new()).await;
+
+        // Mixed case in the request: stored, published and announced lowercase.
+        let status = rename(&ctx, did, "New.Localhost")
+            .await
+            .expect("rename succeeds");
+        assert_eq!(status, StatusCode::OK);
+
+        assert_eq!(
+            plc.published_handles(),
+            vec![(did.to_string(), "new.localhost".to_string())],
+            "exactly one PLC publish, carrying the new handle"
+        );
+        assert_eq!(
+            stored_handle(&ctx, did).await.as_deref(),
+            Some("new.localhost")
+        );
+        assert_eq!(
+            identity_event_handles(&ctx, did).await,
+            vec![Some("new.localhost".to_string())]
+        );
+        assert_eq!(
+            count_chain_rows(&ctx, "account.update_handle", Some(did)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_plc_failure_leaves_everything_unchanged() {
+        let did = "did:plc:renamefail";
+        let (ctx, plc) = handle_change_ctx(
+            did,
+            "old.localhost",
+            MockPlcClient::new().with_update_handle_failure("PLC directory returned error 500"),
+        )
+        .await;
+
+        let (status, body) = rename(&ctx, did, "new.localhost")
+            .await
+            .expect_err("a failed PLC publish must fail the call");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("PLC directory update failed"), "{body}");
+
+        assert!(plc.published_handles().is_empty());
+        assert_eq!(
+            stored_handle(&ctx, did).await.as_deref(),
+            Some("old.localhost")
+        );
+        assert!(identity_event_handles(&ctx, did).await.is_empty());
+        assert_eq!(
+            count_chain_rows(&ctx, "account.update_handle", Some(did)).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_did_web_skips_plc_but_announces() {
+        let did = "did:web:localhost:user:webby";
+        let (ctx, plc) = handle_change_ctx(did, "webby.localhost", MockPlcClient::new()).await;
+
+        rename(&ctx, did, "webster.localhost")
+            .await
+            .expect("rename succeeds");
+
+        assert!(plc.published_handles().is_empty(), "did:web has no PLC doc");
+        assert_eq!(
+            stored_handle(&ctx, did).await.as_deref(),
+            Some("webster.localhost")
+        );
+        assert_eq!(
+            identity_event_handles(&ctx, did).await,
+            vec![Some("webster.localhost".to_string())]
+        );
+        assert_eq!(
+            count_chain_rows(&ctx, "account.update_handle", Some(did)).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_same_handle_republishes() {
+        // The production recovery case: the DB already holds the handle but the
+        // PLC doc is stale. Re-submitting the same handle must still publish.
+        let did = "did:plc:republish";
+        let (ctx, plc) = handle_change_ctx(did, "same.localhost", MockPlcClient::new()).await;
+
+        rename(&ctx, did, "same.localhost")
+            .await
+            .expect("rename succeeds");
+
+        assert_eq!(
+            plc.published_handles(),
+            vec![(did.to_string(), "same.localhost".to_string())]
+        );
+        assert_eq!(
+            identity_event_handles(&ctx, did).await,
+            vec![Some("same.localhost".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_taken_handle_is_rejected_before_plc() {
+        let did = "did:plc:wantsit";
+        let (ctx, plc) = handle_change_ctx(did, "mine.localhost", MockPlcClient::new()).await;
+        seed_test_account(&ctx, "did:plc:hasit", "taken.localhost", None).await;
+
+        let (status, _) = rename(&ctx, did, "taken.localhost")
+            .await
+            .expect_err("taken handle must be rejected");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            plc.published_handles().is_empty(),
+            "nothing published for a taken handle"
+        );
+        assert_eq!(
+            stored_handle(&ctx, did).await.as_deref(),
+            Some("mine.localhost")
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_rejects_invalid_handle_and_unknown_account() {
+        let did = "did:plc:validates";
+        let (ctx, plc) = handle_change_ctx(did, "ok.localhost", MockPlcClient::new()).await;
+
+        for bad in [
+            "",
+            "has space.localhost",
+            "-dash.localhost",
+            "a..b.localhost",
+        ] {
+            let (status, _) = rename(&ctx, did, bad).await.expect_err(bad);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+        let (status, _) = rename(&ctx, "did:plc:nobody", "free.localhost")
+            .await
+            .expect_err("unknown account");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(plc.published_handles().is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_handle_change_refused_behind_entryway() {
+        let did = "did:plc:fronted";
+        let (mut ctx, plc) = handle_change_ctx(did, "front.localhost", MockPlcClient::new()).await;
+        ctx.entryway_client = Some(TestArc::new(
+            crate::federation::EntrywayClient::new("https://entryway.test".to_string()).unwrap(),
+        ));
+
+        let (status, _) = rename(&ctx, did, "moved.localhost")
+            .await
+            .expect_err("entryway mode must refuse");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert!(plc.published_handles().is_empty());
+        assert_eq!(
+            stored_handle(&ctx, did).await.as_deref(),
+            Some("front.localhost")
         );
     }
 

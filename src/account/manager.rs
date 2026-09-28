@@ -1059,6 +1059,29 @@ impl AccountManager {
         }))
     }
 
+    /// Pre-flight uniqueness check for a handle change (#456): `Conflict` when
+    /// any *other* actor already holds `handle`, whatever its status (a
+    /// deactivated account still owns its handle). Handle changes run this
+    /// BEFORE publishing to the PLC directory so a taken handle is never
+    /// published; the in-transaction check in `update_handle_in_tx` still
+    /// guards the race window between this read and the UPDATE.
+    pub async fn ensure_handle_available(&self, did: &str, handle: &str) -> PdsResult<()> {
+        let holder: Option<(String,)> =
+            sqlx::query_as("SELECT did FROM actor WHERE handle = $1 AND did != $2")
+                .bind(handle)
+                .bind(did)
+                .fetch_optional(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        match holder {
+            Some(_) => Err(PdsError::Conflict(format!(
+                "Handle {} already taken",
+                handle
+            ))),
+            None => Ok(()),
+        }
+    }
+
     /// Find account by DID, handle, or email (public for password reset).
     pub async fn get_account_by_identifier(&self, identifier: &str) -> PdsResult<ActorAccount> {
         // v0.8 arc 3 (#184) — DID-form identifier. atproto's createSession

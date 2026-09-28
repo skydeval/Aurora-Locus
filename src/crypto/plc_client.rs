@@ -465,11 +465,53 @@ impl PlcClient {
         Ok(())
     }
 
+    /// Publish a handle change to the PLC directory (#456): the account's
+    /// `alsoKnownAs` becomes `[at://{new_handle}]`.
+    ///
+    /// Arc 13 §6.3.6 snapshot-mutator: full-fetch the last accepted op
+    /// (§6.3.4 — a tombstoned DID surfaces `PdsError::DidTombstoned`), inherit
+    /// every field, override only `also_known_as`, chain `prev` to the prior
+    /// op's CID, sign with the PDS-wide rotation key (§6.3.2 — its did:key is in
+    /// the inherited `rotation_keys`, chainlink #61 §1.4.5) and submit.
+    pub async fn update_handle(
+        &self,
+        did: &str,
+        new_handle: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        let (last_op, last_cid) = self.get_last_op(did).await?;
+        let unsigned = handle_update_operation(last_op, last_cid, new_handle)?;
+        let signed_operation = rotation_key_signer.sign_operation(unsigned)?;
+        register_plc_did(&self.config.plc_url, did, signed_operation).await?;
+
+        tracing::info!(did = %did, handle = %new_handle, "Successfully published handle update to PLC directory");
+
+        Ok(())
+    }
+
     // `needs_rotation` + `rotate_key_if_needed` were removed in B4 (#375): the
     // CLI was their sole consumer, and the B4 reshape replaced that
     // rotate-if-needed flow with the explicit no-op check + per-account-key
     // publish that mirrors the admin handler. The current-vs-desired comparison
     // they provided is now done inline via get_document/get_signing_key/keys_match.
+}
+
+/// Build the unsigned handle-update op from the DID's last accepted op (#456):
+/// every field inherited, `also_known_as` replaced by `[at://{new_handle}]`,
+/// `prev` chained to `last_cid`. Pure so the op shape is unit-testable without
+/// a directory.
+pub(crate) fn handle_update_operation(
+    last_op: PlcOperation,
+    last_cid: String,
+    new_handle: &str,
+) -> PdsResult<PlcOperation> {
+    PlcOperationBuilder::new()
+        .rotation_keys(last_op.rotation_keys)
+        .verification_methods(last_op.verification_methods)
+        .services(last_op.services)
+        .also_known_as(vec![format!("at://{}", new_handle)])
+        .prev(last_cid)
+        .build()
 }
 
 /// The PLC-directory operations that rotation + rebuild flows reach through
@@ -499,6 +541,14 @@ pub trait PlcClientApi: Send + Sync {
         &self,
         did: &str,
         new_endpoint: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()>;
+    /// #456 — publish a handle change (`alsoKnownAs`). Shared by the holder
+    /// `updateHandle` and the admin `updateAccountHandle` paths via `ctx.plc_client`.
+    async fn update_handle(
+        &self,
+        did: &str,
+        new_handle: &str,
         rotation_key_signer: &PlcSigner,
     ) -> PdsResult<()>;
 }
@@ -534,6 +584,14 @@ impl PlcClientApi for PlcClient {
     ) -> PdsResult<()> {
         PlcClient::update_service_endpoint(self, did, new_endpoint, rotation_key_signer).await
     }
+    async fn update_handle(
+        &self,
+        did: &str,
+        new_handle: &str,
+        rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        PlcClient::update_handle(self, did, new_handle, rotation_key_signer).await
+    }
 }
 
 /// Test-only mock of [`PlcClientApi`] (key-rotation arc #372 / B1, extended B3
@@ -556,6 +614,12 @@ pub(crate) struct MockPlcClient {
     /// `update_service_endpoint` records, so bulk-update tests can observe the
     /// re-point without a live PLC.
     published_service_endpoints: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Every `update_handle` call as `(did, new_handle)`, in order (#456), so
+    /// handle-change tests can assert exactly one publish with the new handle.
+    published_handles: std::sync::Mutex<Vec<(String, String)>>,
+    /// When set, `update_handle` fails with this message and records nothing —
+    /// the directory-rejected / unreachable case.
+    update_handle_failure: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -565,7 +629,19 @@ impl MockPlcClient {
             op_histories: std::sync::Mutex::new(std::collections::HashMap::new()),
             current_signing_keys: std::sync::Mutex::new(std::collections::HashMap::new()),
             published_service_endpoints: std::sync::Mutex::new(std::collections::HashMap::new()),
+            published_handles: std::sync::Mutex::new(Vec::new()),
+            update_handle_failure: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Every handle published via `update_handle` (#456), as `(did, handle)`.
+    pub(crate) fn published_handles(&self) -> Vec<(String, String)> {
+        self.published_handles.lock().unwrap().clone()
+    }
+    /// Make `update_handle` fail with `msg` (#456).
+    pub(crate) fn with_update_handle_failure(self, msg: &str) -> Self {
+        *self.update_handle_failure.lock().unwrap() = Some(msg.to_string());
+        self
     }
 
     /// The endpoint last published for `did` via `update_service_endpoint`
@@ -687,6 +763,21 @@ impl PlcClientApi for MockPlcClient {
             .insert(did.to_string(), new_endpoint.to_string());
         Ok(())
     }
+    async fn update_handle(
+        &self,
+        did: &str,
+        new_handle: &str,
+        _rotation_key_signer: &PlcSigner,
+    ) -> PdsResult<()> {
+        if let Some(msg) = self.update_handle_failure.lock().unwrap().clone() {
+            return Err(PdsError::Internal(msg));
+        }
+        self.published_handles
+            .lock()
+            .unwrap()
+            .push((did.to_string(), new_handle.to_string()));
+        Ok(())
+    }
 }
 
 /// Build a mock PLC op-history from `(signing_did_key, accepted_at_rfc3339)`
@@ -708,6 +799,64 @@ pub(crate) fn mock_op_history(entries: &[(&str, &str)]) -> Vec<PlcOpHistoryEntry
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handle_update_operation_replaces_only_also_known_as_and_chains_prev() {
+        let mut vms = std::collections::BTreeMap::new();
+        vms.insert("atproto".to_string(), "did:key:zSigning".to_string());
+        let mut services = std::collections::BTreeMap::new();
+        services.insert(
+            "atproto_pds".to_string(),
+            ServiceEntry {
+                type_: "AtprotoPersonalDataServer".to_string(),
+                endpoint: "https://pds.example.com".to_string(),
+            },
+        );
+        let last_op = PlcOperationBuilder::new()
+            .rotation_keys(vec![
+                "did:key:zRot1".to_string(),
+                "did:key:zRot2".to_string(),
+            ])
+            .verification_methods(vms.clone())
+            .services(services.clone())
+            .also_known_as(vec!["at://old.example.com".to_string()])
+            .build()
+            .unwrap();
+
+        let op =
+            handle_update_operation(last_op, "bafyprevcid".to_string(), "new.example.com").unwrap();
+
+        assert_eq!(op.also_known_as, vec!["at://new.example.com".to_string()]);
+        assert_eq!(op.prev.as_deref(), Some("bafyprevcid"));
+        assert_eq!(
+            op.rotation_keys,
+            vec!["did:key:zRot1".to_string(), "did:key:zRot2".to_string()]
+        );
+        assert_eq!(op.verification_methods, vms);
+        assert_eq!(op.services, services);
+        assert!(op.sig.is_none(), "builder output is unsigned");
+    }
+
+    #[tokio::test]
+    async fn mock_plc_client_records_handle_publishes_and_scripted_failure() {
+        let signer = PlcSigner::from_hex(&"b".repeat(64)).unwrap();
+        let mock = MockPlcClient::new();
+        mock.update_handle("did:plc:a", "a.example.com", &signer)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock.published_handles(),
+            vec![("did:plc:a".to_string(), "a.example.com".to_string())]
+        );
+
+        let failing = MockPlcClient::new().with_update_handle_failure("directory down");
+        let err = failing
+            .update_handle("did:plc:a", "a.example.com", &signer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("directory down"));
+        assert!(failing.published_handles().is_empty());
+    }
 
     #[tokio::test]
     async fn mock_plc_client_returns_configured_op_history() {
