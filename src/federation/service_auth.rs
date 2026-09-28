@@ -1,272 +1,252 @@
-// Allow dead_code - service auth features for future use
-#![allow(dead_code)]
-
-//! Service Authentication for Cross-PDS Requests
+//! Verification of service-auth JWTs from other servers (cross-PDS requests).
 //!
-//! Implements ATProto service auth specification:
-//! - Short-lived JWTs (<60 seconds) signed with user's atproto key
-//! - DID-based verification (no callback to origin PDS)
-//! - Claims: iss (user DID), aud (service DID), exp, lxm (endpoint), jti (nonce)
+//! A peer (another PDS, an Aurora instance, a kryphocron service) calls this
+//! PDS on a user's behalf with a short-lived JWT signed by that user's atproto
+//! key: `iss` = the user's DID, `aud` = this service's DID, `lxm` = the method,
+//! `exp`, and usually `iat` / `jti`.
+//!
+//! (#474) This used to decode with `jsonwebtoken` as ES256 (P-256) against a
+//! PEM key, so it could never verify an atproto token (ES256K, or ES256 with a
+//! multikey from the DID document). It now delegates to the one atproto
+//! verifier, [`crate::service_auth::verify_service_jwt_for_method`], which
+//! resolves the issuer's DID document, checks the signature strictly (compact,
+//! low-S, either curve), and checks `aud`, `lxm` and the expiry window.
 //!
 //! References:
 //! - https://atproto.com/specs/xrpc
 //! - https://docs.bsky.app/docs/advanced-guides/service-auth
 
-use crate::error::{PdsError, PdsResult};
+use crate::error::PdsResult;
 use crate::identity::IdentityResolverApi;
 use chrono::Utc;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::debug;
 
-/// Service auth JWT claims (ATProto spec)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A verified cross-PDS token, in the shape the auth call sites use.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceAuthClaims {
-    /// Issuer: User's DID
+    /// Issuer: the user's DID.
     pub iss: String,
-
-    /// Audience: Target service's DID
+    /// Audience: this service's DID (possibly with a `#service` fragment).
     pub aud: String,
-
-    /// Expiration time (Unix timestamp)
+    /// Expiration time (Unix seconds).
     pub exp: i64,
-
-    /// Issued at (Unix timestamp)
+    /// Issued-at (Unix seconds); the verification time when the token has
+    /// none.
     pub iat: i64,
-
-    /// Lexicon method (optional endpoint identifier)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The method the token was minted for, if any.
     pub lxm: Option<String>,
-
-    /// JWT ID (unique nonce for replay prevention)
+    /// Replay-prevention key: the token's `jti`, or, when it has none (the
+    /// reference PDS omits it), the hex SHA-256 of the whole token, so the
+    /// exact same token still cannot be replayed.
     pub jti: String,
 }
 
-/// Service authenticator for creating and verifying cross-PDS JWTs
+/// Verifies service-auth JWTs from other servers.
 pub struct ServiceAuthenticator {
     identity_resolver: Arc<dyn IdentityResolverApi>,
 }
 
 impl ServiceAuthenticator {
-    /// Create a new service authenticator
+    /// Create an authenticator resolving issuers through `identity_resolver`.
     pub fn new(identity_resolver: Arc<dyn IdentityResolverApi>) -> Self {
         Self { identity_resolver }
     }
 
-    // Cluster 2 Member 2.3 — deleted `create_service_jwt` method
-    // here. It called `identity_resolver.get_signing_key(user_did)`
-    // (which returns a PUBLIC key from the issuer's DID document) and
-    // tried to use it as a PRIVATE signing key via
-    // EncodingKey::from_ec_pem — cannot work; public keys don't sign.
-    // Zero callers (grep confirmed; file carries `#![allow(dead_code)]`
-    // so the compiler didn't flag it). Deleting removes a foot-gun: the
-    // method looked callable on a type wired into AppContext, and a
-    // future contributor searching for "how do I mint a service JWT"
-    // could have landed here and shipped the public-key-as-private bug
-    // to production. The correct minting path is the free function
-    // `src/service_auth.rs::create_service_jwt`, which takes the
-    // private-key bytes as a parameter — that's the path
-    // src/api/server.rs::get_service_auth uses (post-Member 2.1 fix,
-    // with the per-account `get_atproto_signing_key_bytes` bytes).
-    // Folded into the Member 2.1 chainlink (#143) as hygiene.
-
-    /// Verify a service auth JWT from another PDS
-    ///
-    /// This performs DID-based cryptographic verification:
-    /// 1. Decode JWT to extract issuer DID
-    /// 2. Resolve issuer's DID document
-    /// 3. Fetch atproto signing key from DID document
-    /// 4. Verify JWT signature using that public key
-    /// 5. Validate audience, expiration, and nonce
-    ///
-    /// # Arguments
-    /// * `token` - The JWT token to verify
-    /// * `expected_audience` - The expected audience (this service's DID)
-    ///
-    /// # Returns
-    /// The verified claims if successful
+    /// Verify `token` for this service (`expected_audience`), for any method.
     pub async fn verify_service_jwt(
         &self,
         token: &str,
         expected_audience: &str,
     ) -> PdsResult<ServiceAuthClaims> {
-        debug!("Verifying service JWT for audience={}", expected_audience);
-
-        // Decode JWT without verification first to get issuer DID
-        let unverified = decode::<ServiceAuthClaims>(
-            token,
-            &DecodingKey::from_secret(&[]), // Dummy key for header-only decode
-            &Validation::default(),
-        )
-        .map_err(|e| {
-            warn!("Failed to decode JWT: {}", e);
-            PdsError::Authentication("Invalid JWT format".to_string())
-        })?;
-
-        let issuer_did = &unverified.claims.iss;
-
-        debug!("JWT issuer: {}", issuer_did);
-
-        // Resolve issuer's DID document to get signing key.
-        //
-        // Cluster 2 Member 2.2 (#144): propagate typed
-        // PdsError::DidTombstoned unchanged so IntoResponse maps it to
-        // HTTP 400 `{"error": "DidTombstoned", ...}` per
-        // src/error.rs:863-865. Pre-#144 the .map_err destroyed the
-        // typed variant by stringifying into PdsError::Authentication
-        // → HTTP 401 opaque. The PLC-410 → DidTombstoned mapping in
-        // src/identity/resolver.rs::fetch_plc_document (#134 / Arc
-        // 13 v4.2) emitted the typed variant but never reached the
-        // wire because every live `verify_service_jwt` caller
-        // swallowed it here. Pattern-match: pass DidTombstoned
-        // through; wrap everything else as Authentication (preserving
-        // today's wire shape with the source-detail appended for
-        // tracing — non-tombstone strings are tracing-only, not
-        // grep'd by any test/runbook/metric).
-        let signing_key = self
-            .identity_resolver
-            .get_signing_key(issuer_did)
+        self.verify_service_jwt_for_method(token, expected_audience, None)
             .await
-            .map_err(|e| match e {
-                PdsError::DidTombstoned(_) => e,
-                other => {
-                    warn!("Failed to resolve signing key for {}: {}", issuer_did, other);
-                    PdsError::Authentication(format!(
-                        "Could not verify issuer DID: {}: {}",
-                        issuer_did, other
-                    ))
-                }
-            })?;
-
-        // Verify JWT signature with issuer's public key
-        let decoding_key = DecodingKey::from_ec_pem(&signing_key)
-            .map_err(|e| PdsError::Internal(format!("Invalid public key: {}", e)))?;
-
-        let mut validation = Validation::new(Algorithm::ES256);
-        validation.set_audience(&[expected_audience]);
-        validation.leeway = 0; // Strict expiration (no grace period)
-        validation.validate_exp = true;
-
-        let token_data =
-            decode::<ServiceAuthClaims>(token, &decoding_key, &validation).map_err(|e| {
-                warn!("JWT verification failed: {}", e);
-                match e.kind() {
-                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                        PdsError::Authentication("JWT expired".to_string())
-                    }
-                    jsonwebtoken::errors::ErrorKind::InvalidAudience => {
-                        PdsError::Authentication("Invalid audience".to_string())
-                    }
-                    _ => PdsError::Authentication(format!("JWT verification failed: {}", e)),
-                }
-            })?;
-
-        let claims = token_data.claims;
-
-        // Additional validations
-        let now = Utc::now().timestamp();
-
-        // Ensure expiration is < 60 seconds from now
-        let time_to_expire = claims.exp - now;
-        if time_to_expire > 60 {
-            warn!(
-                "JWT expiration too far in future: {} seconds",
-                time_to_expire
-            );
-            return Err(PdsError::Authentication(
-                "JWT expiration exceeds 60 second limit".to_string(),
-            ));
-        }
-
-        // Ensure JWT was issued recently (not from past)
-        let time_since_issued = now - claims.iat;
-        if time_since_issued > 120 {
-            // Allow up to 2 minutes of clock skew
-            warn!("JWT issued too long ago: {} seconds", time_since_issued);
-            return Err(PdsError::Authentication("JWT too old".to_string()));
-        }
-
-        debug!("✓ JWT verified: issuer={}, jti={}", claims.iss, claims.jti);
-
-        Ok(claims)
     }
 
-    /// Verify JWT and check nonce (replay prevention)
-    ///
-    /// This is a convenience method that verifies the JWT and checks if the
-    /// nonce has been used before. The caller is responsible for tracking nonces.
-    ///
-    /// # Arguments
-    /// * `token` - The JWT token to verify
-    /// * `expected_audience` - The expected audience (this service's DID)
-    /// * `nonce_checker` - Async function to check if nonce has been used
-    ///
-    /// # Returns
-    /// The verified claims if successful and nonce is unused
-    pub async fn verify_with_nonce_check<F, Fut>(
+    /// Verify `token` for this service and, when `expected_lxm` is given, for
+    /// exactly that method (the token's `lxm` must name it).
+    pub async fn verify_service_jwt_for_method(
         &self,
         token: &str,
         expected_audience: &str,
-        nonce_checker: F,
-    ) -> PdsResult<ServiceAuthClaims>
-    where
-        F: FnOnce(String) -> Fut,
-        Fut: std::future::Future<Output = PdsResult<bool>>,
-    {
-        // Verify JWT signature and claims
-        let claims = self.verify_service_jwt(token, expected_audience).await?;
-
-        // Check if nonce has been used (replay attack prevention)
-        let nonce_is_new = nonce_checker(claims.jti.clone()).await?;
-
-        if !nonce_is_new {
-            warn!("Replay attack detected: nonce {} already used", claims.jti);
-            return Err(PdsError::Authentication(
-                "Replay attack detected".to_string(),
-            ));
-        }
-
-        Ok(claims)
+        expected_lxm: Option<&str>,
+    ) -> PdsResult<ServiceAuthClaims> {
+        let claims = crate::service_auth::verify_service_jwt_for_method(
+            token,
+            expected_audience,
+            expected_lxm,
+            self.identity_resolver.as_ref(),
+        )
+        .await?;
+        let jti = claims
+            .jti
+            .clone()
+            .unwrap_or_else(|| proto_blue::crypto::sha256_hex(token.as_bytes()));
+        debug!(iss = %claims.iss, lxm = ?claims.lxm, "cross-PDS service JWT verified");
+        Ok(ServiceAuthClaims {
+            iat: claims.iat.unwrap_or_else(|| Utc::now().timestamp()),
+            iss: claims.iss,
+            aud: claims.aud,
+            exp: claims.exp,
+            lxm: claims.lxm,
+            jti,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::did_document::{DidDocument, VerificationMethod};
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use k256::ecdsa::{signature::Signer, Signature, SigningKey};
 
-    #[test]
-    fn test_service_auth_claims_serialization() {
-        let claims = ServiceAuthClaims {
-            iss: "did:plc:user123".to_string(),
-            aud: "did:plc:service456".to_string(),
-            exp: 1234567890,
-            iat: 1234567830,
-            lxm: Some("com.atproto.repo.getRecord".to_string()),
-            jti: "550e8400-e29b-41d4-a716-446655440000".to_string(),
-        };
+    const ISSUER: &str = "did:plc:peeruser";
+    const SERVICE: &str = "did:web:pds.example.com";
 
-        let json = serde_json::to_string(&claims).unwrap();
-        let deserialized: ServiceAuthClaims = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(deserialized.iss, "did:plc:user123");
-        assert_eq!(deserialized.aud, "did:plc:service456");
-        assert_eq!(deserialized.jti, "550e8400-e29b-41d4-a716-446655440000");
+    /// A resolver that knows `ISSUER` with `key`'s public half as #atproto.
+    fn resolver_for(key: &SigningKey) -> Arc<MockIdentityResolver> {
+        let did_key = crate::crypto::plc::PlcSigner::new(&key.to_bytes())
+            .unwrap()
+            .public_key_did_key();
+        let multibase = did_key.strip_prefix("did:key:").unwrap().to_string();
+        let resolver = Arc::new(MockIdentityResolver::new());
+        resolver.script_did(
+            ISSUER,
+            DidDocument {
+                context: None,
+                id: ISSUER.to_string(),
+                also_known_as: vec![],
+                service: vec![],
+                verification_method: vec![VerificationMethod {
+                    id: format!("{ISSUER}#atproto"),
+                    key_type: "Multikey".to_string(),
+                    controller: ISSUER.to_string(),
+                    public_key_multibase: Some(multibase),
+                }],
+            },
+        );
+        resolver
     }
 
-    #[test]
-    fn test_service_auth_claims_without_lxm() {
-        let claims = ServiceAuthClaims {
-            iss: "did:plc:user123".to_string(),
-            aud: "did:plc:service456".to_string(),
-            exp: 1234567890,
-            iat: 1234567830,
-            lxm: None,
-            jti: "test-jti".to_string(),
+    /// Hand-build a token with explicit claims and signature encoding.
+    fn token(key: &SigningKey, claims: serde_json::Value, der: bool) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256K","typ":"JWT"}"#);
+        let body = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let input = format!("{header}.{body}");
+        let sig: Signature = key.sign(input.as_bytes());
+        let sig = sig.normalize_s().unwrap_or(sig);
+        let sig_bytes = if der {
+            sig.to_der().as_bytes().to_vec()
+        } else {
+            sig.to_bytes().to_vec()
         };
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(sig_bytes))
+    }
 
-        let json = serde_json::to_string(&claims).unwrap();
-        // lxm should be omitted from JSON when None
-        assert!(!json.contains("lxm"));
+    fn now() -> i64 {
+        Utc::now().timestamp()
+    }
+
+    /// The #474 regression: a token minted the atproto way (here by this
+    /// PDS's own minter, as a peer Aurora-Locus would) verifies.
+    #[tokio::test]
+    async fn verifies_an_atproto_minted_token() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let auth = ServiceAuthenticator::new(resolver_for(&key));
+        let minted = crate::service_auth::create_service_jwt(
+            ISSUER,
+            SERVICE,
+            None,
+            Some("com.atproto.repo.getRecord"),
+            &key.to_bytes(),
+        )
+        .unwrap();
+
+        let claims = auth
+            .verify_service_jwt_for_method(&minted, SERVICE, Some("com.atproto.repo.getRecord"))
+            .await
+            .expect("verifies");
+        assert_eq!(claims.iss, ISSUER);
+        assert_eq!(claims.lxm.as_deref(), Some("com.atproto.repo.getRecord"));
+        assert!(!claims.jti.is_empty());
+    }
+
+    #[tokio::test]
+    async fn checks_method_audience_and_signer() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let auth = ServiceAuthenticator::new(resolver_for(&key));
+        let claims = serde_json::json!({
+            "iss": ISSUER, "aud": SERVICE, "iat": now(), "exp": now() + 60,
+            "lxm": "com.atproto.repo.getRecord", "jti": "n1"
+        });
+        let good = token(&key, claims, false);
+
+        assert!(auth
+            .verify_service_jwt_for_method(&good, SERVICE, Some("com.atproto.repo.putRecord"))
+            .await
+            .is_err());
+        assert!(auth
+            .verify_service_jwt(&good, "did:web:other.example")
+            .await
+            .is_err());
+
+        let impostor = SigningKey::random(&mut rand::thread_rng());
+        let forged = token(
+            &impostor,
+            serde_json::json!({"iss": ISSUER, "aud": SERVICE, "iat": now(), "exp": now() + 60}),
+            false,
+        );
+        assert!(
+            auth.verify_service_jwt(&forged, SERVICE).await.is_err(),
+            "wrong key"
+        );
+
+        let expired = token(
+            &key,
+            serde_json::json!({"iss": ISSUER, "aud": SERVICE, "iat": now() - 120, "exp": now() - 60}),
+            false,
+        );
+        assert!(
+            auth.verify_service_jwt(&expired, SERVICE).await.is_err(),
+            "expired"
+        );
+    }
+
+    /// Reference-PDS-shaped tokens (no jti, aud with a service fragment) and
+    /// legacy DER signatures from not-yet-updated Aurora peers are accepted.
+    #[tokio::test]
+    async fn accepts_reference_shapes_and_legacy_der() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let auth = ServiceAuthenticator::new(resolver_for(&key));
+
+        let no_jti = token(
+            &key,
+            serde_json::json!({
+                "iss": ISSUER, "aud": format!("{SERVICE}#atproto_pds"),
+                "iat": now(), "exp": now() + 60
+            }),
+            false,
+        );
+        let claims = auth
+            .verify_service_jwt(&no_jti, SERVICE)
+            .await
+            .expect("verifies");
+        assert_eq!(
+            claims.jti,
+            proto_blue::crypto::sha256_hex(no_jti.as_bytes()),
+            "replay key falls back to the token hash"
+        );
+
+        let legacy = token(
+            &key,
+            serde_json::json!({"iss": ISSUER, "aud": SERVICE, "iat": now(), "exp": now() + 60, "jti": "n2"}),
+            true,
+        );
+        assert!(
+            auth.verify_service_jwt(&legacy, SERVICE).await.is_ok(),
+            "DER accepted"
+        );
     }
 }

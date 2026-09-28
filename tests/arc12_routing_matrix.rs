@@ -4,7 +4,7 @@
 //! `require_auth_unified` after Step 0.6.3's tuple-based routing
 //! rewrite. Each case asserts both the dispatch outcome and the
 //! routing path responsible for it, using
-//! `MockIdentityResolver::get_signing_key_calls()` as the deterministic
+//! `MockIdentityResolver::resolve_did_calls()` as the deterministic
 //! witness for whether the trusted service-auth fallback fired (any
 //! `>= 1`) or rejected before fetching a key (`== 0`).
 //!
@@ -208,9 +208,6 @@ fn script_k256(mock: &MockIdentityResolver, did: &str) -> K256SigningKey {
     let signing_key = K256SigningKey::random(&mut rand::thread_rng());
     let verifying_key: K256VerifyingKey = *signing_key.verifying_key();
     mock.script_did(did, did_doc_with_k256(did, &verifying_key));
-    // verify_service_jwt calls get_signing_key separately; script
-    // that map too so the fallback actually reaches the verify step.
-    mock.script_signing_key(did, b"-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n".to_vec());
     signing_key
 }
 
@@ -268,7 +265,7 @@ async fn case_01_opaque_oauth_token_routes_to_oauth_path() {
         other => panic!("expected OAuth variant, got {:?}", other),
     }
     // Opaque-token path never touches PLC.
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -292,7 +289,7 @@ async fn case_02_hs256_with_aurora_local_v1_kid_routes_to_local_verify() {
         UnifiedAuthContext::Local(s) => assert_eq!(s.did, TEST_USER_DID),
         other => panic!("expected Local variant, got {:?}", other),
     }
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -339,7 +336,7 @@ async fn case_03_hs256_no_kid_routes_to_local_verify() {
         UnifiedAuthContext::Local(s) => assert_eq!(s.did, TEST_USER_DID),
         other => panic!("expected Local variant, got {:?}", other),
     }
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -386,10 +383,9 @@ async fn case_06_es256k_entryway_kid_wrong_aud_rejected_at_audience_check() {
 // Case 7 — ES256K + no kid + iss = local PDS DID → fallback
 // ============================================================
 
-#[ignore = "Step 1.3: verify_service_jwt's first decode uses Validation::default() (HS256-only), \
-            so ES256K tokens reject before reaching get_signing_key. Step 1.3's extraction \
-            of verify_jwt_with_allowlist must support an alg-agnostic header peek so this \
-            fallback dispatch can actually trigger key resolution."]
+// Un-ignored by #474: the cross-PDS verifier used to decode ES256K tokens as
+// HS256/ES256 and reject them before any key resolution; it now resolves the
+// issuer's DID document and verifies ES256K.
 #[tokio::test]
 async fn case_07_es256k_no_kid_iss_local_pds_dispatches_to_service_auth_fallback() {
     let (ctx, mock) = build_test_ctx().await;
@@ -405,8 +401,8 @@ async fn case_07_es256k_no_kid_iss_local_pds_dispatches_to_service_auth_fallback
 
     let _ = call_auth(&ctx, &token).await;
     assert!(
-        mock.get_signing_key_calls() >= 1,
-        "fallback must reach get_signing_key for local PDS DID"
+        mock.resolve_did_calls() >= 1,
+        "fallback must reach DID/key resolution for local PDS DID"
     );
 }
 
@@ -414,7 +410,7 @@ async fn case_07_es256k_no_kid_iss_local_pds_dispatches_to_service_auth_fallback
 // Case 8 — ES256K + unknown kid + iss = local PDS DID → fallback
 // ============================================================
 
-#[ignore = "Step 1.3: see case_07's reason — same first-decode HS256-only limitation"]
+// Un-ignored by #474 (see case_07).
 #[tokio::test]
 async fn case_08_es256k_unknown_kid_iss_local_pds_dispatches_to_service_auth_fallback() {
     let (ctx, mock) = build_test_ctx().await;
@@ -437,8 +433,8 @@ async fn case_08_es256k_unknown_kid_iss_local_pds_dispatches_to_service_auth_fal
 
     let _ = call_auth(&ctx, &token).await;
     assert!(
-        mock.get_signing_key_calls() >= 1,
-        "fallback must reach get_signing_key for unknown-kid + trusted-iss"
+        mock.resolve_did_calls() >= 1,
+        "fallback must reach DID/key resolution for unknown-kid + trusted-iss"
     );
 }
 
@@ -446,7 +442,7 @@ async fn case_08_es256k_unknown_kid_iss_local_pds_dispatches_to_service_auth_fal
 // Case 9 — ES256K + no kid + iss = peer PDS DID → fallback
 // ============================================================
 
-#[ignore = "Step 1.3: see case_07's reason — same first-decode HS256-only limitation"]
+// Un-ignored by #474 (see case_07).
 #[tokio::test]
 async fn case_09_es256k_no_kid_iss_peer_pds_dispatches_to_service_auth_fallback() {
     let (ctx, mock) = build_test_ctx().await;
@@ -460,11 +456,17 @@ async fn case_09_es256k_no_kid_iss_peer_pds_dispatches_to_service_auth_fallback(
     )
     .expect("create_service_jwt");
 
-    let _ = call_auth(&ctx, &token).await;
+    let auth = call_auth(&ctx, &token).await;
     assert!(
-        mock.get_signing_key_calls() >= 1,
-        "fallback must reach get_signing_key for peer PDS DID iss"
+        mock.resolve_did_calls() >= 1,
+        "fallback must reach DID/key resolution for peer PDS DID iss"
     );
+    // #474: a correctly signed ES256K token from a trusted peer now
+    // authenticates end to end.
+    match auth {
+        Ok(UnifiedAuthContext::CrossPDS { did }) => assert_eq!(did, TEST_PEER_DID),
+        other => panic!("expected CrossPDS for the peer, got {:?}", other),
+    }
 }
 
 // ============================================================
@@ -491,7 +493,7 @@ async fn case_10_es256k_iss_untrusted_did_rejected_at_iss_allowlist_without_plc_
     ));
     // Critical: routing rejected BEFORE any PLC fetch.
     assert_eq!(
-        mock.get_signing_key_calls(),
+        mock.resolve_did_calls(),
         0,
         "untrusted iss must reject without PLC fetch"
     );
@@ -519,7 +521,7 @@ async fn case_11_hs256_aurora_local_v1_kid_forged_sig_rejected_at_local_verify()
         aurora_locus::error::PdsError::Authentication(_)
     ));
     // Routed to local-verify (DB lookup), no PLC involvement.
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -578,7 +580,7 @@ async fn case_13_expired_local_token_rejected_at_session_expiry_check() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -601,14 +603,14 @@ async fn case_14_malformed_jwt_claims_rejected_at_decode() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
 // Case 15 — iss in trust set + sig fails against PLC-fetched key
 // ============================================================
 
-#[ignore = "Step 1.3: see case_07's reason — same first-decode HS256-only limitation"]
+// Un-ignored by #474 (see case_07).
 #[tokio::test]
 async fn case_15_iss_in_trust_set_sig_fails_against_plc_fetched_key() {
     let (ctx, mock) = build_test_ctx().await;
@@ -635,7 +637,7 @@ async fn case_15_iss_in_trust_set_sig_fails_against_plc_fetched_key() {
     // iss-allowlist passed (trusted iss), fallback fetched key,
     // sig verify failed somewhere in verify_service_jwt.
     assert!(
-        mock.get_signing_key_calls() >= 1,
+        mock.resolve_did_calls() >= 1,
         "fallback must reach get_signing_key for trusted iss"
     );
 }
@@ -667,7 +669,7 @@ async fn case_16_alg_none_rejected_at_algorithm_allowlist() {
         aurora_locus::error::PdsError::Authentication(_)
     ));
     // Rejected at the allowlist BEFORE tuple routing or any fetch.
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -691,7 +693,7 @@ async fn case_17_alg_rs256_rejected_at_algorithm_allowlist() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 // ============================================================
@@ -714,7 +716,7 @@ async fn case_18_empty_iss_with_es256k_rejected_at_iss_allowlist() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 #[tokio::test]
@@ -733,7 +735,7 @@ async fn case_18b_non_did_iss_https_url_rejected_at_iss_allowlist() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }
 
 #[tokio::test]
@@ -752,5 +754,5 @@ async fn case_18c_missing_iss_with_es256k_rejected_at_iss_allowlist() {
         err,
         aurora_locus::error::PdsError::Authentication(_)
     ));
-    assert_eq!(mock.get_signing_key_calls(), 0);
+    assert_eq!(mock.resolve_did_calls(), 0);
 }

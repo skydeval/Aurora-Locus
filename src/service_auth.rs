@@ -34,7 +34,7 @@
 /// - JWT RFC: https://tools.ietf.org/html/rfc7519
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
-use k256::ecdsa::{signature::Signer, signature::Verifier, Signature, SigningKey, VerifyingKey};
+use k256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -60,12 +60,18 @@ pub enum ServiceAuthError {
     NotJwtShaped(String),
     /// Header lacks an `alg` field, or `alg` isn't a string.
     MissingOrInvalidAlg,
-    /// Header's `alg` is a string but isn't `ES256K`.
+    /// Header's `alg` is neither `ES256K` nor `ES256`, or doesn't match the
+    /// issuer key's type.
     UnsupportedAlg(String),
     /// Claims segment couldn't be decoded or parsed.
     InvalidClaims(String),
-    /// `aud` claim doesn't byte-equal `expected_aud`.
+    /// `aud` claim is neither `expected_aud` nor `expected_aud#<service>`.
     AudienceMismatch { expected: String, received: String },
+    /// `lxm` claim doesn't name the method being called (#474).
+    MethodMismatch {
+        expected: String,
+        received: Option<String>,
+    },
     /// `identity_resolver.resolve_did(...)` returned an error.
     ResolverError(String),
     /// DID document had no `#atproto` verification method, or the
@@ -103,6 +109,12 @@ impl std::fmt::Display for ServiceAuthError {
                 f,
                 "Invalid audience: expected {}, got {}",
                 expected, received
+            ),
+            Self::MethodMismatch { expected, received } => write!(
+                f,
+                "Token is for method {}, not {}",
+                received.as_deref().unwrap_or("(none)"),
+                expected
             ),
             Self::ResolverError(detail) => write!(f, "Failed to resolve issuer DID: {}", detail),
             Self::InvalidPublicKey(detail) => write!(f, "Invalid public key: {}", detail),
@@ -425,6 +437,18 @@ pub async fn verify_service_jwt(
     expected_aud: &str,
     identity_resolver: &dyn IdentityResolverApi,
 ) -> Result<ServiceAuthClaims, ServiceAuthError> {
+    verify_service_jwt_for_method(token, expected_aud, None, identity_resolver).await
+}
+
+/// [`verify_service_jwt`] that also requires the token's `lxm` to name
+/// `expected_lxm` when one is given — the method being called, as the
+/// reference PDS checks (#474). A token without `lxm` is refused then.
+pub async fn verify_service_jwt_for_method(
+    token: &str,
+    expected_aud: &str,
+    expected_lxm: Option<&str>,
+    identity_resolver: &dyn IdentityResolverApi,
+) -> Result<ServiceAuthClaims, ServiceAuthError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(ServiceAuthError::NotJwtShaped(
@@ -445,7 +469,9 @@ pub async fn verify_service_jwt(
         .and_then(|v| v.as_str())
         .ok_or(ServiceAuthError::MissingOrInvalidAlg)?;
 
-    if alg != "ES256K" {
+    // atproto service auth is ES256K (secp256k1) or ES256 (P-256); which one
+    // must match the issuer's key, checked below.
+    if alg != "ES256K" && alg != "ES256" {
         return Err(ServiceAuthError::UnsupportedAlg(alg.to_string()));
     }
 
@@ -455,11 +481,26 @@ pub async fn verify_service_jwt(
     let claims: ServiceAuthClaims = serde_json::from_slice(&claims_bytes)
         .map_err(|e| ServiceAuthError::InvalidClaims(format!("parse failed: {}", e)))?;
 
-    if claims.aud != expected_aud {
+    // The audience is this service's DID, optionally naming the service in
+    // its DID document (`did#atproto_pds`), which some issuers include.
+    let aud_matches = claims.aud == expected_aud
+        || claims
+            .aud
+            .strip_prefix(expected_aud)
+            .is_some_and(|rest| rest.starts_with('#') && rest.len() > 1);
+    if !aud_matches {
         return Err(ServiceAuthError::AudienceMismatch {
             expected: expected_aud.to_string(),
             received: claims.aud.clone(),
         });
+    }
+    if let Some(expected) = expected_lxm {
+        if claims.lxm.as_deref() != Some(expected) {
+            return Err(ServiceAuthError::MethodMismatch {
+                expected: expected.to_string(),
+                received: claims.lxm.clone(),
+            });
+        }
     }
 
     // Cluster 2 Member 2.2 (#144): pattern-match the resolver error so
@@ -494,23 +535,49 @@ pub async fn verify_service_jwt(
             )
         })?;
 
-    let public_key_decoded = decode_multibase_key(public_key_bytes)
-        .map_err(|e| ServiceAuthError::InvalidPublicKey(e.to_string()))?;
-
-    let verifying_key = VerifyingKey::from_sec1_bytes(&public_key_decoded)
-        .map_err(|e| ServiceAuthError::InvalidPublicKey(e.to_string()))?;
+    // The #atproto key as a did:key (multikey form); its type decides the
+    // algorithm, which must be the one the header names.
+    let did_key = format!("did:key:{}", public_key_bytes);
+    let key_alg = proto_blue::crypto::parse_did_key(&did_key)
+        .map_err(|e| ServiceAuthError::InvalidPublicKey(e.to_string()))?
+        .jwt_alg;
+    if key_alg != alg {
+        return Err(ServiceAuthError::UnsupportedAlg(format!(
+            "{alg} token for a {key_alg} key"
+        )));
+    }
 
     let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|e| {
         ServiceAuthError::InvalidSignatureFormat(format!("base64 decode failed: {}", e))
     })?;
-    let signature = decode_es256k_signature(&signature_bytes).map_err(|e| {
-        ServiceAuthError::InvalidSignatureFormat(format!("signature parse failed: {}", e))
-    })?;
+    // atproto signatures are 64-byte compact low-S. Aurora-Locus minted DER
+    // before #473; convert those (secp256k1 only) so not-yet-updated peers
+    // still verify.
+    let signature_bytes = if signature_bytes.len() == 64 {
+        signature_bytes
+    } else if alg == "ES256K" {
+        let sig = decode_es256k_signature(&signature_bytes).map_err(|e| {
+            ServiceAuthError::InvalidSignatureFormat(format!("signature parse failed: {}", e))
+        })?;
+        sig.normalize_s().unwrap_or(sig).to_bytes().to_vec()
+    } else {
+        return Err(ServiceAuthError::InvalidSignatureFormat(
+            "expected a 64-byte compact signature".to_string(),
+        ));
+    };
 
+    // Strict atproto verification: compact, low-S only.
     let signing_input = format!("{}.{}", header_b64, claims_b64);
-    verifying_key
-        .verify(signing_input.as_bytes(), &signature)
-        .map_err(|_| ServiceAuthError::SignatureVerificationFailed)?;
+    let verified = proto_blue::crypto::verify_signature(
+        &did_key,
+        signing_input.as_bytes(),
+        &signature_bytes,
+        false,
+    )
+    .map_err(|e| ServiceAuthError::InvalidSignatureFormat(e.to_string()))?;
+    if !verified {
+        return Err(ServiceAuthError::SignatureVerificationFailed);
+    }
 
     // Validate claims (expiration window). `claims.validate` returns
     // PdsError variants; lift them into ServiceAuthError so the
@@ -522,49 +589,6 @@ pub async fn verify_service_jwt(
         // `ServiceAuthClaims::validate` doesn't construct any other
         // PdsError variant, but be defensive in case it grows one.
         Err(other) => Err(ServiceAuthError::InvalidExpirationWindow(other.to_string())),
-    }
-}
-
-/// Decode a multibase-encoded public key
-///
-/// ATProto uses multibase encoding (specifically base58btc) for public keys.
-/// Format: z<base58btc-encoded-key>
-///
-/// For secp256k1 keys:
-/// - Multicodec prefix: 0xe7 (secp256k1-pub)
-/// - Key bytes: 33 bytes (compressed) or 65 bytes (uncompressed)
-fn decode_multibase_key(multibase_key: &str) -> PdsResult<Vec<u8>> {
-    // Check for 'z' prefix (base58btc)
-    if !multibase_key.starts_with('z') {
-        return Err(PdsError::Authentication(
-            "Invalid multibase key: must start with 'z' (base58btc)".to_string(),
-        ));
-    }
-
-    // Decode base58btc (strip 'z' prefix)
-    let encoded = &multibase_key[1..];
-    let decoded = bs58::decode(encoded)
-        .into_vec()
-        .map_err(|e| PdsError::Authentication(format!("Failed to decode base58: {}", e)))?;
-
-    // Check multicodec prefix for secp256k1-pub (0xe7)
-    if decoded.is_empty() {
-        return Err(PdsError::Authentication("Empty key data".to_string()));
-    }
-
-    // For secp256k1-pub, the multicodec is 0xe7 (231 in decimal)
-    // However, the encoding uses varint, so we need to check for the varint-encoded value
-    // 0xe7 in varint is: 0xe7, 0x01 (two bytes)
-    if decoded[0] == 0xe7 && decoded.len() > 1 {
-        // This is a secp256k1 key, skip the multicodec prefix (2 bytes for varint)
-        let skip_bytes = if decoded[1] == 0x01 { 2 } else { 1 };
-        Ok(decoded[skip_bytes..].to_vec())
-    } else if decoded[0] == 0xe7 {
-        // Single byte prefix
-        Ok(decoded[1..].to_vec())
-    } else {
-        // Try without prefix (some implementations may not include it)
-        Ok(decoded)
     }
 }
 
@@ -595,6 +619,7 @@ pub fn generate_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::SigningKey;
 
     #[test]
@@ -837,43 +862,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_decode_multibase_key_valid() {
-        // Example multibase key (base58btc with 'z' prefix)
-        // This is a synthetic example - in reality this would be a properly encoded key
-        let key_bytes = vec![0x02; 33]; // Compressed secp256k1 public key (33 bytes)
-
-        // Add multicodec prefix for secp256k1-pub (0xe7)
-        let mut with_prefix = vec![0xe7];
-        with_prefix.extend_from_slice(&key_bytes);
-
-        // Encode as base58btc
-        let encoded = bs58::encode(&with_prefix).into_string();
-        let multibase = format!("z{}", encoded);
-
-        let result = decode_multibase_key(&multibase);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), key_bytes);
-    }
-
-    #[test]
-    fn test_decode_multibase_key_invalid_prefix() {
-        // Invalid prefix (not 'z')
-        let result = decode_multibase_key("a123456");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("must start with 'z'"));
-    }
-
-    #[test]
-    fn test_decode_multibase_key_invalid_base58() {
-        // Invalid base58 characters
-        let result = decode_multibase_key("z0OIl"); // 0, O, I, l are not valid base58
-        assert!(result.is_err());
-    }
-
     /// Step 0.6 smoke test — proves the test-friendly resolver is
     /// callable from this module's test scope and that its invocation
     /// counter is observable. Step 1's algorithm-confusion tests will
@@ -900,11 +888,8 @@ mod verify_service_jwt_tests {
     //! cases below, the security boundary leaked and the design needs
     //! revision — counter assertions read zero are the contract.
     //!
-    //! `verify_service_jwt` calls `resolver.resolve_did(...)` and then
-    //! reads the signing key off the returned `DidDocument` directly
-    //! (it does NOT call `resolver.get_signing_key(...)`). So
-    //! `get_signing_key_calls()` is always 0 in these tests; the
-    //! load-bearing counter is `resolve_did_calls()`.
+    //! The load-bearing counter is `resolve_did_calls()`: `verify_service_jwt`
+    //! reads the signing key off the resolved `DidDocument`.
     use super::*;
     use crate::identity::did_document::{DidDocument, VerificationMethod};
     use crate::identity::resolver::test_doubles::MockIdentityResolver;
@@ -1092,10 +1077,6 @@ mod verify_service_jwt_tests {
             mock.resolve_did_calls() >= 1,
             "happy path must reach resolver — otherwise verification short-circuited"
         );
-        // `verify_service_jwt` reads the key off the DidDocument
-        // directly rather than calling resolver.get_signing_key();
-        // pin that fact as a contract.
-        assert_eq!(mock.get_signing_key_calls(), 0);
     }
 
     // ---------- Algorithm-confusion negative tests (Q8 hypothesis) ----------
@@ -1117,11 +1098,6 @@ mod verify_service_jwt_tests {
             mock.resolve_did_calls(),
             0,
             "alg-rejection path called resolve_did — algorithm boundary leaked"
-        );
-        assert_eq!(
-            mock.get_signing_key_calls(),
-            0,
-            "alg-rejection path called get_signing_key — algorithm boundary leaked"
         );
     }
 
@@ -1165,11 +1141,6 @@ mod verify_service_jwt_tests {
             0,
             "alg-rejection path called resolve_did — algorithm boundary leaked"
         );
-        assert_eq!(
-            mock.get_signing_key_calls(),
-            0,
-            "alg-rejection path called get_signing_key — algorithm boundary leaked"
-        );
     }
 
     #[tokio::test]
@@ -1187,11 +1158,6 @@ mod verify_service_jwt_tests {
             0,
             "alg-rejection path called resolve_did — algorithm boundary leaked"
         );
-        assert_eq!(
-            mock.get_signing_key_calls(),
-            0,
-            "alg-rejection path called get_signing_key — algorithm boundary leaked"
-        );
     }
 
     #[tokio::test]
@@ -1208,11 +1174,6 @@ mod verify_service_jwt_tests {
             mock.resolve_did_calls(),
             0,
             "alg-rejection path called resolve_did — algorithm boundary leaked"
-        );
-        assert_eq!(
-            mock.get_signing_key_calls(),
-            0,
-            "alg-rejection path called get_signing_key — algorithm boundary leaked"
         );
     }
 
@@ -1347,9 +1308,6 @@ mod verify_service_jwt_tests {
             mock.resolve_did_calls() >= 1,
             "signature-corrupted path is reached only after resolver invocation"
         );
-        // verify_service_jwt does not call resolver.get_signing_key();
-        // it reads the key off the DidDocument directly.
-        assert_eq!(mock.get_signing_key_calls(), 0);
     }
 
     fn future_exp() -> i64 {

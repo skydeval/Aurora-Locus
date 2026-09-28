@@ -705,11 +705,14 @@ pub async fn service_auth(
         // Local auth failed - try service auth (cross-PDS)
         if let Some(service_auth) = &ctx.federation_auth {
             let service_did = ctx.service_did();
+            // The token must be for the method being called (#474), as the
+            // reference PDS requires, when this is an XRPC call.
+            let method = req.uri().path().strip_prefix("/xrpc/").map(str::to_string);
 
             // Verify JWT with this PDS's DID as audience
             match service_auth
                 .authenticator
-                .verify_service_jwt(&token, service_did)
+                .verify_service_jwt_for_method(&token, service_did, method.as_deref())
                 .await
             {
                 Ok(claims) => {

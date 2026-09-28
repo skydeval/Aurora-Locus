@@ -337,9 +337,6 @@ mod tests {
         async fn resolve_handle(&self, _handle: &str) -> crate::error::PdsResult<String> {
             unimplemented!("not used by ProductionLexiconFetcher tests")
         }
-        async fn get_signing_key(&self, _did: &str) -> crate::error::PdsResult<Vec<u8>> {
-            unimplemented!()
-        }
         async fn get_handle_for_did(
             &self,
             _did: &str,

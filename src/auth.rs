@@ -621,6 +621,13 @@ fn log_service_auth_error(err: &crate::service_auth::ServiceAuthError, expected_
             // dead under future refactors.
             let _ = expected_aud;
         }
+        ServiceAuthError::MethodMismatch { expected, received } => {
+            tracing::debug!(
+                "service-auth: token lxm={:?}, called method={}",
+                received,
+                expected
+            );
+        }
         ServiceAuthError::Expired => {
             tracing::debug!("service-auth: token expired");
         }
