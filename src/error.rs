@@ -61,6 +61,12 @@ pub enum PdsError {
     #[error("Handle not found: {0}")]
     HandleNotFound(String),
 
+    /// `com.atproto.server.createAccount` was called without a usable invite
+    /// code while invites are required: missing, unknown, disabled, expired or
+    /// used up. Lexicon error name `InvalidInviteCode`, HTTP 400 (#464).
+    #[error("{0}")]
+    InvalidInviteCode(String),
+
     /// Rate limiting errors
     #[error("Rate limit exceeded")]
     RateLimitExceeded { retry_after: std::time::Duration },
@@ -605,6 +611,7 @@ impl PartialEq for PdsError {
             (PdsError::BlobStorage(a), PdsError::BlobStorage(b)) => a == b,
             (PdsError::DidResolution(a), PdsError::DidResolution(b)) => a == b,
             (PdsError::IdentityResolution(a), PdsError::IdentityResolution(b)) => a == b,
+            (PdsError::InvalidInviteCode(a), PdsError::InvalidInviteCode(b)) => a == b,
             (
                 PdsError::RateLimitExceeded { retry_after: a },
                 PdsError::RateLimitExceeded { retry_after: b },
@@ -862,6 +869,11 @@ impl IntoResponse for PdsError {
             PdsError::HandleNotFound(_) => (
                 StatusCode::BAD_REQUEST,
                 "HandleNotFound",
+                self.to_string(),
+            ),
+            PdsError::InvalidInviteCode(_) => (
+                StatusCode::BAD_REQUEST,
+                "InvalidInviteCode",
                 self.to_string(),
             ),
             // Arc 14 §7.3.5 / §7.6.5: sync-namespace typed errors.

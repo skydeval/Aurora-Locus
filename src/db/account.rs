@@ -168,25 +168,6 @@ pub struct EmailToken {
     pub used: bool,
 }
 
-/// Invite code record
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct InviteCode {
-    pub code: String,
-    pub available_uses: i32,
-    pub disabled: bool,
-    pub created_by: String,
-    pub created_at: DateTime<Utc>,
-    pub created_for: Option<String>,
-}
-
-/// Invite code usage record
-#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
-pub struct InviteCodeUse {
-    pub code: String,
-    pub used_by: String,
-    pub used_at: DateTime<Utc>,
-}
-
 /// App password record (for OAuth/third-party apps)
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct AppPassword {

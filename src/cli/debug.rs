@@ -29,8 +29,8 @@ pub async fn inspect_account(ctx: &AppContext, identifier: &str, format: &str) -
 
     // Get invite codes (if available)
     let invite_codes = ctx
-        .account_manager
-        .list_invite_codes(&account.did)
+        .invite_manager
+        .get_codes_for_account(&account.did)
         .await
         .unwrap_or_else(|_| Vec::new());
 
@@ -453,8 +453,8 @@ pub async fn export_account(ctx: &AppContext, did: &str, output: &str) -> PdsRes
 
     // Get invite codes
     let invite_codes = ctx
-        .account_manager
-        .list_invite_codes(did)
+        .invite_manager
+        .get_codes_for_account(did)
         .await
         .unwrap_or_else(|_| Vec::new());
 
@@ -521,7 +521,7 @@ pub async fn export_account(ctx: &AppContext, did: &str, output: &str) -> PdsRes
         })).collect::<Vec<_>>(),
         "invite_codes": invite_codes.iter().map(|ic| json!({
             "code": ic.code,
-            "available_uses": ic.available_uses,
+            "available": ic.available,
             "disabled": ic.disabled,
             "created_at": ic.created_at,
         })).collect::<Vec<_>>(),

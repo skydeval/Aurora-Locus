@@ -25,7 +25,7 @@ pub async fn create_account(
     // Validate invite code if provided
     if let Some(code) = invite_code {
         println!("📋 Validating invite code...");
-        ctx.account_manager.validate_invite_code(code, None).await?;
+        ctx.invite_manager.check_available(code).await?;
         println!("✓ Invite code is valid");
     }
 

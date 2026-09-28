@@ -98,6 +98,30 @@ pub struct InviteCode {
     pub for_account: Option<String>,
 }
 
+/// Build an [`InviteCode`] from a row selecting `code, available, disabled,
+/// created_by, created_at, expires_at, note, for_account`.
+fn invite_from_row(row: &sqlx::any::AnyRow) -> PdsResult<InviteCode> {
+    let created_at_str: String = row.get("created_at");
+    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
+        .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
+        .with_timezone(&Utc);
+    let expires_at = row
+        .try_get::<String, _>("expires_at")
+        .ok()
+        .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+    Ok(InviteCode {
+        code: row.get("code"),
+        available: row.get("available"),
+        disabled: crate::db::read_bool(row, "disabled")?,
+        created_by: row.get("created_by"),
+        created_at,
+        expires_at,
+        note: row.get("note"),
+        for_account: row.get("for_account"),
+    })
+}
+
 /// Invite code manager
 #[derive(Clone)]
 pub struct InviteCodeManager {
@@ -185,83 +209,148 @@ impl InviteCodeManager {
         })
     }
 
-    /// Validate and use invite code
-    pub async fn use_code(&self, code: &str, used_by: &str) -> PdsResult<()> {
-        let now = Utc::now();
-
-        // Get code details
-        let row = sqlx::query(
-            r#"
-            SELECT available, disabled, expires_at, for_account
-            FROM invite_code
-            WHERE code = $1
-            "#,
-        )
-        .bind(code)
-        .fetch_optional(&self.db)
-        .await?;
-
-        let row = row.ok_or_else(|| PdsError::NotFound("Invite code not found".to_string()))?;
-
-        let available: i32 = row.get("available");
-        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
-        let for_account: Option<String> = row.get("for_account");
-
-        // Validate code
+    /// Why a code with these stored values cannot be redeemed at `now`, or
+    /// `None` when it can (#464). `expires_at` is the stored RFC3339 string.
+    fn unredeemable_reason(
+        available: i32,
+        disabled: bool,
+        expires_at: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> PdsResult<Option<&'static str>> {
         if disabled {
-            return Err(PdsError::Validation("Invite code is disabled".to_string()));
+            return Ok(Some("Invite code has been disabled"));
+        }
+        if available <= 0 {
+            return Ok(Some("Invite code has no uses remaining"));
+        }
+        if let Some(raw) = expires_at.filter(|s| !s.is_empty()) {
+            let expires = DateTime::parse_from_rfc3339(raw)
+                .map_err(|e| PdsError::Internal(format!("Invalid invite expiry timestamp: {}", e)))?
+                .with_timezone(&Utc);
+            if expires < now {
+                return Ok(Some("Invite code has expired"));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Check that `code` can be redeemed now, without using it (#464). Account
+    /// creation calls this before writing anything (including the PLC
+    /// registration), so a bad code fails fast with `InvalidInviteCode`.
+    pub async fn check_available(&self, code: &str) -> PdsResult<()> {
+        let row =
+            sqlx::query("SELECT available, disabled, expires_at FROM invite_code WHERE code = $1")
+                .bind(code)
+                .fetch_optional(&self.db)
+                .await?
+                .ok_or_else(|| PdsError::InvalidInviteCode("Invite code not found".to_string()))?;
+        let expires_at: Option<String> = row.try_get("expires_at").ok().flatten();
+        match Self::unredeemable_reason(
+            row.get("available"),
+            crate::db::read_bool(&row, "disabled")?,
+            expires_at.as_deref(),
+            Utc::now(),
+        )? {
+            Some(reason) => Err(PdsError::InvalidInviteCode(reason.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Redeem one use of `code` for the account `used_by` (its DID) inside the
+    /// caller's transaction (#464): the use lands only if the caller commits,
+    /// so a failure anywhere in account creation leaves the code available.
+    /// The decrement is conditional on a remaining use, so two concurrent
+    /// signups cannot both take the last one.
+    ///
+    /// `invite_code.for_account` is the account the code was issued for (its
+    /// owner, as in `com.atproto.server.createInviteCode`), not a restriction
+    /// on who may redeem it.
+    pub async fn consume_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        code: &str,
+        used_by: &str,
+    ) -> PdsResult<()> {
+        let now = Utc::now();
+        let row =
+            sqlx::query("SELECT available, disabled, expires_at FROM invite_code WHERE code = $1")
+                .bind(code)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or_else(|| PdsError::InvalidInviteCode("Invite code not found".to_string()))?;
+        let expires_at: Option<String> = row.try_get("expires_at").ok().flatten();
+        if let Some(reason) = Self::unredeemable_reason(
+            row.get("available"),
+            crate::db::read_bool(&row, "disabled")?,
+            expires_at.as_deref(),
+            now,
+        )? {
+            return Err(PdsError::InvalidInviteCode(reason.to_string()));
         }
 
-        if available <= 0 {
-            return Err(PdsError::Validation(
+        let updated = sqlx::query(
+            "UPDATE invite_code SET available = available - 1 WHERE code = $1 AND available > 0",
+        )
+        .bind(code)
+        .execute(&mut **tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(PdsError::InvalidInviteCode(
                 "Invite code has no uses remaining".to_string(),
             ));
         }
 
-        if let Ok(Some(expires_at_str)) = row.try_get::<Option<String>, _>("expires_at") {
-            if !expires_at_str.is_empty() {
-                let expires_at = DateTime::parse_from_rfc3339(&expires_at_str)
+        sqlx::query("INSERT INTO invite_code_use (code, used_by, used_at) VALUES ($1, $2, $3)")
+            .bind(code)
+            .bind(used_by)
+            .bind(now.to_rfc3339())
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Redeem one use of `code` for `used_by` in its own transaction. See
+    /// [`consume_in_tx`](Self::consume_in_tx).
+    pub async fn use_code(&self, code: &str, used_by: &str) -> PdsResult<()> {
+        let mut tx = self.db.begin().await?;
+        Self::consume_in_tx(&mut tx, code, used_by).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Invite codes issued for `did` (`invite_code.for_account`), newest first:
+    /// the codes `com.atproto.server.getAccountInviteCodes` returns.
+    pub async fn get_codes_for_account(&self, did: &str) -> PdsResult<Vec<InviteCode>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT code, available, disabled, created_by, created_at, expires_at, note, for_account
+            FROM invite_code
+            WHERE for_account = $1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(did)
+        .fetch_all(&self.db)
+        .await?;
+        rows.iter().map(invite_from_row).collect()
+    }
+
+    /// Every use of `code` as `(used_by DID, used_at)`, newest first.
+    pub async fn get_code_uses(&self, code: &str) -> PdsResult<Vec<(String, DateTime<Utc>)>> {
+        let rows = sqlx::query(
+            "SELECT used_by, used_at FROM invite_code_use WHERE code = $1 ORDER BY used_at DESC",
+        )
+        .bind(code)
+        .fetch_all(&self.db)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let used_at: String = row.get("used_at");
+                let used_at = DateTime::parse_from_rfc3339(&used_at)
                     .map_err(|e| PdsError::Internal(format!("Invalid timestamp: {}", e)))?
                     .with_timezone(&Utc);
-                if expires_at < now {
-                    return Err(PdsError::Validation("Invite code has expired".to_string()));
-                }
-            }
-        }
-
-        if let Some(specific_account) = for_account {
-            if specific_account != used_by {
-                return Err(PdsError::Authorization(
-                    "This invite code is reserved for another account".to_string(),
-                ));
-            }
-        }
-
-        // Use code (decrement available and record usage)
-        sqlx::query(
-            r#"
-            UPDATE invite_code
-            SET available = available - 1
-            WHERE code = $1
-            "#,
-        )
-        .bind(code)
-        .execute(&self.db)
-        .await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO invite_code_use (code, used_by, used_at)
-            VALUES ($1, $2, $3)
-            "#,
-        )
-        .bind(code)
-        .bind(used_by)
-        .bind(now.to_rfc3339())
-        .execute(&self.db)
-        .await?;
-
-        Ok(())
+                Ok((row.get::<String, _>("used_by"), used_at))
+            })
+            .collect()
     }
 
     /// Disable invite code

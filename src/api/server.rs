@@ -164,33 +164,22 @@ async fn create_account(
         None
     };
 
-    // Validate and use invite code if required
-    if ctx.config.invites.required {
-        tracing::debug!("create_account: Invite code required, validating");
-        let code = req.invite_code.as_ref().ok_or_else(|| {
-            crate::error::PdsError::Validation("Invite code required".to_string())
-        })?;
-
-        // Validate and mark code as used
-        ctx.invite_manager
-            .use_code(code, &req.handle)
-            .await
-            .map_err(|e| {
-                tracing::error!("create_account: Failed to use invite code: {}", e);
-                e
-            })?;
-        tracing::debug!("create_account: Invite code validated successfully");
-    }
-
-    // Create account (pass None for invite_code since we already validated it).
-    // Arc 13 §6.3.3 / Step 2.2: pass through the optional
-    // `recovery_key` input so it ends up first in the genesis op's
-    // rotation_keys per §6.3.3 priority order.
+    // Create the account. The invite code (#464) is checked and redeemed by
+    // AccountManager::create_account alone: checked before anything is
+    // written, redeemed in the account-insert transaction against the new DID.
+    // Arc 13 §6.3.3 / Step 2.2: pass through the optional `recovery_key` input
+    // so it ends up first in the genesis op's rotation_keys per §6.3.3.
     tracing::debug!("create_account: Creating account in database");
     let email = req.email.clone();
     let account = ctx
         .account_manager
-        .create_account(req.handle.clone(), req.email, req.password, None, req.recovery_key)
+        .create_account(
+            req.handle.clone(),
+            req.email,
+            req.password,
+            req.invite_code,
+            req.recovery_key,
+        )
         .await
         .map_err(|e| {
             tracing::error!(
@@ -1469,71 +1458,90 @@ async fn describe_server(State(ctx): State<AppContext>) -> PdsResult<Json<Descri
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GetAccountInviteCodesResponse {
-    codes: Vec<InviteCodeInfo>,
+    codes: Vec<InviteCodeView>,
 }
 
+/// `com.atproto.server.defs#inviteCode`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InviteCodeInfo {
+struct InviteCodeView {
     code: String,
     available: i32,
     disabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    for_account: Option<String>,
+    for_account: String,
+    created_by: String,
     created_at: String,
-    uses: Vec<InviteCodeUse>,
+    uses: Vec<InviteCodeUseView>,
 }
 
+/// `com.atproto.server.defs#inviteCodeUse`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InviteCodeUse {
+struct InviteCodeUseView {
     used_by: String,
     used_at: String,
 }
 
-/// Get account invite codes endpoint
-///
-/// Returns all invite codes allocated to or created by the authenticated user.
+/// `com.atproto.server.getAccountInviteCodes` — the invite codes issued for
+/// the authenticated account (`invite_code.for_account`), with their uses.
 async fn get_account_invite_codes(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<GetAccountInviteCodesResponse>> {
-    // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
-    // Get user's invite codes
     let codes = ctx
-        .account_manager
-        .list_invite_codes(&validated.did)
+        .invite_manager
+        .get_codes_for_account(&validated.did)
         .await?;
-
-    // Build response with usage information
-    let mut code_infos = Vec::new();
+    let mut views = Vec::with_capacity(codes.len());
     for code in codes {
-        // Get usage history for each code
-        let uses_raw = ctx
-            .account_manager
-            .get_invite_code_usage(&code.code)
-            .await?;
-        let uses = uses_raw
+        let uses = ctx
+            .invite_manager
+            .get_code_uses(&code.code)
+            .await?
             .into_iter()
-            .map(|u| InviteCodeUse {
-                used_by: u.used_by,
-                used_at: u.used_at.to_rfc3339(),
+            .map(|(used_by, used_at)| InviteCodeUseView {
+                used_by,
+                used_at: used_at.to_rfc3339(),
             })
             .collect();
-
-        code_infos.push(InviteCodeInfo {
+        views.push(InviteCodeView {
             code: code.code,
-            available: code.available_uses,
+            available: code.available,
             disabled: code.disabled,
-            for_account: code.created_for,
+            for_account: code.for_account.unwrap_or_else(|| validated.did.clone()),
+            created_by: code.created_by,
             created_at: code.created_at.to_rfc3339(),
             uses,
         });
     }
 
-    Ok(Json(GetAccountInviteCodesResponse { codes: code_infos }))
+    Ok(Json(GetAccountInviteCodesResponse { codes: views }))
+}
+
+/// Invite creation is an administrator action (#464): letting any account mint
+/// codes would make `PDS_INVITE_REQUIRED` meaningless. The reference PDS
+/// gates `createInviteCode(s)` on admin auth likewise.
+fn require_invite_admin(auth: &crate::auth::AdminAuthContext) -> PdsResult<()> {
+    if auth.role.can_act_as(crate::admin::roles::Role::Admin) {
+        Ok(())
+    } else {
+        Err(PdsError::Authorization(
+            "Creating invite codes requires the Admin role".to_string(),
+        ))
+    }
+}
+
+/// Validate a requested per-code use count.
+fn validate_use_count(use_count: i32) -> PdsResult<()> {
+    if (1..=10).contains(&use_count) {
+        Ok(())
+    } else {
+        Err(PdsError::Validation(
+            "useCount must be between 1 and 10".to_string(),
+        ))
+    }
 }
 
 /// Request for createInviteCode
@@ -1541,7 +1549,7 @@ async fn get_account_invite_codes(
 #[serde(rename_all = "camelCase")]
 struct CreateInviteCodeRequest {
     use_count: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     for_account: Option<String>,
 }
 
@@ -1552,125 +1560,93 @@ struct CreateInviteCodeResponse {
     code: String,
 }
 
-/// Create invite code endpoint
-///
-/// Allows authenticated users to create invite codes (if they have allocation).
+/// `com.atproto.server.createInviteCode` (admin) — one code with `useCount`
+/// uses, issued for `forAccount` when given.
 async fn create_invite_code(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    auth: crate::auth::AdminAuthContext,
     Json(req): Json<CreateInviteCodeRequest>,
 ) -> PdsResult<Json<CreateInviteCodeResponse>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
-
-    // Validate use count
-    if req.use_count < 1 {
-        return Err(PdsError::Validation(
-            "Use count must be at least 1".to_string(),
-        ));
-    }
-
-    if req.use_count > 10 {
-        return Err(PdsError::Validation(
-            "Use count cannot exceed 10".to_string(),
-        ));
-    }
-
-    // Create invite code
+    require_invite_admin(&auth)?;
+    validate_use_count(req.use_count)?;
     let code = ctx
-        .account_manager
-        .create_invite_code(&validated.did, req.use_count, req.for_account)
+        .invite_manager
+        .create_invite(&auth.did, req.use_count, None, None, req.for_account)
         .await?;
-
-    Ok(Json(CreateInviteCodeResponse { code }))
+    Ok(Json(CreateInviteCodeResponse { code: code.code }))
 }
 
 /// Request for createInviteCodes (bulk creation)
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateInviteCodesRequest {
+    #[serde(default = "default_code_count")]
     code_count: i32,
     use_count: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     for_accounts: Option<Vec<String>>,
+}
+
+fn default_code_count() -> i32 {
+    1
 }
 
 /// Response for createInviteCodes
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateInviteCodesResponse {
-    codes: Vec<AccountInviteCode>,
+    codes: Vec<AccountCodes>,
 }
 
+/// `com.atproto.server.createInviteCodes#accountCodes`.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct AccountInviteCode {
-    code: String,
-    available: i32,
-    disabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    for_account: Option<String>,
-    created_at: String,
-    created_by: String,
+struct AccountCodes {
+    account: String,
+    codes: Vec<String>,
 }
 
-/// Create invite codes endpoint (bulk)
-///
-/// Allows authenticated users (or admins) to create multiple invite codes at once.
+/// `com.atproto.server.createInviteCodes` (admin) — `codeCount` codes for each
+/// account in `forAccounts` (per the lexicon), or `codeCount` codes issued for
+/// no particular account (reported under `"admin"`, as the reference PDS does).
 async fn create_invite_codes(
     State(ctx): State<AppContext>,
-    headers: HeaderMap,
+    auth: crate::auth::AdminAuthContext,
     Json(req): Json<CreateInviteCodesRequest>,
 ) -> PdsResult<Json<CreateInviteCodesResponse>> {
-    // Require authentication
-    let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
-
-    // Validate counts
-    if req.code_count < 1 || req.code_count > 100 {
+    require_invite_admin(&auth)?;
+    validate_use_count(req.use_count)?;
+    if !(1..=100).contains(&req.code_count) {
         return Err(PdsError::Validation(
-            "Code count must be between 1 and 100".to_string(),
+            "codeCount must be between 1 and 100".to_string(),
         ));
     }
-
-    if req.use_count < 1 || req.use_count > 10 {
-        return Err(PdsError::Validation(
-            "Use count must be between 1 and 10".to_string(),
-        ));
-    }
-
-    // Check if for_accounts matches code_count (if provided)
-    if let Some(ref accounts) = req.for_accounts {
-        if accounts.len() != req.code_count as usize {
-            return Err(PdsError::Validation(
-                "Number of for_accounts must match code_count".to_string(),
-            ));
+    let targets: Vec<Option<String>> = match req.for_accounts {
+        Some(accounts) if !accounts.is_empty() => {
+            if accounts.len() > 100 {
+                return Err(PdsError::Validation("at most 100 forAccounts".to_string()));
+            }
+            accounts.into_iter().map(Some).collect()
         }
-    }
+        _ => vec![None],
+    };
 
-    // Create codes
-    let mut codes = Vec::new();
-    for i in 0..req.code_count {
-        let for_account = req
-            .for_accounts
-            .as_ref()
-            .and_then(|a| a.get(i as usize).cloned());
-        let code = ctx
-            .account_manager
-            .create_invite_code(&validated.did, req.use_count, for_account.clone())
-            .await?;
-
-        let now = Utc::now();
-        codes.push(AccountInviteCode {
-            code,
-            available: req.use_count,
-            disabled: false,
-            for_account,
-            created_at: now.to_rfc3339(),
-            created_by: validated.did.clone(),
+    let mut out = Vec::with_capacity(targets.len());
+    for account in targets {
+        let mut codes = Vec::with_capacity(req.code_count as usize);
+        for _ in 0..req.code_count {
+            let code = ctx
+                .invite_manager
+                .create_invite(&auth.did, req.use_count, None, None, account.clone())
+                .await?;
+            codes.push(code.code);
+        }
+        out.push(AccountCodes {
+            account: account.unwrap_or_else(|| "admin".to_string()),
+            codes,
         });
     }
-
-    Ok(Json(CreateInviteCodesResponse { codes }))
+    Ok(Json(CreateInviteCodesResponse { codes: out }))
 }
 
 /// Body for activate_account. All fields optional — empty body
@@ -2213,5 +2189,235 @@ mod create_session_ip_binding_tests {
             .validate_access_token_with_ip(&token, None)
             .await
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod invite_tests {
+    //! #464 — createAccount with invites required, and the invite XRPCs.
+    use super::*;
+    use crate::admin::roles::Role;
+    use crate::api::federation_peers::test_support::create_test_context_with;
+    use crate::auth::AdminAuthContext;
+
+    async fn invite_ctx() -> AppContext {
+        create_test_context_with(|c| c.invites.required = true).await
+    }
+
+    fn auth(role: Role) -> AdminAuthContext {
+        AdminAuthContext {
+            did: "did:plc:operator".to_string(),
+            session: crate::account::ValidatedSession {
+                did: "did:plc:operator".to_string(),
+                session_id: "s".to_string(),
+                is_app_password: false,
+            },
+            role,
+        }
+    }
+
+    fn signup_request(handle: &str, code: Option<&str>) -> CreateAccountRequest {
+        CreateAccountRequest {
+            handle: handle.to_string(),
+            email: None,
+            password: "password123".to_string(),
+            invite_code: code.map(str::to_string),
+            did: None,
+            recovery_key: None,
+        }
+    }
+
+    /// The production bug: the handler redeemed the code, then the manager
+    /// demanded one again and failed, leaving the code burned. Through the real
+    /// endpoint, a valid code now creates the account and is used once, by DID.
+    #[tokio::test]
+    async fn create_account_endpoint_with_invite_required_succeeds_once() {
+        let ctx = invite_ctx().await;
+        let code = ctx
+            .invite_manager
+            .create_invite("did:plc:operator", 1, None, None, None)
+            .await
+            .unwrap()
+            .code;
+
+        let Json(resp) = create_account(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(signup_request("newbie.localhost", Some(&code))),
+        )
+        .await
+        .expect("signup with a valid invite succeeds");
+
+        let stored = ctx.invite_manager.get_code(&code).await.unwrap().unwrap();
+        assert_eq!(stored.available, 0);
+        let uses = ctx.invite_manager.get_code_uses(&code).await.unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].0, resp.did,
+            "used_by is the account DID, not the handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_account_endpoint_without_a_code_is_invalid_invite_code() {
+        let ctx = invite_ctx().await;
+        let err = create_account(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(signup_request("nocode.localhost", None)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::InvalidInviteCode(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn create_invite_code_is_admin_only() {
+        let ctx = invite_ctx().await;
+        let req = || {
+            Json(CreateInviteCodeRequest {
+                use_count: 2,
+                for_account: Some("did:plc:owner".to_string()),
+            })
+        };
+        let err = create_invite_code(State(ctx.clone()), auth(Role::Moderator), req())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+
+        let Json(resp) = create_invite_code(State(ctx.clone()), auth(Role::Admin), req())
+            .await
+            .unwrap();
+        let stored = ctx
+            .invite_manager
+            .get_code(&resp.code)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.available, 2);
+        assert_eq!(stored.for_account.as_deref(), Some("did:plc:owner"));
+        assert_eq!(stored.created_by, "did:plc:operator");
+    }
+
+    #[tokio::test]
+    async fn create_invite_codes_follows_the_lexicon_grouping() {
+        let ctx = invite_ctx().await;
+        let Json(resp) = create_invite_codes(
+            State(ctx.clone()),
+            auth(Role::SuperAdmin),
+            Json(CreateInviteCodesRequest {
+                code_count: 2,
+                use_count: 1,
+                for_accounts: Some(vec!["did:plc:a".to_string(), "did:plc:b".to_string()]),
+            }),
+        )
+        .await
+        .unwrap();
+        let v = serde_json::to_value(&resp).unwrap();
+        let groups = v["codes"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "one group per account");
+        assert_eq!(groups[0]["account"], "did:plc:a");
+        assert_eq!(
+            groups[0]["codes"].as_array().unwrap().len(),
+            2,
+            "codeCount per account"
+        );
+        assert_eq!(groups[1]["account"], "did:plc:b");
+
+        let Json(resp) = create_invite_codes(
+            State(ctx.clone()),
+            auth(Role::Admin),
+            Json(CreateInviteCodesRequest {
+                code_count: 3,
+                use_count: 1,
+                for_accounts: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.codes.len(), 1);
+        assert_eq!(resp.codes[0].account, "admin");
+        assert_eq!(resp.codes[0].codes.len(), 3);
+
+        let err = create_invite_codes(
+            State(ctx.clone()),
+            auth(Role::Admin),
+            Json(CreateInviteCodesRequest {
+                code_count: 1,
+                use_count: 0,
+                for_accounts: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn account_invite_codes_are_the_codes_issued_for_the_account() {
+        let ctx = invite_ctx().await;
+        let mine = ctx
+            .invite_manager
+            .create_invite(
+                "did:plc:operator",
+                1,
+                None,
+                None,
+                Some("did:plc:me".to_string()),
+            )
+            .await
+            .unwrap()
+            .code;
+        ctx.invite_manager
+            .create_invite(
+                "did:plc:operator",
+                1,
+                None,
+                None,
+                Some("did:plc:other".to_string()),
+            )
+            .await
+            .unwrap();
+        ctx.invite_manager
+            .use_code(&mine, "did:plc:friend")
+            .await
+            .unwrap();
+
+        let codes = ctx
+            .invite_manager
+            .get_codes_for_account("did:plc:me")
+            .await
+            .unwrap();
+        assert_eq!(codes.len(), 1);
+        assert_eq!(codes[0].code, mine);
+        let uses = ctx.invite_manager.get_code_uses(&mine).await.unwrap();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].0, "did:plc:friend");
+    }
+
+    #[tokio::test]
+    async fn cli_create_account_enforces_invites() {
+        let ctx = invite_ctx().await;
+        let err = crate::cli::account::create_account(
+            &ctx,
+            "cli@example.com",
+            "cli.localhost",
+            "password123",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::InvalidInviteCode(_)), "{err:?}");
+
+        let bad = crate::cli::account::create_account(
+            &ctx,
+            "cli@example.com",
+            "cli.localhost",
+            "password123",
+            Some("aurora-doesnotexist00"),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(bad, PdsError::InvalidInviteCode(_)), "{bad:?}");
     }
 }

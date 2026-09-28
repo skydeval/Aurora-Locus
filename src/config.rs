@@ -1111,11 +1111,15 @@ pub struct EmailConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteConfig {
     pub required: bool,
-    // NOTE (housekeeping #421 §5): `interval`/`epoch` have zero runtime readers
-    // (dead fields). Removal is deferred — it fans out to ~8 test-construction
-    // sites; batch it with the `blob_metadata`/`stage_ttl_seconds` removal (same
-    // fan-out) in a focused config-field-removal commit.
+    /// Seconds between earned invite codes (`PDS_INVITE_INTERVAL`, default 7
+    /// days). Kept deliberately: this and `epoch` are the pacing inputs for the
+    /// planned earned-invite mechanism (#465), Bluesky's invite-era model where
+    /// `getAccountInviteCodes` grants an account one code per interval since
+    /// its creation (or since `epoch`, if later). Not yet read at runtime; do
+    /// NOT remove in the housekeeping dead-field sweep (#421).
     pub interval: u64,
+    /// Start of invite earning (`PDS_INVITE_EPOCH`, RFC3339): accounts older
+    /// than this earn from the epoch rather than their creation. See `interval`.
     pub epoch: String,
 }
 

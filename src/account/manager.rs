@@ -147,13 +147,21 @@ impl AccountManager {
         invite_code: Option<String>,
         recovery_key: Option<String>,
     ) -> PdsResult<ActorAccount> {
-        // Validate invite code if required
-        if self.config.invites.required {
-            let code = invite_code
-                .as_ref()
-                .ok_or_else(|| PdsError::Validation("Invite code required".to_string()))?;
-            self.validate_invite_code(code, None).await?;
-        }
+        // Invites (#464): this is the single place a code is checked and used.
+        // Check it before anything is written (including the PLC
+        // registration below); it is consumed inside the account-insert
+        // transaction, so a failure at any later step leaves it usable.
+        let invite_code = if self.config.invites.required {
+            let code = invite_code.ok_or_else(|| {
+                PdsError::InvalidInviteCode("No invite code provided".to_string())
+            })?;
+            crate::admin::invites::InviteCodeManager::new(self.db.clone())
+                .check_available(&code)
+                .await?;
+            Some(code)
+        } else {
+            None
+        };
 
         // Validate handle format
         self.validate_handle(&handle)?;
@@ -237,15 +245,14 @@ impl AccountManager {
         .await
         .map_err(PdsError::Database)?;
 
+        // Redeem the invite in the same transaction, recorded against the new
+        // account's DID.
+        if let Some(code) = invite_code.as_deref() {
+            crate::admin::invites::InviteCodeManager::consume_in_tx(&mut tx, code, &did).await?;
+        }
+
         // Commit transaction
         tx.commit().await.map_err(PdsError::Database)?;
-
-        // Use invite code if provided
-        if let Some(code) = invite_code {
-            if self.config.invites.required {
-                self.use_invite_code(&code, &did).await?;
-            }
-        }
 
         // Return combined ActorAccount
         Ok(ActorAccount {
@@ -2910,236 +2917,6 @@ impl AccountManager {
 
     // ==================== Invite Code System ====================
 
-    /// Create an invite code
-    ///
-    /// # Arguments
-    /// * `created_by` - DID of the user creating the invite
-    /// * `use_count` - Number of times this invite can be used (default: 1)
-    /// * `for_account` - Optional DID if this invite is for a specific person
-    ///
-    /// # Returns
-    /// * The generated invite code string
-    pub async fn create_invite_code(
-        &self,
-        created_by: &str,
-        use_count: i32,
-        for_account: Option<String>,
-    ) -> PdsResult<String> {
-        // Generate a random invite code (format: xxxx-xxxx-xxxx-xxxx)
-        let code = format!(
-            "{}-{}-{}-{}",
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4)
-        );
-
-        let now = Utc::now();
-
-        sqlx::query(
-            "INSERT INTO invite_code (code, available_uses, disabled, created_by, created_at, created_for)
-             VALUES ($1, $2, $3, $4, $5, $6)"
-        )
-        .bind(&code)
-        .bind(use_count)
-        .bind(false)
-        .bind(created_by)
-        .bind(now.to_rfc3339())
-        .bind(&for_account)
-        .execute(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
-
-        tracing::info!(
-            "Created invite code {} by {} (uses: {}, for: {:?})",
-            code,
-            created_by,
-            use_count,
-            for_account
-        );
-
-        Ok(code)
-    }
-
-    /// Validate an invite code and return information about it
-    ///
-    /// Checks if the code exists, is not disabled, and has available uses.
-    pub async fn validate_invite_code(&self, code: &str, used_by: Option<&str>) -> PdsResult<()> {
-        // Check if invites are required
-        if !self.config.invites.required {
-            // Invites not required, always succeed
-            return Ok(());
-        }
-
-        let row = sqlx::query(
-            "SELECT code, available_uses, disabled, created_for FROM invite_code WHERE code = $1",
-        )
-        .bind(code)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(PdsError::Database)?
-        .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
-
-        let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
-        let created_for: Option<String> = row.get("created_for");
-
-        // Check if disabled
-        if disabled {
-            return Err(PdsError::Validation(
-                "Invite code has been disabled".to_string(),
-            ));
-        }
-
-        // Check if uses remain
-        if available_uses <= 0 {
-            return Err(PdsError::Validation(
-                "Invite code has no uses remaining".to_string(),
-            ));
-        }
-
-        // Check if code is for a specific person
-        if let Some(specific_did) = created_for {
-            if let Some(user_did) = used_by {
-                if user_did != specific_did {
-                    return Err(PdsError::Validation(
-                        "Invite code is reserved for another user".to_string(),
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Use an invite code (called during account creation)
-    ///
-    /// Decrements available uses and records usage.
-    pub async fn use_invite_code(&self, code: &str, used_by: &str) -> PdsResult<()> {
-        // Check if invites are required
-        if !self.config.invites.required {
-            // Invites not required, no-op
-            return Ok(());
-        }
-
-        let now = Utc::now();
-
-        // Begin transaction
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
-
-        // Validate code
-        let row =
-            sqlx::query("SELECT code, available_uses, disabled FROM invite_code WHERE code = $1")
-                .bind(code)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(PdsError::Database)?
-                .ok_or_else(|| PdsError::Validation("Invalid invite code".to_string()))?;
-
-        let available_uses: i32 = row.get("available_uses");
-        let disabled: bool = crate::db::read_bool(&row, "disabled")?;
-
-        if disabled {
-            return Err(PdsError::Validation(
-                "Invite code has been disabled".to_string(),
-            ));
-        }
-
-        if available_uses <= 0 {
-            return Err(PdsError::Validation(
-                "Invite code has no uses remaining".to_string(),
-            ));
-        }
-
-        // Record usage
-        sqlx::query(
-            "INSERT INTO invite_code_use (code, used_by, used_at)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(code)
-        .bind(used_by)
-        .bind(now.to_rfc3339())
-        .execute(&mut *tx)
-        .await
-        .map_err(PdsError::Database)?;
-
-        // Decrement available uses
-        sqlx::query("UPDATE invite_code SET available_uses = available_uses - 1 WHERE code = $1")
-            .bind(code)
-            .execute(&mut *tx)
-            .await
-            .map_err(PdsError::Database)?;
-
-        tx.commit().await.map_err(PdsError::Database)?;
-
-        tracing::info!("Invite code {} used by {}", code, used_by);
-
-        Ok(())
-    }
-
-    /// List invite codes created by a user
-    pub async fn list_invite_codes(
-        &self,
-        created_by: &str,
-    ) -> PdsResult<Vec<crate::db::account::InviteCode>> {
-        // Manual row → struct conversion: the auto-derived FromRow on
-        // InviteCode wants `Decode<Any>` for chrono::DateTime, which
-        // sqlx::Any doesn't provide. We read created_at as String and
-        // parse via parse_timestamp.
-        let rows = sqlx::query(
-            "SELECT code, available_uses, disabled, created_by, created_at, created_for
-             FROM invite_code
-             WHERE created_by = $1
-             ORDER BY created_at DESC",
-        )
-        .bind(created_by)
-        .fetch_all(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
-
-        rows.into_iter()
-            .map(|row| {
-                let created_at_s: String = row.try_get("created_at")?;
-                Ok(crate::db::account::InviteCode {
-                    code: row.try_get("code")?,
-                    available_uses: row.try_get("available_uses")?,
-                    disabled: crate::db::read_bool(&row, "disabled")?,
-                    created_by: row.try_get("created_by")?,
-                    created_at: parse_timestamp(&created_at_s)?,
-                    created_for: row.try_get("created_for")?,
-                })
-            })
-            .collect()
-    }
-
-    /// Get usage history for an invite code
-    pub async fn get_invite_code_usage(
-        &self,
-        code: &str,
-    ) -> PdsResult<Vec<crate::db::account::InviteCodeUse>> {
-        let rows = sqlx::query(
-            "SELECT code, used_by, used_at
-             FROM invite_code_use
-             WHERE code = $1
-             ORDER BY used_at DESC",
-        )
-        .bind(code)
-        .fetch_all(&self.db)
-        .await
-        .map_err(PdsError::Database)?;
-
-        rows.into_iter()
-            .map(|row| {
-                let used_at_s: String = row.try_get("used_at")?;
-                Ok(crate::db::account::InviteCodeUse {
-                    code: row.try_get("code")?,
-                    used_by: row.try_get("used_by")?,
-                    used_at: parse_timestamp(&used_at_s)?,
-                })
-            })
-            .collect()
-    }
-
     /// Disable an invite code (admin/creator only)
     #[allow(dead_code)] // Future invite management feature
     pub async fn disable_invite_code(&self, code: &str, requesting_did: &str) -> PdsResult<()> {
@@ -3229,32 +3006,6 @@ impl AccountManager {
 
         tracing::info!(did = %did, "account_invites_disabled");
         Ok(())
-    }
-
-    #[allow(dead_code)] // Future invite allocation feature
-    pub async fn allocate_invite_codes(&self, did: &str, count: i32) -> PdsResult<Vec<String>> {
-        // Check if invites are disabled for this account
-        let row = sqlx::query("SELECT invites_disabled FROM account WHERE did = $1")
-            .bind(did)
-            .fetch_optional(&self.db)
-            .await
-            .map_err(PdsError::Database)?
-            .ok_or_else(|| PdsError::NotFound("Account not found".to_string()))?;
-
-        let invites_disabled: bool = crate::db::read_bool(&row, "invites_disabled")?;
-
-        if invites_disabled {
-            return Ok(Vec::new()); // Don't allocate if disabled
-        }
-
-        // Create invite codes
-        let mut codes = Vec::new();
-        for _ in 0..count {
-            let code = self.create_invite_code(did, 1, None).await?;
-            codes.push(code);
-        }
-
-        Ok(codes)
     }
 
     /// List all accounts with pagination
@@ -3683,6 +3434,190 @@ mod tests {
         });
 
         AccountManager::new(db, config)
+    }
+
+    // ---- #464: createAccount with invites required ----
+
+    /// A test manager with `PDS_INVITE_REQUIRED=true`, plus the invite manager
+    /// over the same database.
+    async fn invite_required_manager() -> (AccountManager, crate::admin::invites::InviteCodeManager)
+    {
+        let base = create_test_manager().await;
+        let mut config = (*base.config).clone();
+        config.invites.required = true;
+        let invites = crate::admin::invites::InviteCodeManager::new(base.db.clone());
+        (
+            AccountManager {
+                db: base.db.clone(),
+                config: Arc::new(config),
+            },
+            invites,
+        )
+    }
+
+    async fn new_code(invites: &crate::admin::invites::InviteCodeManager, uses: i32) -> String {
+        invites
+            .create_invite("did:plc:admin", uses, None, None, None)
+            .await
+            .unwrap()
+            .code
+    }
+
+    async fn actor_count(m: &AccountManager) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM actor")
+            .fetch_one(&m.db)
+            .await
+            .unwrap()
+    }
+
+    async fn code_state(m: &AccountManager, code: &str) -> (i32, Vec<String>) {
+        let available: i32 =
+            sqlx::query_scalar("SELECT available FROM invite_code WHERE code = $1")
+                .bind(code)
+                .fetch_one(&m.db)
+                .await
+                .unwrap();
+        let used_by: Vec<String> =
+            sqlx::query_scalar("SELECT used_by FROM invite_code_use WHERE code = $1")
+                .bind(code)
+                .fetch_all(&m.db)
+                .await
+                .unwrap();
+        (available, used_by)
+    }
+
+    async fn signup(
+        m: &AccountManager,
+        handle: &str,
+        code: Option<&str>,
+    ) -> PdsResult<ActorAccount> {
+        m.create_account(
+            handle.to_string(),
+            None,
+            "password123".to_string(),
+            code.map(str::to_string),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn invite_required_valid_code_creates_account_and_uses_code_once() {
+        let (m, invites) = invite_required_manager().await;
+        let code = new_code(&invites, 1).await;
+
+        let account = signup(&m, "invited.localhost", Some(&code)).await.unwrap();
+
+        let (available, used_by) = code_state(&m, &code).await;
+        assert_eq!(available, 0);
+        assert_eq!(
+            used_by,
+            vec![account.did.clone()],
+            "used_by is the new account's DID"
+        );
+        assert!(account.did.starts_with("did:"));
+    }
+
+    #[tokio::test]
+    async fn invite_required_failure_after_the_check_leaves_the_code_usable() {
+        let (m, invites) = invite_required_manager().await;
+        let first = new_code(&invites, 1).await;
+        signup(&m, "taken.localhost", Some(&first)).await.unwrap();
+
+        let code = new_code(&invites, 1).await;
+        let err = signup(&m, "taken.localhost", Some(&code))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Conflict(_)), "{err:?}");
+
+        assert_eq!(
+            code_state(&m, &code).await,
+            (1, vec![]),
+            "code still available"
+        );
+        // And it still works for a signup that succeeds.
+        signup(&m, "second.localhost", Some(&code)).await.unwrap();
+        assert_eq!(code_state(&m, &code).await.0, 0);
+    }
+
+    #[tokio::test]
+    async fn invite_required_missing_code_writes_nothing() {
+        let (m, _invites) = invite_required_manager().await;
+        let before = actor_count(&m).await;
+        let err = signup(&m, "nocode.localhost", None).await.unwrap_err();
+        assert!(matches!(err, PdsError::InvalidInviteCode(_)), "{err:?}");
+        assert_eq!(actor_count(&m).await, before);
+    }
+
+    #[tokio::test]
+    async fn invite_required_unusable_codes_are_rejected_and_write_nothing() {
+        let (m, invites) = invite_required_manager().await;
+
+        let used_up = new_code(&invites, 1).await;
+        signup(&m, "first.localhost", Some(&used_up)).await.unwrap();
+
+        let disabled = new_code(&invites, 1).await;
+        invites.disable_code(&disabled).await.unwrap();
+
+        let expired = invites
+            .create_invite(
+                "did:plc:admin",
+                1,
+                Some(chrono::Duration::seconds(-60)),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .code;
+
+        let before = actor_count(&m).await;
+        for (label, code) in [
+            ("used up", used_up.as_str()),
+            ("disabled", disabled.as_str()),
+            ("expired", expired.as_str()),
+            ("unknown", "aurora-doesnotexist00"),
+        ] {
+            let err = signup(&m, "rejected.localhost", Some(code))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, PdsError::InvalidInviteCode(_)),
+                "{label}: {err:?}"
+            );
+        }
+        assert_eq!(actor_count(&m).await, before);
+        assert_eq!(code_state(&m, &disabled).await, (1, vec![]));
+        assert_eq!(code_state(&m, &expired).await, (1, vec![]));
+    }
+
+    #[tokio::test]
+    async fn invites_not_required_creates_account_without_a_code() {
+        let m = create_test_manager().await;
+        let account = signup(&m, "free.localhost", None).await.unwrap();
+        assert!(account.did.starts_with("did:"));
+    }
+
+    #[tokio::test]
+    async fn two_redemptions_of_the_last_use_cannot_both_land() {
+        let (m, invites) = invite_required_manager().await;
+        let code = new_code(&invites, 1).await;
+        let mut tx1 = m.db.begin().await.unwrap();
+        crate::admin::invites::InviteCodeManager::consume_in_tx(&mut tx1, &code, "did:plc:a")
+            .await
+            .unwrap();
+        tx1.commit().await.unwrap();
+        let mut tx2 = m.db.begin().await.unwrap();
+        let err =
+            crate::admin::invites::InviteCodeManager::consume_in_tx(&mut tx2, &code, "did:plc:b")
+                .await
+                .unwrap_err();
+        assert!(matches!(err, PdsError::InvalidInviteCode(_)), "{err:?}");
+        drop(tx2);
+        assert_eq!(
+            code_state(&m, &code).await,
+            (0, vec!["did:plc:a".to_string()])
+        );
     }
 
     // ---- key-rotation arc #372 / B1: rotation substrate primitives ----
