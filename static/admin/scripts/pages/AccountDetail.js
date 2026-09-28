@@ -652,6 +652,8 @@
   // Inline rationale prompt — uses a modal to ensure proper a11y. The
   // confirm button takes a descriptive, action-naming label (§8.2.3 — not a
   // generic "Confirm"); the caller passes the verb that matches `title`.
+  // Resolves the trimmed rationale on confirm, or null on any dismissal
+  // (Cancel, ×, Esc, overlay click — all route through the modal's onClose).
   function promptRationale(title, subtext, confirmLabel) {
     return new Promise((resolve) => {
       const div = document.createElement('div');
@@ -668,10 +670,11 @@
       div.querySelector('#pr-confirm').addEventListener('click', () => {
         const v = div.querySelector('#pr-r').value.trim();
         if (!v) { global.AuroraToast.warning('Rationale is required.'); return; }
-        handle.close();
-        // onClose resolves null; trigger a separate resolve here.
-        // Replace the resolve function so onClose is a noop.
+        // Settle BEFORE closing: AuroraModal.close() synchronously fires
+        // onClose → resolve(null), and a promise keeps its first settlement,
+        // so closing first would hand the caller null and drop the submit.
         resolve(v);
+        handle.close();
       });
     });
   }
