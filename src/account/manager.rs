@@ -64,6 +64,20 @@ fn join_handle_with_domain(handle: &str, domain: &str) -> String {
     format!("{}.{}", handle, suffix)
 }
 
+/// Preferences only a full-access session may read or write: app-password
+/// sessions (privileged or not) can do neither, as in the reference PDS
+/// (#470).
+const FULL_ACCESS_ONLY_PREFS: [&str; 1] = ["app.bsky.actor.defs#personalDetailsPref"];
+
+/// Whether a preference `$type` belongs to `namespace` (`app.bsky` matches
+/// `app.bsky` itself and `app.bsky.…`, not `app.bskyx.…`).
+fn pref_in_namespace(namespace: &str, pref_type: &str) -> bool {
+    pref_type == namespace
+        || pref_type
+            .strip_prefix(namespace)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 /// Account manager service
 pub struct AccountManager {
     db: AnyPool,
@@ -2912,6 +2926,106 @@ impl AccountManager {
             return Err(PdsError::Validation("Invalid email format".to_string()));
         }
 
+        Ok(())
+    }
+
+    // ==================== Preferences (#470) ====================
+
+    /// Stored preferences for `did` within `namespace` (e.g. `app.bsky`), in
+    /// the order they were written. Without `full_access` (app-password
+    /// sessions), the full-access-only preferences are left out, as in the
+    /// reference PDS.
+    pub async fn get_preferences(
+        &self,
+        did: &str,
+        namespace: &str,
+        full_access: bool,
+    ) -> PdsResult<Vec<serde_json::Value>> {
+        let rows =
+            sqlx::query("SELECT name, value_json FROM account_pref WHERE did = $1 ORDER BY id")
+                .bind(did)
+                .fetch_all(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        rows.iter()
+            .filter_map(|row| {
+                let name: String = row.get("name");
+                let visible = pref_in_namespace(namespace, &name)
+                    && (full_access || !FULL_ACCESS_ONLY_PREFS.contains(&name.as_str()));
+                visible.then(|| {
+                    let raw: String = row.get("value_json");
+                    serde_json::from_str(&raw).map_err(|e| {
+                        PdsError::Internal(format!("stored preference is not JSON: {}", e))
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Replace `did`'s preferences in `namespace` with `prefs`
+    /// (`app.bsky.actor.putPreferences`). Every preference must be an object
+    /// whose `$type` is in `namespace`. Without `full_access`, setting a
+    /// full-access-only preference is refused and the stored ones are kept.
+    /// Preferences in other namespaces are untouched. One transaction.
+    pub async fn put_preferences(
+        &self,
+        did: &str,
+        namespace: &str,
+        prefs: Vec<serde_json::Value>,
+        full_access: bool,
+    ) -> PdsResult<()> {
+        let mut rows = Vec::with_capacity(prefs.len());
+        for pref in prefs {
+            let name = pref
+                .get("$type")
+                .and_then(|t| t.as_str())
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| PdsError::Validation("Preference is missing a $type".to_string()))?
+                .to_string();
+            if !pref_in_namespace(namespace, &name) {
+                return Err(PdsError::Validation(format!(
+                    "Some preferences are not in the {} namespace",
+                    namespace
+                )));
+            }
+            if !full_access && FULL_ACCESS_ONLY_PREFS.contains(&name.as_str()) {
+                return Err(PdsError::Authorization(
+                    "Do not have authorization to set preferences.".to_string(),
+                ));
+            }
+            let json = serde_json::to_string(&pref)
+                .map_err(|e| PdsError::Internal(format!("preference encode failed: {}", e)))?;
+            rows.push((name, json));
+        }
+
+        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        let existing = sqlx::query("SELECT id, name FROM account_pref WHERE did = $1")
+            .bind(did)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(PdsError::Database)?;
+        for row in &existing {
+            let name: String = row.get("name");
+            let replaceable = pref_in_namespace(namespace, &name)
+                && (full_access || !FULL_ACCESS_ONLY_PREFS.contains(&name.as_str()));
+            if replaceable {
+                sqlx::query("DELETE FROM account_pref WHERE id = $1")
+                    .bind(row.get::<i64, _>("id"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(PdsError::Database)?;
+            }
+        }
+        for (name, json) in rows {
+            sqlx::query("INSERT INTO account_pref (did, name, value_json) VALUES ($1, $2, $3)")
+                .bind(did)
+                .bind(name)
+                .bind(json)
+                .execute(&mut *tx)
+                .await
+                .map_err(PdsError::Database)?;
+        }
+        tx.commit().await.map_err(PdsError::Database)?;
         Ok(())
     }
 

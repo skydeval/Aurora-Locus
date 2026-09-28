@@ -99,6 +99,12 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
             .execute(&ctx.account_db)
             .await?;
 
+        // Delete stored preferences (#470)
+        sqlx::query("DELETE FROM account_pref WHERE did = $1")
+            .bind(&did)
+            .execute(&ctx.account_db)
+            .await?;
+
         // Delete all email tokens
         sqlx::query("DELETE FROM email_token WHERE did = $1")
             .bind(&did)

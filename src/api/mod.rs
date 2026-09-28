@@ -1,5 +1,6 @@
 /// API routes and handlers
 pub mod admin;
+pub mod actor_prefs;
 pub mod appview;
 pub mod aurora_admin;
 pub mod aurora_kryphocron_ops;
@@ -117,6 +118,7 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
         .merge(health::routes())
         .merge(federation::routes())
         .merge(temp::routes())
+        .merge(actor_prefs::routes()) // preferences, served locally (#470)
         .merge(appview::routes()) // AppView proxy with read-after-write
         // OAuth admin routes with their own state
         .merge(oauth_admin::routes(oauth_state_store))

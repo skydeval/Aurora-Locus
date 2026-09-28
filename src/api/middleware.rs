@@ -341,6 +341,49 @@ pub async fn require_auth_unified(
         .await
 }
 
+/// A request authenticated as an account on this PDS (#470): a session JWT
+/// from `createSession` / `refreshSession` (the account password or an app
+/// password) or an atproto-OAuth token, i.e. everything
+/// [`require_auth_unified`] accepts except a cross-PDS service-auth token,
+/// which identifies another server's user, not a local account.
+///
+/// The extractor for user-facing routes that act *as* the account:
+/// preferences, and the service proxy, which mints service auth in the
+/// account's name.
+#[derive(Debug, Clone)]
+pub struct AccountAuth {
+    /// The account's DID.
+    pub did: String,
+    /// `false` for app-password sessions (privileged or not), which the
+    /// reference PDS keeps away from full-access-only data such as
+    /// `personalDetailsPref`.
+    pub full_access: bool,
+}
+
+#[axum::async_trait]
+impl axum::extract::FromRequestParts<AppContext> for AccountAuth {
+    type Rejection = PdsError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppContext,
+    ) -> Result<Self, Self::Rejection> {
+        match require_auth_unified(State(state.clone()), parts.headers.clone()).await? {
+            UnifiedAuthContext::Local(session) => Ok(AccountAuth {
+                did: session.did,
+                full_access: !session.is_app_password,
+            }),
+            UnifiedAuthContext::OAuth { did, .. } => Ok(AccountAuth {
+                did,
+                full_access: true,
+            }),
+            UnifiedAuthContext::CrossPDS { .. } => Err(PdsError::Authentication(
+                "This endpoint requires an account session on this PDS".to_string(),
+            )),
+        }
+    }
+}
+
 /// Arc 12 §5.3.4 forwarded variant — thin wrapper around the same
 /// `verify_jwt_with_allowlist` helper with the multi-audience
 /// allowlist that forwarded routes need (`[service_did, entryway_did]`

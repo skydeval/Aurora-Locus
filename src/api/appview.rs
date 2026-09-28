@@ -57,7 +57,6 @@ pub fn routes() -> Router<AppContext> {
             get(search_actors_typeahead),
         )
         .route("/xrpc/app.bsky.actor.getSuggestions", get(get_suggestions))
-        .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
         // Graph endpoints (simple proxy)
         .route("/xrpc/app.bsky.graph.getFollowers", get(get_followers))
         .route("/xrpc/app.bsky.graph.getFollows", get(get_follows))
@@ -640,14 +639,6 @@ async fn get_suggestions(
     Query(params): Query<CursorLimitParams>,
 ) -> PdsResult<Response> {
     proxy_to_appview(&ctx, "app.bsky.actor.getSuggestions", params).await
-}
-
-/// Get user preferences
-async fn get_preferences(
-    State(ctx): State<AppContext>,
-    _auth: OAuthAuthContext,
-) -> PdsResult<Response> {
-    proxy_to_appview(&ctx, "app.bsky.actor.getPreferences", serde_json::json!({})).await
 }
 
 /// Get followers
