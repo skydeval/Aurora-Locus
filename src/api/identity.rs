@@ -37,7 +37,19 @@ pub async fn resolve_handle(
         return Err(PdsError::Validation("Handle cannot be empty".to_string()));
     }
 
-    // Resolve via identity resolver (with caching)
+    // Local accounts first (matches the reference PDS): a handle this PDS
+    // hosts resolves from the actor table with no network round-trip. A
+    // deactivated or taken-down local account is treated as absent here and
+    // falls through to external resolution, like any unknown handle.
+    if let Some(did) = ctx
+        .account_manager
+        .get_active_did_by_handle(&params.handle)
+        .await?
+    {
+        return Ok(Json(ResolveHandleResponse { did }));
+    }
+
+    // Otherwise resolve via identity resolver (with caching)
     let did = ctx.identity_resolver.resolve_handle(&params.handle).await?;
 
     Ok(Json(ResolveHandleResponse { did }))
@@ -1135,5 +1147,84 @@ mod tests {
         let did_key = format!("did:key:z{}", bs58::encode(&payload).into_string());
         let result = super::validate_did_key_shape(&did_key);
         assert!(result.is_err(), "wrong-length payload must be rejected");
+    }
+
+    // ── resolveHandle: local accounts first (#454) ──
+
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use axum::extract::{Query, State};
+    use std::sync::Arc;
+
+    async fn ctx_with_mock() -> (crate::AppContext, Arc<MockIdentityResolver>) {
+        let mut ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.identity.service_handle_domains = vec![".nearhorizon.app".to_string()];
+        })
+        .await;
+        let mock = Arc::new(MockIdentityResolver::new());
+        ctx.identity_resolver = mock.clone();
+        (ctx, mock)
+    }
+
+    async fn seed_actor(ctx: &crate::AppContext, did: &str, handle: &str) {
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind(handle)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+    }
+
+    async fn call(ctx: &crate::AppContext, handle: &str) -> crate::error::PdsResult<String> {
+        super::resolve_handle(
+            State(ctx.clone()),
+            Query(super::ResolveHandleParams {
+                handle: handle.to_string(),
+            }),
+        )
+        .await
+        .map(|axum::Json(r)| r.did)
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_local_account_skips_resolver() {
+        let (ctx, mock) = ctx_with_mock().await;
+        seed_actor(
+            &ctx,
+            "did:plc:testaccount0000000000000",
+            "sky.nearhorizon.app",
+        )
+        .await;
+        let did = call(&ctx, "sky.nearhorizon.app").await.unwrap();
+        assert_eq!(did, "did:plc:testaccount0000000000000");
+        // Case-insensitive, still local.
+        let did = call(&ctx, "Sky.NearHorizon.app").await.unwrap();
+        assert_eq!(did, "did:plc:testaccount0000000000000");
+        assert_eq!(mock.resolve_handle_calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_non_local_goes_through_resolver() {
+        let (ctx, mock) = ctx_with_mock().await;
+        mock.script_handle("alice.bsky.social", "did:plc:alice");
+        let did = call(&ctx, "alice.bsky.social").await.unwrap();
+        assert_eq!(did, "did:plc:alice");
+        assert_eq!(mock.resolve_handle_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_handle_taken_down_local_account_falls_through() {
+        let (ctx, mock) = ctx_with_mock().await;
+        seed_actor(&ctx, "did:plc:gone", "gone.nearhorizon.app").await;
+        sqlx::query("UPDATE actor SET takedown_ref = $1 WHERE did = $2")
+            .bind("mod-action-1")
+            .bind("did:plc:gone")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        // The mock has nothing scripted, so falling through surfaces its error
+        // rather than the hidden local DID.
+        assert!(call(&ctx, "gone.nearhorizon.app").await.is_err());
+        assert_eq!(mock.resolve_handle_calls(), 1);
     }
 }

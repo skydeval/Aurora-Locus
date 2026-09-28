@@ -1,10 +1,11 @@
 use crate::identity::did_document::{build_did_document, DidDocument};
+use crate::identity::handle_validation::is_under_service_handle_domain;
 /// Well-known endpoints
 /// Handles /.well-known/* endpoints for DID resolution and other standards
 use crate::{context::AppContext, crypto::plc::PlcSigner, error::PdsResult};
 use axum::{
     extract::State,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{Json, Response},
     routing::get,
     Router,
@@ -63,21 +64,87 @@ pub async fn oauth_protected_resource(
 
 /// /.well-known/atproto-did
 ///
-/// Returns the DID for this PDS server in plain text
-/// Used for did:web resolution
-pub async fn atproto_did(State(ctx): State<AppContext>) -> PdsResult<Response> {
-    let did = ctx.service_did();
+/// Answers by the request's `Host` (the hostname being verified):
+/// - the service host (`PDS_HOSTNAME`, or the host of `PDS_SERVICE_PUBLIC_URL`)
+///   → the server's own DID (did:web service resolution, federation discovery);
+/// - a host strictly under a service handle domain → the DID of the active
+///   local account holding that handle (ATProto HTTPS handle verification),
+///   or 404 `User not found` when there is none or it is deactivated/taken down;
+/// - any other host → 404.
+///
+/// Only the plain `Host` header (or HTTP/2 `:authority`) is read.
+/// `X-Forwarded-Host` is deliberately not trusted (nothing else in the codebase
+/// trusts it, and it is client-controlled unless a proxy overwrites it); reverse
+/// proxies must preserve the original `Host`, which Caddy's `reverse_proxy`
+/// does by default.
+pub async fn atproto_did(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> PdsResult<Response> {
+    // HTTP/1.1 carries the hostname in `Host`; HTTP/2 in the `:authority`
+    // pseudo-header, which surfaces as the request URI's authority.
+    let raw_host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or_else(|| uri.authority().map(|a| a.as_str()));
+    let Some(host) = raw_host.and_then(normalize_host) else {
+        return plain_text(StatusCode::NOT_FOUND, "User not found");
+    };
 
-    // Return plain text DID
-    let response = Response::builder()
-        .status(StatusCode::OK)
+    if is_service_host(&ctx, &host) {
+        return plain_text(StatusCode::OK, ctx.service_did());
+    }
+
+    if !is_under_service_handle_domain(&host, &ctx.config.identity.service_handle_domains) {
+        return plain_text(StatusCode::NOT_FOUND, "User not found");
+    }
+
+    match ctx.account_manager.get_active_did_by_handle(&host).await? {
+        Some(did) => plain_text(StatusCode::OK, &did),
+        None => plain_text(StatusCode::NOT_FOUND, "User not found"),
+    }
+}
+
+/// Reduce a `Host` value to a bare lowercase hostname: strip any `:port`
+/// (including after a bracketed IPv6 literal) and a trailing root dot.
+/// `None` for an empty result.
+fn normalize_host(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        // [v6]:port → v6 literal (kept bracket-free; never a handle anyway).
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        raw.split(':').next().unwrap_or_default()
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether `host` (already normalised) names this PDS itself rather than one
+/// of its account handles.
+fn is_service_host(ctx: &AppContext, host: &str) -> bool {
+    let service = &ctx.config.service;
+    if normalize_host(&service.hostname).as_deref() == Some(host) {
+        return true;
+    }
+    service
+        .public_url
+        .as_deref()
+        .and_then(|url| url.split_once("://").map(|(_, rest)| rest))
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .and_then(normalize_host)
+        .as_deref()
+        == Some(host)
+}
+
+/// Build a `text/plain` response.
+fn plain_text(status: StatusCode, body: &str) -> PdsResult<Response> {
+    Response::builder()
+        .status(status)
         .header(header::CONTENT_TYPE, "text/plain")
-        .body(did.to_string().into())
-        .map_err(|e| {
-            crate::error::PdsError::Internal(format!("Failed to build response: {}", e))
-        })?;
-
-    Ok(response)
+        .body(body.to_string().into())
+        .map_err(|e| crate::error::PdsError::Internal(format!("Failed to build response: {}", e)))
 }
 
 /// /.well-known/did.json
@@ -400,5 +467,200 @@ mod tests {
             did: "did:web:entryway.test".to_string(),
         });
         run_oauth_protected_resource(config, "https://entryway.test").await;
+    }
+
+    // ── /.well-known/atproto-did: Host-aware handle verification (#454) ──
+
+    const SERVICE_HOST: &str = "locus.nearhorizon.app";
+    const SERVICE_DID: &str = "did:web:locus.nearhorizon.app";
+
+    async fn handle_ctx() -> AppContext {
+        crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.service.hostname = SERVICE_HOST.to_string();
+            c.service.service_did = SERVICE_DID.to_string();
+            c.identity.service_handle_domains = vec![".nearhorizon.app".to_string()];
+        })
+        .await
+    }
+
+    async fn seed_actor(ctx: &AppContext, did: &str, handle: &str) {
+        sqlx::query("INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3)")
+            .bind(did)
+            .bind(handle)
+            .bind("2026-01-01T00:00:00Z")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+    }
+
+    async fn get_atproto_did(ctx: &AppContext, host: Option<&str>) -> (StatusCode, String) {
+        let mut headers = HeaderMap::new();
+        if let Some(h) = host {
+            headers.insert(header::HOST, h.parse().unwrap());
+        }
+        let resp = atproto_did(
+            State(ctx.clone()),
+            headers,
+            Uri::from_static("/.well-known/atproto-did"),
+        )
+        .await
+        .unwrap();
+        let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(content_type, "text/plain");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn atproto_did_service_host_returns_service_did() {
+        let ctx = handle_ctx().await;
+        let got = get_atproto_did(&ctx, Some(SERVICE_HOST)).await;
+        assert_eq!(got, (StatusCode::OK, SERVICE_DID.to_string()));
+        let got = get_atproto_did(&ctx, Some("Locus.NearHorizon.app:2583")).await;
+        assert_eq!(got, (StatusCode::OK, SERVICE_DID.to_string()));
+    }
+
+    #[tokio::test]
+    async fn atproto_did_public_url_host_returns_service_did() {
+        // Build with a coherent config (WebAuthn RP setup rejects a hostname
+        // that disagrees with the public URL), then swap in the split one.
+        let mut ctx = handle_ctx().await;
+        let mut config = (*ctx.config).clone();
+        config.service.hostname = "internal-name".to_string();
+        config.service.public_url = Some("https://pds.example.com/".to_string());
+        config.service.service_did = "did:web:pds.example.com".to_string();
+        ctx.config = std::sync::Arc::new(config);
+        let got = get_atproto_did(&ctx, Some("pds.example.com")).await;
+        assert_eq!(got, (StatusCode::OK, "did:web:pds.example.com".to_string()));
+    }
+
+    #[tokio::test]
+    async fn atproto_did_local_handle_host_returns_account_did() {
+        let ctx = handle_ctx().await;
+        seed_actor(
+            &ctx,
+            "did:plc:testaccount0000000000000",
+            "sky.nearhorizon.app",
+        )
+        .await;
+        let got = get_atproto_did(&ctx, Some("sky.nearhorizon.app")).await;
+        assert_eq!(
+            got,
+            (
+                StatusCode::OK,
+                "did:plc:testaccount0000000000000".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn atproto_did_normalises_port_case_and_root_dot() {
+        let ctx = handle_ctx().await;
+        seed_actor(&ctx, "did:plc:alice", "alice.nearhorizon.app").await;
+        for host in [
+            "ALICE.NearHorizon.App:2583",
+            "alice.nearhorizon.app.",
+            "alice.nearhorizon.app.:443",
+        ] {
+            let got = get_atproto_did(&ctx, Some(host)).await;
+            assert_eq!(got, (StatusCode::OK, "did:plc:alice".to_string()), "{host}");
+        }
+    }
+
+    #[tokio::test]
+    async fn atproto_did_unknown_handle_under_domain_is_404() {
+        let ctx = handle_ctx().await;
+        let got = get_atproto_did(&ctx, Some("nobody.nearhorizon.app")).await;
+        assert_eq!(got, (StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
+
+    #[tokio::test]
+    async fn atproto_did_taken_down_or_deactivated_account_is_404() {
+        let ctx = handle_ctx().await;
+        seed_actor(&ctx, "did:plc:gone", "gone.nearhorizon.app").await;
+        seed_actor(&ctx, "did:plc:asleep", "asleep.nearhorizon.app").await;
+        sqlx::query("UPDATE actor SET takedown_ref = $1 WHERE did = $2")
+            .bind("mod-action-1")
+            .bind("did:plc:gone")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE actor SET deactivated_at = $1 WHERE did = $2")
+            .bind("2026-02-01T00:00:00Z")
+            .bind("did:plc:asleep")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        for host in ["gone.nearhorizon.app", "asleep.nearhorizon.app"] {
+            let got = get_atproto_did(&ctx, Some(host)).await;
+            assert_eq!(
+                got,
+                (StatusCode::NOT_FOUND, "User not found".to_string()),
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn atproto_did_unrelated_or_lookalike_host_is_404() {
+        let ctx = handle_ctx().await;
+        // A local actor whose handle is outside the service domains must not be
+        // vouched for, even though the row exists.
+        seed_actor(&ctx, "did:plc:outside", "alice.other.example").await;
+        for host in [
+            "alice.other.example",
+            "nearhorizon.app",
+            "evil-nearhorizon.app",
+            "sky.nearhorizon.app.evil.com",
+        ] {
+            let got = get_atproto_did(&ctx, Some(host)).await;
+            assert_eq!(
+                got,
+                (StatusCode::NOT_FOUND, "User not found".to_string()),
+                "{host}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn atproto_did_missing_host_is_404() {
+        let ctx = handle_ctx().await;
+        let got = get_atproto_did(&ctx, None).await;
+        assert_eq!(got, (StatusCode::NOT_FOUND, "User not found".to_string()));
+    }
+
+    #[tokio::test]
+    async fn atproto_did_uses_uri_authority_when_host_absent() {
+        let ctx = handle_ctx().await;
+        let resp = atproto_did(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Uri::from_static("https://locus.nearhorizon.app/.well-known/atproto-did"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn normalize_host_shapes() {
+        assert_eq!(
+            normalize_host("Example.COM:8080").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            normalize_host(" example.com. ").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(normalize_host("[::1]:2583").as_deref(), Some("::1"));
+        assert_eq!(normalize_host("").as_deref(), None);
+        assert_eq!(normalize_host(":443").as_deref(), None);
     }
 }

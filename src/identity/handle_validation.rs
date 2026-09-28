@@ -184,9 +184,92 @@ pub fn normalize_handle(handle: &str) -> String {
     handle.to_lowercase()
 }
 
+/// Whether `handle` sits strictly *under* one of the PDS's service handle
+/// domains — i.e. it is `<label(s)>.<domain>`, never the bare domain itself.
+///
+/// Domains are matched on a label boundary regardless of whether the
+/// configured entry carries the conventional leading dot (`.example.com`) or
+/// not (`example.com`), so `evil-example.com` does not match `.example.com`.
+/// Comparison is ASCII-case-insensitive; the caller need not pre-lowercase.
+///
+/// Used to decide whether a hostname is one this PDS can vouch for as a
+/// handle (`/.well-known/atproto-did` handle verification).
+///
+/// ```
+/// use aurora_locus::identity::handle_validation::is_under_service_handle_domain;
+/// let domains = vec![".example.com".to_string()];
+/// assert!(is_under_service_handle_domain("alice.example.com", &domains));
+/// assert!(!is_under_service_handle_domain("example.com", &domains));
+/// assert!(!is_under_service_handle_domain("evil-example.com", &domains));
+/// ```
+pub fn is_under_service_handle_domain(handle: &str, service_domains: &[String]) -> bool {
+    let handle = handle.to_ascii_lowercase();
+    service_domains.iter().any(|domain| {
+        let bare = domain.trim_start_matches('.').to_ascii_lowercase();
+        if bare.is_empty() {
+            return false;
+        }
+        handle
+            .strip_suffix(bare.as_str())
+            .and_then(|prefix| prefix.strip_suffix('.'))
+            .is_some_and(|label| !label.is_empty())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn under_service_handle_domain_requires_a_label_boundary() {
+        let dotted = vec![".nearhorizon.app".to_string()];
+        let undotted = vec!["nearhorizon.app".to_string()];
+        for domains in [&dotted, &undotted] {
+            assert!(is_under_service_handle_domain(
+                "sky.nearhorizon.app",
+                domains
+            ));
+            assert!(is_under_service_handle_domain(
+                "a.b.nearhorizon.app",
+                domains
+            ));
+            assert!(is_under_service_handle_domain(
+                "SKY.NearHorizon.app",
+                domains
+            ));
+            assert!(!is_under_service_handle_domain("nearhorizon.app", domains));
+            assert!(!is_under_service_handle_domain(".nearhorizon.app", domains));
+            assert!(!is_under_service_handle_domain(
+                "evil-nearhorizon.app",
+                domains
+            ));
+            assert!(!is_under_service_handle_domain(
+                "sky.nearhorizon.app.evil.com",
+                domains
+            ));
+            assert!(!is_under_service_handle_domain("", domains));
+        }
+    }
+
+    #[test]
+    fn under_service_handle_domain_ignores_empty_domain_entries() {
+        let domains = vec![String::new(), ".".to_string()];
+        assert!(!is_under_service_handle_domain(
+            "alice.example.com",
+            &domains
+        ));
+        assert!(!is_under_service_handle_domain("alice", &domains));
+    }
+
+    #[test]
+    fn under_service_handle_domain_matches_any_configured_domain() {
+        let domains = vec![".one.test".to_string(), ".two.test".to_string()];
+        assert!(is_under_service_handle_domain("alice.two.test", &domains));
+        assert!(!is_under_service_handle_domain(
+            "alice.three.test",
+            &domains
+        ));
+    }
 
     fn test_domains() -> Vec<String> {
         vec!["bsky.social".to_string(), "localhost".to_string()]

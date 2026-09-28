@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Handles under the PDS's handle domains now verify: `/.well-known/atproto-did` answers by the requested hostname, returning the account's DID for `<name>.<handle-domain>` (404 `User not found` for unknown, deactivated or taken-down accounts, and for unrelated hosts) while the service hostname still returns the server's DID. Previously every hostname got the server's DID, so Bluesky and other clients showed hosted handles as invalid
+- `com.atproto.identity.resolveHandle` resolves handles of this PDS's own active accounts locally before trying DNS/HTTPS (previously returned `HandleNotFound` for handles it hosts)
+
 ## [0.10.1] - 2026-07-27
 
 ### Fixed
