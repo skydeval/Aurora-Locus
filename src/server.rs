@@ -21,7 +21,7 @@ use axum::{
 use serde_json::json;
 use tower_http::{
     compression::CompressionLayer,
-    cors::{Any, CorsLayer},
+    cors::{AllowHeaders, Any, CorsLayer},
     services::ServeDir,
     trace::TraceLayer,
 };
@@ -50,6 +50,46 @@ fn no_store(mut resp: Response) -> Response {
     resp
 }
 
+/// Response headers browser clients need to read, so they are exposed to
+/// cross-origin callers (#469). `atproto-content-labelers` /
+/// `atproto-repo-rev` come back from proxied app.bsky calls, `dpop-nonce` and
+/// `www-authenticate` drive the OAuth DPoP retry, and the `ratelimit-*` family
+/// lets clients back off.
+const CORS_EXPOSED_HEADERS: [&str; 8] = [
+    "atproto-content-labelers",
+    "atproto-repo-rev",
+    "dpop-nonce",
+    "www-authenticate",
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+    "ratelimit-policy",
+];
+
+/// CORS for the XRPC surface, matching the reference PDS (#469): any origin,
+/// any requested header (reflected, so `atproto-proxy`,
+/// `atproto-accept-labelers`, `dpop` and whatever clients add next are
+/// allowed), the methods XRPC and the admin/OAuth pages use, the headers
+/// clients read exposed, and preflights cached for a day. The old allow-list
+/// of just `content-type` + `authorization` made the browser block every
+/// proxied bsky.app call.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(CORS_EXPOSED_HEADERS.map(header::HeaderName::from_static))
+        .max_age(std::time::Duration::from_secs(24 * 60 * 60))
+}
+
 /// Build the main application router.
 ///
 /// `api_router` is the pre-built `Router<AppContext>` returned by
@@ -62,11 +102,7 @@ fn no_store(mut resp: Response) -> Response {
 ///
 /// Returns `Router<()>` because state is already provided.
 pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
-    // Create CORS layer
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
+    let cors = cors_layer();
 
     // Static file serving for admin panel.
     // Must come AFTER API routes to not conflict with /oauth/admin/* endpoints.
@@ -340,6 +376,90 @@ mod shutdown_wiring_tests {
             res.is_ok(),
             "watchdog should complete within the drain deadline after a signal"
         );
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    //! #469: a bsky.app preflight carrying the atproto headers must be allowed.
+    use super::cors_layer;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route("/xrpc/app.bsky.actor.getProfile", get(|| async { "ok" }))
+            .layer(cors_layer())
+    }
+
+    #[tokio::test]
+    async fn preflight_reflects_atproto_request_headers() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/xrpc/app.bsky.actor.getProfile")
+                    .header(header::ORIGIN, "https://bsky.app")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(
+                        header::ACCESS_CONTROL_REQUEST_HEADERS,
+                        "atproto-accept-labelers,atproto-proxy,authorization",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        let allowed = h
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in ["atproto-accept-labelers", "atproto-proxy", "authorization"] {
+            assert!(allowed.contains(name), "{name} not allowed: {allowed}");
+        }
+        assert_eq!(h.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
+        assert_eq!(h.get(header::ACCESS_CONTROL_MAX_AGE).unwrap(), "86400");
+        let methods = h
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            methods.contains("GET") && methods.contains("POST"),
+            "{methods}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_expose_the_headers_clients_read() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/xrpc/app.bsky.actor.getProfile")
+                    .header(header::ORIGIN, "https://bsky.app")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = resp
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase();
+        for name in super::CORS_EXPOSED_HEADERS {
+            assert!(exposed.contains(name), "{name} not exposed: {exposed}");
+        }
     }
 }
 

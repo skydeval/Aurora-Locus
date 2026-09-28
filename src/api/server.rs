@@ -364,10 +364,25 @@ async fn create_session(
                     "primary login path errored unexpectedly; falling back to app-password"
                 );
             }
-            ctx.account_manager
+            match ctx
+                .account_manager
                 .login_with_app_password(&req.identifier, &req.password)
                 .await
-                .map(|(account, session, _name)| (account, session))?
+            {
+                Ok((account, session, _name)) => (account, session),
+                // Neither the account password nor an app password matched (or
+                // there is no such account): one generic answer, as the
+                // reference PDS gives (#472). It used to surface the
+                // app-password path's "Invalid app password" for a mistyped
+                // account password. Account-status refusals (taken down,
+                // deactivated) still come through as-is.
+                Err(PdsError::NotFound(_) | PdsError::Authentication(_)) => {
+                    return Err(PdsError::Authentication(
+                        "Invalid identifier or password".to_string(),
+                    ));
+                }
+                Err(e) => return Err(e),
+            }
         }
     };
 
@@ -2105,6 +2120,31 @@ mod create_session_ip_binding_tests {
         .execute(&ctx.account_db)
         .await
         .unwrap();
+    }
+
+    /// #472: a wrong password (or unknown account) is one generic 401, not the
+    /// app-password path's "Invalid app password".
+    #[tokio::test]
+    async fn create_session_wrong_password_is_generic() {
+        let ctx = create_test_context_with(|_| {}).await;
+        seed_password_account(&ctx, "did:plc:pw", "pw.test", "right-password").await;
+        for identifier in ["pw.test", "nobody.test"] {
+            let err = create_session(
+                State(ctx.clone()),
+                HeaderMap::new(),
+                Json(CreateSessionRequest {
+                    identifier: identifier.to_string(),
+                    password: "wrong-password".to_string(),
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err,
+                PdsError::Authentication("Invalid identifier or password".to_string()),
+                "{identifier}"
+            );
+        }
     }
 
     // #442 Gate 1 regression: the standard `com.atproto.server.createSession` login
