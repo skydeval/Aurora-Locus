@@ -995,16 +995,19 @@ impl RepositoryManager {
         // Aliased to satisfy clippy::type_complexity — the
         // restructure has both branches converging on this 7-tuple
         // so each can supply `prepared` for Phase B.
+        // (commit CID, new rev, previous commit's rev — the firehose `since`,
+        //  previous commit's MST root — the firehose `prevData`, blocks, ops,
+        //  prepared records)
         type CommitProjection = (
             Cid,
             String,
-            Option<Cid>,
+            Option<String>,
             Option<Cid>,
             BlockMap,
             Vec<CommitOp>,
             Vec<PreparedRecord>,
         );
-        let (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared): CommitProjection =
+        let (commit_cid, new_rev, prev_rev, prev_data, blocks, commit_ops, prepared): CommitProjection =
             if let Some(shared_pool) = self.shared_pool.clone() {
             // ----- Relay-race lent-tx path -----
             let actor_pool = self.store.open_db(&self.did).await?;
@@ -1082,14 +1085,16 @@ impl RepositoryManager {
                                 )?,
                                 Err(e) => return Err(e),
                             };
-                            let prev = repo.commit_cid().cloned();
+                            // #467: `since` is the previous commit's rev (a TID
+                            // string), not its CID.
+                            let prev_rev = repo.commit().map(|c| c.rev.clone());
                             let prev_data = repo.commit().map(|c| c.data.clone());
                             let data =
                                 repo.apply_writes(&repo_writes_owned, signer_for_blocking.as_ref())?;
                             Ok((
                                 data.commit_cid,
                                 data.commit.rev.clone(),
-                                prev,
+                                prev_rev,
                                 prev_data,
                                 data.blocks,
                             ))
@@ -1097,7 +1102,7 @@ impl RepositoryManager {
                     )
                     .await
                     .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?;
-                    let (commit_cid, new_rev, prev_commit, prev_data, blocks) = proto_blue_join
+                    let (commit_cid, new_rev, prev_rev, prev_data, blocks) = proto_blue_join
                         .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
 
                     // Phase A metadata — route through the lent
@@ -1157,7 +1162,7 @@ impl RepositoryManager {
                     Ok::<_, PdsError>((
                         commit_cid,
                         new_rev,
-                        prev_commit,
+                        prev_rev,
                         prev_data,
                         blocks,
                         commit_ops_inner,
@@ -1171,7 +1176,7 @@ impl RepositoryManager {
             let (
                 commit_cid_v,
                 new_rev_v,
-                prev_commit_v,
+                prev_rev_v,
                 prev_data_v,
                 blocks_v,
                 commit_ops_v,
@@ -1210,7 +1215,7 @@ impl RepositoryManager {
             (
                 commit_cid_v,
                 new_rev_v,
-                prev_commit_v,
+                prev_rev_v,
                 prev_data_v,
                 blocks_v,
                 commit_ops_v,
@@ -1241,10 +1246,10 @@ impl RepositoryManager {
             let did = self.did.clone();
             let signer_arc = signer;
 
-            let (commit_cid, new_rev, prev_commit, prev_data, blocks): (
+            let (commit_cid, new_rev, prev_rev, prev_data, blocks): (
                 Cid,
                 String,
-                Option<Cid>,
+                Option<String>,
                 Option<Cid>,
                 BlockMap,
             ) = tokio::task::spawn_blocking(
@@ -1257,13 +1262,14 @@ impl RepositoryManager {
                         }
                         Err(e) => return Err(e),
                     };
-                    let prev = repo.commit_cid().cloned();
+                    // #467: `since` is the previous commit's rev, not its CID.
+                    let prev_rev = repo.commit().map(|c| c.rev.clone());
                     let prev_data = repo.commit().map(|c| c.data.clone());
                     let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
                     Ok((
                         data.commit_cid,
                         data.commit.rev.clone(),
-                        prev,
+                        prev_rev,
                         prev_data,
                         data.blocks,
                     ))
@@ -1316,7 +1322,7 @@ impl RepositoryManager {
                 }
             }
 
-            (commit_cid, new_rev, prev_commit, prev_data, blocks, commit_ops, prepared)
+            (commit_cid, new_rev, prev_rev, prev_data, blocks, commit_ops, prepared)
         };
 
         // Phase B — shared-DB blob-ref reconciliation (Arc 16e
@@ -1344,7 +1350,9 @@ impl RepositoryManager {
                 self.did.clone(),
                 commit_cid.to_string(),
                 new_rev.clone(),
-                prev_commit.map(|c| c.to_string()),
+                // #467: `since` = the previous commit's rev (None for the
+                // repo's first commit).
+                prev_rev,
                 // Arc 14 §7.3.2: prior commit's MST root CID.
                 prev_data.map(|c| c.to_string()),
                 car_bytes,

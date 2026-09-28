@@ -23,11 +23,14 @@ const OVERSIZED_COMMIT_WARN_BYTES: usize = 25 * 1024;
 pub struct CommitEvent {
     pub rebase: bool,
     pub too_big: bool,
-    pub repo: String,          // DID
-    pub commit: String,        // CID of commit
-    pub rev: String,           // Revision TID
-    pub since: Option<String>, // Previous commit CID
-    pub blocks: Vec<u8>,       // CAR file bytes
+    pub repo: String,   // DID
+    pub commit: String, // CID of commit
+    pub rev: String,    // Revision TID
+    /// The rev (TID) of this repo's previous commit; `None` for its first
+    /// commit. #467: events sequenced before the fix hold the previous
+    /// commit's CID here instead; the firehose resolves those at send time.
+    pub since: Option<String>,
+    pub blocks: Vec<u8>, // CAR file bytes
     pub ops: Vec<CommitOp>,
     pub blobs: Vec<String>, // CIDs of blobs (deprecated but included)
     /// Prior commit's MST root CID. `None` for genesis commits.

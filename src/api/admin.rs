@@ -13612,6 +13612,89 @@ mod tests {
         assert_eq!(err, (StatusCode::CONFLICT, "NoRelays".to_string()));
     }
 
+    // ---------- #467: firehose #commit.since is the previous rev ----------
+
+    /// The `data` (MST root) CID inside a `#commit` event's commit block.
+    fn commit_data_cid(evt: &crate::sequencer::events::CommitEvent) -> String {
+        use proto_blue::lex_data::LexValue;
+        let (root, blocks) = proto_blue::repo::car::read_car_with_root(&evt.blocks).unwrap();
+        let bytes = blocks.get(&root).expect("commit block in CAR");
+        let LexValue::Map(commit) = proto_blue::lex_cbor::decode(bytes).unwrap() else {
+            panic!("commit block is a map")
+        };
+        match commit.get("data") {
+            Some(LexValue::Cid(c)) => c.to_string(),
+            other => panic!("commit.data is a CID link, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn consecutive_writes_chain_since_and_prev_data() {
+        let ctx = create_test_context().await;
+        let did = seed_rotatable_account(&ctx, "chain", "chain@example.com").await;
+        let key = ctx
+            .account_manager
+            .get_atproto_signing_key_bytes(&did)
+            .await
+            .unwrap();
+        let signer: TestArc<dyn proto_blue::crypto::Signer> =
+            TestArc::new(crate::crypto::proto_blue_signer::RepoSigner::from_bytes(&key).unwrap());
+        let repo = crate::actor_store::RepositoryManager::for_writer(&ctx, did.clone());
+        repo.create_record(
+            "app.bsky.actor.profile",
+            Some("self"),
+            serde_json::json!({"$type": "app.bsky.actor.profile", "displayName": "Chain"}),
+            Some(false),
+            signer.clone(),
+        )
+        .await
+        .unwrap();
+        repo.create_record(
+            "app.bsky.feed.post",
+            None,
+            serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "second",
+                "createdAt": "2026-09-28T00:00:00Z"
+            }),
+            Some(false),
+            signer,
+        )
+        .await
+        .unwrap();
+
+        // Newest first: [second write, first write, genesis, ...].
+        let commits: Vec<crate::sequencer::events::CommitEvent> = ctx
+            .sequencer
+            .get_events_for_did(&did, 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::sequencer::SeqEvent::Commit { evt, .. } => Some(evt),
+                _ => None,
+            })
+            .collect();
+        let (second, first) = (&commits[0], &commits[1]);
+        assert_eq!(
+            second.since.as_deref(),
+            Some(first.rev.as_str()),
+            "since is the previous commit's rev"
+        );
+        assert_eq!(
+            first.since.as_deref(),
+            Some(commits[2].rev.as_str()),
+            "the first write chains to genesis"
+        );
+        assert_eq!(
+            second.prev_data.as_deref(),
+            Some(commit_data_cid(first).as_str()),
+            "prevData is the previous commit's MST root"
+        );
+        let genesis = commits.last().unwrap();
+        assert_eq!(genesis.since, None, "a repo's first commit has no since");
+    }
+
     // ---------- #460: getRelayConfig reports the LIVE relay set ----------
 
     #[tokio::test]

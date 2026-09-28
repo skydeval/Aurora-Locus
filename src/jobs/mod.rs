@@ -102,13 +102,27 @@ impl JobScheduler {
         }
 
         // Announce this PDS to its relays (#462); a no-op unless federation and
-        // crawling are both on.
+        // crawling are both on. Wait until the PDS is actually answering first:
+        // the scheduler starts before the HTTP listener, and a relay probes
+        // describeServer when asked to crawl (#467).
         if self.context.federation_enabled {
-            crate::api::federation_crawl::spawn_crawl_requests(
-                &self.context,
-                None,
-                crate::api::federation_crawl::CrawlTrigger::Boot,
-            );
+            let ctx = Arc::clone(&self.context);
+            tokio::spawn(async move {
+                use crate::api::federation_crawl as crawl;
+                if !crawl::wait_until_serving(
+                    ctx.config.service.port,
+                    crawl::BOOT_READY_TIMEOUT,
+                    crawl::BOOT_READY_POLL,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "PDS did not answer describeServer locally within {:?}; asking relays to crawl anyway",
+                        crawl::BOOT_READY_TIMEOUT
+                    );
+                }
+                crawl::spawn_crawl_requests(&ctx, None, crawl::CrawlTrigger::Boot);
+            });
         }
 
         // Spawn nonce cleanup job (Phase 4)

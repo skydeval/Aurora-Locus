@@ -164,7 +164,10 @@ fn cid_str_to_lex(cid_str: &str) -> Result<LexValue, PdsError> {
 /// * `repo`: actor DID.
 /// * `commit_cid`: CID of the signed commit block (parsed for tag-42).
 /// * `rev`: TID revision string.
-/// * `since`: prior commit CID (Some for non-genesis); CID-typed.
+/// * `since`: the rev (TID string) of this repo's previous commit, or
+///   `None` for its first commit. Always emitted: the lexicon marks `since`
+///   required and nullable, so `None` is an explicit CBOR null. (#467: this
+///   was a CID link, which the Bluesky relay rejects.)
 /// * `prev_data`: prior MST root CID (Some for non-genesis; Step 2
 ///   integration — currently always `None`).
 /// * `blocks`: raw CAR bytes (NOT base64; emitted as CBOR major-type-2).
@@ -194,10 +197,15 @@ pub fn commit_body_to_lex_value(
     map.insert("repo".to_string(), LexValue::String(repo.to_string()));
     map.insert("commit".to_string(), cid_str_to_lex(commit_cid)?);
     map.insert("rev".to_string(), LexValue::String(rev.to_string()));
-    // Optional fields: omit-if-none discipline (Arc 14 §7.3.2).
-    if let Some(s) = since {
-        map.insert("since".to_string(), cid_str_to_lex(s)?);
-    }
+    // `since`: required + nullable string (TID) per the lexicon (#467).
+    map.insert(
+        "since".to_string(),
+        match since {
+            Some(rev) => LexValue::String(rev.to_string()),
+            None => LexValue::Null,
+        },
+    );
+    // `prevData`: optional; omitted for a repo's first commit (Arc 14 §7.3.2).
     if let Some(pd) = prev_data {
         map.insert("prevData".to_string(), cid_str_to_lex(pd)?);
     }
@@ -482,7 +490,7 @@ mod tests {
             "did:plc:test",
             "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454",
             "3l4rev",
-            Some("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"),
+            Some("3l4prevrev22a"),
             Some("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"),
             vec![],
             vec![],
@@ -495,6 +503,44 @@ mod tests {
         assert!(
             bytes.windows(prev_data_key.len()).any(|w| w == prev_data_key),
             "subsequent commit body MUST contain 'prevData' key"
+        );
+    }
+
+    /// #467: `since` is the previous commit's rev as a plain string, never a
+    /// CID link; for a repo's first commit it is present and null.
+    #[test]
+    fn since_is_a_rev_string_or_explicit_null() {
+        let build = |since: Option<&str>| {
+            commit_body_to_lex_value(
+                2,
+                false,
+                false,
+                "did:plc:test",
+                "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454",
+                "3mwlx6mgzik2o",
+                since,
+                None,
+                vec![],
+                vec![],
+                &[],
+                "2026-09-28T00:00:00Z",
+            )
+            .expect("build")
+        };
+        let LexValue::Map(later) = build(Some("3mwlx6lcubc2o")) else {
+            panic!("map")
+        };
+        assert_eq!(
+            later.get("since"),
+            Some(&LexValue::String("3mwlx6lcubc2o".to_string()))
+        );
+        let LexValue::Map(first) = build(None) else {
+            panic!("map")
+        };
+        assert_eq!(
+            first.get("since"),
+            Some(&LexValue::Null),
+            "required + nullable"
         );
     }
 

@@ -170,13 +170,16 @@ enum CursorDecision {
 }
 
 fn decide_cursor(
-    requested_cursor: i64,
+    requested_cursor: Option<i64>,
     current_seq: i64,
     earliest_in_window: Option<i64>,
 ) -> CursorDecision {
-    if requested_cursor == 0 {
+    // Only an absent cursor means live tail. `cursor=0` is a real cursor and
+    // replays the retained window from its start, as in the reference PDS
+    // (#467: it used to be treated as "no cursor" and returned nothing).
+    let Some(requested_cursor) = requested_cursor else {
         return CursorDecision::LiveTailNoCursor;
-    }
+    };
     if current_seq == 0 {
         // Round-1 F8 closure: requested_cursor > 0 with an empty
         // table → silent live-tail (no OutdatedCursor; nothing to
@@ -187,7 +190,10 @@ fn decide_cursor(
         return CursorDecision::FutureCursor;
     }
     match earliest_in_window {
-        Some(earliest) if requested_cursor < earliest => {
+        // Outdated only when events were actually skipped: the next event
+        // after `requested_cursor` is `requested_cursor + 1`, so a cursor of
+        // `earliest - 1` misses nothing and is a normal backfill.
+        Some(earliest) if requested_cursor < earliest - 1 => {
             // Subtract 1 because `next_event` is exclusive on `cursor`.
             CursorDecision::OutdatedCursor {
                 reason: OutdatedReason::CursorBelowWindow,
@@ -236,6 +242,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
         }
     };
 
+    // For log messages; `decide_cursor` takes the raw Option.
     let requested_cursor = params.cursor.unwrap_or(0);
     let backfill_secs = ctx.sequencer.backfill_limit_secs();
 
@@ -243,7 +250,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
     // the requested cursor + current head warrant it. We compute it
     // eagerly here only when both gates would let it matter — saves
     // a DB round-trip on no-cursor + empty-table paths.
-    let earliest_in_window = if requested_cursor > 0 && current_seq > 0 {
+    let earliest_in_window = if params.cursor.is_some() && current_seq > 0 {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(backfill_secs);
         match ctx.sequencer.earliest_after_time(cutoff).await {
             Ok(v) => v,
@@ -261,11 +268,11 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
         None
     };
 
-    let decision = decide_cursor(requested_cursor, current_seq, earliest_in_window);
+    let decision = decide_cursor(params.cursor, current_seq, earliest_in_window);
 
     let cursor: i64 = match decision {
         CursorDecision::LiveTailNoCursor => {
-            tracing::info!(
+            tracing::debug!(
                 at_branch = "live_tail_no_cursor",
                 current_seq,
                 "firehose: live-tail-from-now, no cursor provided",
@@ -273,7 +280,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
             current_seq
         }
         CursorDecision::EmptyRepoSeq => {
-            tracing::info!(
+            tracing::debug!(
                 at_branch = "empty_repo_seq",
                 requested_cursor,
                 "firehose: empty repo_seq, falling through to live-tail",
@@ -281,7 +288,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
             0
         }
         CursorDecision::FutureCursor => {
-            tracing::info!(
+            tracing::debug!(
                 at_branch = "future_cursor",
                 requested_cursor,
                 current_seq,
@@ -304,7 +311,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
             return;
         }
         CursorDecision::Backfill { starting_cursor } => {
-            tracing::info!(
+            tracing::debug!(
                 at_branch = "backfill",
                 requested_cursor = starting_cursor,
                 earliest_in_window = earliest_in_window.unwrap_or(0),
@@ -337,7 +344,7 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
                     "window_excluded_all_events",
                 ),
             };
-            tracing::info!(
+            tracing::debug!(
                 at_branch = "outdated_cursor",
                 reason = reason_tag,
                 requested_cursor,
@@ -410,8 +417,11 @@ async fn handle_subscription(socket: WebSocket, params: SubscribeReposParams, ct
                     Some(Ok(Message::Pong(_))) => {
                         last_activity = Instant::now();
                     }
+                    // A client dropping the connection (e.g. "Connection reset
+                    // without closing handshake") is routine and, from a
+                    // reconnecting relay, very frequent: debug, not error.
                     Some(Err(e)) => {
-                        tracing::error!("WebSocket error: {}", e);
+                        tracing::debug!("firehose client connection error: {}", e);
                         break;
                     }
                     None => {
@@ -457,6 +467,7 @@ async fn produce_events(ctx: AppContext, mut cursor: i64, tx: mpsc::Sender<Fireh
                     error_count = 0;
                     for event in events {
                         cursor = event.seq;
+                        let event = repair_legacy_commit_since(&ctx, event).await;
                         if let Some(frame) = event_to_frame(event) {
                             if tx.send(frame).await.is_err() {
                                 return;
@@ -482,6 +493,7 @@ async fn produce_events(ctx: AppContext, mut cursor: i64, tx: mpsc::Sender<Fireh
                 Ok(Some(event)) => {
                     error_count = 0;
                     cursor = event.seq;
+                    let event = repair_legacy_commit_since(&ctx, event).await;
                     if let Some(frame) = event_to_frame(event) {
                         if tx.send(frame).await.is_err() {
                             return;
@@ -503,6 +515,52 @@ async fn produce_events(ctx: AppContext, mut cursor: i64, tx: mpsc::Sender<Fireh
             }
         }
     }
+}
+
+/// Whether `s` has the shape of a TID (a repo `rev`): 13 characters of
+/// base32-sortable, the first limited to `2-7a-j`.
+fn is_tid(s: &str) -> bool {
+    const ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
+    let b = s.as_bytes();
+    b.len() == 13 && b"234567abcdefghij".contains(&b[0]) && b.iter().all(|c| ALPHABET.contains(c))
+}
+
+/// #467: commit events sequenced before the fix stored the previous commit's
+/// CID in `since` instead of its rev, and the Bluesky relay drops the
+/// connection on such a frame, wedging it at that seq. Replace any non-rev
+/// `since` with the rev of the repo's previous commit event (the lexicon's
+/// definition of `since`), or null when there is none. Events with a proper
+/// rev, and non-commit events, pass through untouched with no DB access.
+async fn repair_legacy_commit_since(
+    ctx: &AppContext,
+    mut event: crate::sequencer::SeqRow,
+) -> crate::sequencer::SeqRow {
+    if event.event_type != "commit" {
+        return event;
+    }
+    let Ok(mut commit) = serde_cbor::from_slice::<CommitEvent>(&event.event) else {
+        return event;
+    };
+    match commit.since.as_deref() {
+        None => return event,
+        Some(s) if is_tid(s) => return event,
+        Some(_) => {}
+    }
+    commit.since = match ctx
+        .sequencer
+        .previous_commit_rev(&commit.repo, event.seq)
+        .await
+    {
+        Ok(rev) => rev,
+        Err(e) => {
+            tracing::warn!(seq = event.seq, error = %e, "firehose: could not resolve legacy since; emitting null");
+            None
+        }
+    };
+    if let Ok(bytes) = serde_cbor::to_vec(&commit) {
+        event.event = bytes;
+    }
+    event
 }
 
 /// Convert a stored `SeqRow` to a typed `FirehoseFrame` (header + body).
@@ -729,15 +787,47 @@ mod tests {
     // reader can map test → §7.3.3 branch.
     // ============================================================
 
-    /// Branch 1 (live-tail, no cursor sent). cursor=0 → start from head.
+    /// Branch 1 (live-tail): no cursor parameter → start from head.
     #[test]
     fn decide_cursor_live_tail_when_no_cursor() {
         assert_eq!(
-            decide_cursor(0, 6, Some(3)),
+            decide_cursor(None, 6, Some(3)),
             CursorDecision::LiveTailNoCursor
         );
-        // Also when both are 0 (empty table, no cursor).
-        assert_eq!(decide_cursor(0, 0, None), CursorDecision::LiveTailNoCursor);
+        // Also on an empty table.
+        assert_eq!(
+            decide_cursor(None, 0, None),
+            CursorDecision::LiveTailNoCursor
+        );
+    }
+
+    /// #467: `cursor=0` is a real cursor — replay the retained window from its
+    /// start (it used to be treated as "no cursor" and returned nothing).
+    #[test]
+    fn decide_cursor_zero_replays_the_window() {
+        // Window starts at seq 1: nothing skipped, plain backfill from 0.
+        assert_eq!(
+            decide_cursor(Some(0), 6, Some(1)),
+            CursorDecision::Backfill { starting_cursor: 0 }
+        );
+        // Window starts later: events before it are gone → OutdatedCursor.
+        assert_eq!(
+            decide_cursor(Some(0), 6, Some(3)),
+            CursorDecision::OutdatedCursor {
+                reason: OutdatedReason::CursorBelowWindow,
+                advanced_to: 2,
+            }
+        );
+    }
+
+    /// A cursor of `earliest - 1` skips nothing (the next event IS the
+    /// window's earliest), so it is a normal backfill, not OutdatedCursor.
+    #[test]
+    fn decide_cursor_earliest_minus_one_is_not_outdated() {
+        assert_eq!(
+            decide_cursor(Some(2), 6, Some(3)),
+            CursorDecision::Backfill { starting_cursor: 2 }
+        );
     }
 
     /// Round-1 F8 closure: cursor > 0 with an empty `repo_seq`
@@ -745,14 +835,23 @@ mod tests {
     /// Distinct from chainlink #76's WindowExcludedAllEvents case.
     #[test]
     fn decide_cursor_empty_repo_seq_no_outdated() {
-        assert_eq!(decide_cursor(5, 0, None), CursorDecision::EmptyRepoSeq);
+        assert_eq!(
+            decide_cursor(Some(5), 0, None),
+            CursorDecision::EmptyRepoSeq
+        );
     }
 
     /// Branch 2 (FutureCursor): cursor > current_seq > 0.
     #[test]
     fn decide_cursor_future_cursor_when_beyond_head() {
-        assert_eq!(decide_cursor(10, 5, Some(3)), CursorDecision::FutureCursor);
-        assert_eq!(decide_cursor(2, 1, Some(1)), CursorDecision::FutureCursor);
+        assert_eq!(
+            decide_cursor(Some(10), 5, Some(3)),
+            CursorDecision::FutureCursor
+        );
+        assert_eq!(
+            decide_cursor(Some(2), 1, Some(1)),
+            CursorDecision::FutureCursor
+        );
     }
 
     /// Branch 3 normal-backfill: cursor sits within the window.
@@ -760,12 +859,12 @@ mod tests {
     #[test]
     fn decide_cursor_normal_backfill_when_cursor_within_window() {
         assert_eq!(
-            decide_cursor(5, 6, Some(3)),
+            decide_cursor(Some(5), 6, Some(3)),
             CursorDecision::Backfill { starting_cursor: 5 }
         );
         // Boundary: cursor == earliest_in_window.
         assert_eq!(
-            decide_cursor(3, 6, Some(3)),
+            decide_cursor(Some(3), 6, Some(3)),
             CursorDecision::Backfill { starting_cursor: 3 }
         );
     }
@@ -777,7 +876,7 @@ mod tests {
     #[test]
     fn decide_cursor_outdated_below_window_advances_to_earliest_minus_one() {
         assert_eq!(
-            decide_cursor(1, 6, Some(3)),
+            decide_cursor(Some(1), 6, Some(3)),
             CursorDecision::OutdatedCursor {
                 reason: OutdatedReason::CursorBelowWindow,
                 advanced_to: 2,
@@ -795,7 +894,7 @@ mod tests {
     #[test]
     fn decide_cursor_outdated_window_excluded_all_events_chainlink_76() {
         assert_eq!(
-            decide_cursor(1, 6, None),
+            decide_cursor(Some(1), 6, None),
             CursorDecision::OutdatedCursor {
                 reason: OutdatedReason::WindowExcludedAllEvents,
                 advanced_to: 6,
@@ -809,11 +908,88 @@ mod tests {
     /// live-tail). Confirms the two cases are correctly disambiguated.
     #[test]
     fn decide_cursor_does_not_emit_outdated_when_repo_seq_genuinely_empty() {
-        let d = decide_cursor(5, 0, None);
+        let d = decide_cursor(Some(5), 0, None);
         assert!(
             matches!(d, CursorDecision::EmptyRepoSeq),
             "expected EmptyRepoSeq, got {:?}",
             d
+        );
+    }
+
+    #[test]
+    fn is_tid_accepts_revs_only() {
+        assert!(is_tid("3mwlx6lcubc2o"));
+        assert!(is_tid("2222222222222"));
+        assert!(!is_tid(
+            "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454"
+        ));
+        assert!(!is_tid("3mwlx6lcubc2")); // 12 chars
+        assert!(!is_tid("kmwlx6lcubc2o")); // first char out of range
+        assert!(!is_tid("3MWLX6LCUBC2O")); // uppercase
+        assert!(!is_tid(""));
+    }
+
+    /// #467: an event sequenced before the fix (`since` = previous commit CID)
+    /// goes out with the previous commit's rev instead, or null when the repo
+    /// has no earlier commit. A proper rev is left alone.
+    #[tokio::test]
+    async fn legacy_cid_since_is_repaired_at_send_time() {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let did = "did:plc:legacy";
+        let cid = "bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454";
+        let mk = |rev: &str, since: Option<&str>| {
+            CommitEvent::new(
+                did.to_string(),
+                cid.to_string(),
+                rev.to_string(),
+                since.map(str::to_string),
+                None,
+                vec![],
+                vec![],
+            )
+        };
+        let seq_first = ctx
+            .sequencer
+            .sequence_commit(mk("3mwlx6lcubc2o", Some(cid)))
+            .await
+            .unwrap();
+        let seq_second = ctx
+            .sequencer
+            .sequence_commit(mk("3mwlx6mgzik2o", Some(cid)))
+            .await
+            .unwrap();
+        let seq_good = ctx
+            .sequencer
+            .sequence_commit(mk("3mwlx6nnnnn2o", Some("3mwlx6mgzik2o")))
+            .await
+            .unwrap();
+
+        let since_after_repair = |seq: i64| {
+            let ctx = ctx.clone();
+            async move {
+                let row = ctx.sequencer.next_event(seq - 1).await.unwrap().unwrap();
+                assert_eq!(row.seq, seq);
+                let row = repair_legacy_commit_since(&ctx, row).await;
+                serde_cbor::from_slice::<CommitEvent>(&row.event)
+                    .unwrap()
+                    .since
+            }
+        };
+        assert_eq!(
+            since_after_repair(seq_first).await,
+            None,
+            "no earlier commit → null"
+        );
+        assert_eq!(
+            since_after_repair(seq_second).await.as_deref(),
+            Some("3mwlx6lcubc2o"),
+            "CID replaced by the previous commit's rev"
+        );
+        assert_eq!(
+            since_after_repair(seq_good).await.as_deref(),
+            Some("3mwlx6mgzik2o"),
+            "a proper rev passes through"
         );
     }
 

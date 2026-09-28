@@ -20,6 +20,11 @@ use crate::federation::crawl::{CrawlRequester, BACKGROUND_BACKOFF};
 use serde::Serialize;
 use std::time::Duration;
 
+/// How long the boot announcement waits for this PDS to start answering.
+pub const BOOT_READY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How often the boot announcement re-checks readiness.
+pub const BOOT_READY_POLL: Duration = Duration::from_secs(1);
+
 /// A relay acknowledged a `requestCrawl`.
 pub(crate) const ACTION_CRAWL_REQUESTED: &str = "federation.crawl_requested";
 /// A `requestCrawl` failed after its last attempt.
@@ -112,6 +117,37 @@ pub async fn relay_state(ctx: &AppContext) -> &'static str {
         "announcing"
     } else {
         "idle"
+    }
+}
+
+/// Wait until this PDS answers its own `describeServer` on the local listener
+/// (`127.0.0.1:port`), or `timeout` passes. Returns whether it answered.
+///
+/// A relay answers `requestCrawl` by probing the PDS's `describeServer`; asked
+/// before the listener is up, the probe times out and the relay replies
+/// `HostNotFound` (#467). The boot announcement waits on this first.
+pub async fn wait_until_serving(port: u16, timeout: Duration, poll: Duration) -> bool {
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("http://127.0.0.1:{port}/xrpc/com.atproto.server.describeServer");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 
@@ -264,6 +300,39 @@ mod tests {
         assert_eq!(
             relay_state(&with(true, true, r()).await).await,
             "announcing"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_until_serving_sees_a_listener_and_times_out_without_one() {
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/xrpc/com.atproto.server.describeServer",
+            get(|| async { "{}" }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(wait_until_serving(port, Duration::from_secs(5), Duration::from_millis(50)).await);
+
+        let closed = {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_until_serving(
+                closed,
+                Duration::from_millis(300),
+                Duration::from_millis(50)
+            )
+            .await
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "bounded by the timeout"
         );
     }
 

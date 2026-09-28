@@ -454,6 +454,33 @@ impl Sequencer {
         }
     }
 
+    /// The rev of `did`'s most recent non-invalidated commit event before
+    /// `seq`, or `None` if it has none. That is exactly the `#commit.since`
+    /// value for the event at `seq` ("the rev of the last emitted commit from
+    /// this repo"). Used by the firehose to repair events sequenced before
+    /// #467, which stored the previous commit's CID in `since` instead.
+    pub async fn previous_commit_rev(&self, did: &str, seq: i64) -> PdsResult<Option<String>> {
+        use sqlx::Row as _;
+        let row = sqlx::query(
+            "SELECT event FROM repo_seq \
+             WHERE did = $1 AND event_type = $2 AND seq < $3 AND NOT invalidated \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(did)
+        .bind(EventType::Commit.as_str())
+        .bind(seq)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let bytes: Vec<u8> = row.try_get("event").map_err(PdsError::Database)?;
+        let prev: CommitEvent = serde_cbor::from_slice(&bytes)
+            .map_err(|e| PdsError::Internal(format!("Failed to decode commit event: {}", e)))?;
+        Ok(Some(prev.rev))
+    }
+
     /// Get events for a specific DID
     #[allow(dead_code)] // Public API for DID-specific event queries
     pub async fn get_events_for_did(&self, did: &str, limit: i64) -> PdsResult<Vec<SeqEvent>> {
