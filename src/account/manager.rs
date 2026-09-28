@@ -2929,6 +2929,25 @@ impl AccountManager {
         Ok(())
     }
 
+    /// Whether the session `session_id` was opened with a *privileged* app
+    /// password (#471). `false` for a session not opened with an app password
+    /// or with an unknown id; callers check `is_app_password` first.
+    pub async fn session_app_password_privileged(&self, session_id: &str) -> PdsResult<bool> {
+        let row = sqlx::query(
+            "SELECT ap.privileged FROM session s \
+             JOIN app_password ap ON ap.did = s.did AND ap.name = s.app_password_name \
+             WHERE s.id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        match row {
+            Some(row) => Ok(crate::db::read_bool(&row, "privileged")?),
+            None => Ok(false),
+        }
+    }
+
     // ==================== Preferences (#470) ====================
 
     /// Stored preferences for `did` within `namespace` (e.g. `app.bsky`), in

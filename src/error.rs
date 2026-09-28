@@ -67,6 +67,21 @@ pub enum PdsError {
     #[error("{0}")]
     InvalidInviteCode(String),
 
+    /// The XRPC method is neither implemented here nor forwardable (#471).
+    /// XRPC `MethodNotImplemented`, HTTP 501.
+    #[error("{0}")]
+    MethodNotImplemented(String),
+
+    /// A proxied upstream service could not be reached or answered
+    /// unusably (#471). XRPC `UpstreamFailure`, HTTP 502.
+    #[error("{0}")]
+    UpstreamFailure(String),
+
+    /// A proxied upstream service did not answer in time (#471). XRPC
+    /// `UpstreamTimeout`, HTTP 504.
+    #[error("{0}")]
+    UpstreamTimeout(String),
+
     /// Rate limiting errors
     #[error("Rate limit exceeded")]
     RateLimitExceeded { retry_after: std::time::Duration },
@@ -612,6 +627,9 @@ impl PartialEq for PdsError {
             (PdsError::DidResolution(a), PdsError::DidResolution(b)) => a == b,
             (PdsError::IdentityResolution(a), PdsError::IdentityResolution(b)) => a == b,
             (PdsError::InvalidInviteCode(a), PdsError::InvalidInviteCode(b)) => a == b,
+            (PdsError::MethodNotImplemented(a), PdsError::MethodNotImplemented(b)) => a == b,
+            (PdsError::UpstreamFailure(a), PdsError::UpstreamFailure(b)) => a == b,
+            (PdsError::UpstreamTimeout(a), PdsError::UpstreamTimeout(b)) => a == b,
             (
                 PdsError::RateLimitExceeded { retry_after: a },
                 PdsError::RateLimitExceeded { retry_after: b },
@@ -874,6 +892,19 @@ impl IntoResponse for PdsError {
             PdsError::InvalidInviteCode(_) => (
                 StatusCode::BAD_REQUEST,
                 "InvalidInviteCode",
+                self.to_string(),
+            ),
+            PdsError::MethodNotImplemented(_) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "MethodNotImplemented",
+                self.to_string(),
+            ),
+            PdsError::UpstreamFailure(_) => {
+                (StatusCode::BAD_GATEWAY, "UpstreamFailure", self.to_string())
+            }
+            PdsError::UpstreamTimeout(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "UpstreamTimeout",
                 self.to_string(),
             ),
             // Arc 14 §7.3.5 / §7.6.5: sync-namespace typed errors.

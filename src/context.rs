@@ -124,8 +124,8 @@ pub struct AppContext {
     /// keyspaces don't conflict.
     pub dpop_nonce_store: Option<Arc<DPopNonceStore>>,
     /// DPoP verifier — always present. Used by the OAuth token
-    /// endpoint at issuance and by `OAuthAuthContext` on every
-    /// resource request that has a DPoP-bound token. RFC 9449 §4.3
+    /// endpoint at issuance and on resource requests that carry a
+    /// DPoP-bound token. RFC 9449 §4.3
     /// `ath` binding is checked at the resource-request site; the
     /// JTI replay set is shared with the federation §8 challenge
     /// store when federation is enabled (see field above).

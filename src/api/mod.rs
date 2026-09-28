@@ -39,6 +39,7 @@ pub mod registry;
 pub mod repo;
 pub mod repo_import;
 pub mod server;
+pub mod service_proxy;
 pub mod sync;
 pub mod sync_helpers;
 pub mod temp;
@@ -136,6 +137,11 @@ pub fn routes() -> (Router<AppContext>, Arc<crate::api::registry::RouteRegistry>
     // `docs/internal/dev-routes.md`.
     #[cfg(debug_assertions)]
     let router = router.merge(dev_routes::routes());
+
+    // #471: anything no route above serves falls through to the service
+    // proxy — unimplemented `/xrpc/<nsid>` calls are forwarded (atproto-proxy
+    // header, else app.bsky.* to the AppView); every other path is a JSON 404.
+    let router = router.fallback(service_proxy::xrpc_fallback);
 
     (router, registry)
 }

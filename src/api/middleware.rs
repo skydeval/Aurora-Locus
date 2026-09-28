@@ -358,6 +358,9 @@ pub struct AccountAuth {
     /// reference PDS keeps away from full-access-only data such as
     /// `personalDetailsPref`.
     pub full_access: bool,
+    /// Full access, or an app password created as privileged. The reference
+    /// PDS requires this for proxied `chat.bsky.*` calls (#471).
+    pub privileged: bool,
 }
 
 #[axum::async_trait]
@@ -369,13 +372,22 @@ impl axum::extract::FromRequestParts<AppContext> for AccountAuth {
         state: &AppContext,
     ) -> Result<Self, Self::Rejection> {
         match require_auth_unified(State(state.clone()), parts.headers.clone()).await? {
-            UnifiedAuthContext::Local(session) => Ok(AccountAuth {
-                did: session.did,
-                full_access: !session.is_app_password,
-            }),
+            UnifiedAuthContext::Local(session) => {
+                let privileged = !session.is_app_password
+                    || state
+                        .account_manager
+                        .session_app_password_privileged(&session.session_id)
+                        .await?;
+                Ok(AccountAuth {
+                    did: session.did,
+                    full_access: !session.is_app_password,
+                    privileged,
+                })
+            }
             UnifiedAuthContext::OAuth { did, .. } => Ok(AccountAuth {
                 did,
                 full_access: true,
+                privileged: true,
             }),
             UnifiedAuthContext::CrossPDS { .. } => Err(PdsError::Authentication(
                 "This endpoint requires an account session on this PDS".to_string(),

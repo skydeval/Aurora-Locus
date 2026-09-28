@@ -14,11 +14,10 @@ use axum::{
     http::{header, Method, StatusCode},
     middleware,
     middleware::Next,
-    response::{IntoResponse, Json, Response},
+    response::{IntoResponse, Response},
     routing::get,
     Router,
 };
-use serde_json::json;
 use tower_http::{
     compression::CompressionLayer,
     cors::{AllowHeaders, Any, CorsLayer},
@@ -211,7 +210,8 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
-        .fallback(not_found)
+    // No `.fallback` here: the API router's fallback (the XRPC service proxy,
+    // #471, with a JSON 404 for everything else) must not be overridden.
 }
 
 /// Metrics handler - Returns Prometheus-formatted metrics
@@ -225,17 +225,6 @@ async fn metrics_handler() -> Response {
         )
         .body(metrics_text.into())
         .unwrap()
-}
-
-/// 404 handler
-async fn not_found() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "error": "NotFound",
-            "message": "Endpoint not found"
-        })),
-    )
 }
 
 /// v0.9 Federation runtime-mutability arc §3.1 (#390) — graceful-shutdown drain

@@ -1176,6 +1176,55 @@ struct GetServiceAuthResponse {
     token: String,
 }
 
+/// Mint a service-auth JWT in `did`'s name for `aud` (optionally bound to the
+/// lexicon method `lxm`, expiring after `exp_seconds`). Shared by
+/// `com.atproto.server.getServiceAuth` and the XRPC service proxy (#471).
+///
+/// Routing is KEY-PRESENCE-based (#448): when the PDS holds the account's
+/// per-account key it signs in-process — did:plc and, as of v0.10, did:web
+/// accounts with a PDS-held key (parity). The key is the per-account
+/// atproto_signing_key (#143), so the signature matches the issuer DID's
+/// published verification method. When no key is stored — a sovereign did:web
+/// whose holder keeps the private key — the signature is mediated through the
+/// holder channel (v0.11 / Phase γ; the default
+/// `UnavailableHolderSigningChannel` returns a clean "not yet wired" 4xx).
+pub(crate) async fn mint_account_service_jwt(
+    ctx: &AppContext,
+    did: &str,
+    aud: &str,
+    exp_seconds: Option<i64>,
+    lxm: Option<&str>,
+) -> PdsResult<String> {
+    match ctx.account_manager.get_atproto_signing_key_bytes(did).await {
+        Ok(signing_key_bytes) => {
+            if signing_key_bytes.len() != 32 {
+                return Err(PdsError::Internal(
+                    "Signing key must be exactly 32 bytes".to_string(),
+                ));
+            }
+            service_auth::create_service_jwt(did, aud, exp_seconds, lxm, &signing_key_bytes)
+        }
+        Err(PdsError::NotFound(nf)) => {
+            // No PDS-held key. A did:web account is sovereign — mediate through
+            // the holder channel. Any other DID with no key is simply unknown;
+            // surface that as-is rather than misroute it to the holder path.
+            if crate::identity::did_method::is_web(did) {
+                mint_service_jwt_via_holder(
+                    ctx.holder_signing_channel.as_ref(),
+                    did,
+                    aud,
+                    exp_seconds,
+                    lxm,
+                )
+                .await
+            } else {
+                Err(PdsError::NotFound(nf))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Get service auth endpoint
 ///
 /// Generates a service auth JWT for authenticated server-to-server communication.
@@ -1295,44 +1344,9 @@ async fn get_service_auth(
     // the signature is mediated through the holder channel (v0.11 / Phase γ; the
     // default `UnavailableHolderSigningChannel` returns a clean "not yet wired"
     // 4xx today). See chainlink #447 (async signer) / #448 (this parity work).
-    let token = match ctx
-        .account_manager
-        .get_atproto_signing_key_bytes(&auth.did)
-        .await
-    {
-        Ok(signing_key_bytes) => {
-            if signing_key_bytes.len() != 32 {
-                return Err(PdsError::Internal(
-                    "Signing key must be exactly 32 bytes".to_string(),
-                ));
-            }
-            service_auth::create_service_jwt(
-                &auth.did,          // Issuer DID (authenticated user)
-                &req.aud,           // Audience DID (target service)
-                exp_duration,       // Expiration duration in seconds
-                req.lxm.as_deref(), // Optional lexicon method
-                &signing_key_bytes, // Per-account signing key (chainlink #143)
-            )?
-        }
-        Err(PdsError::NotFound(nf)) => {
-            // No PDS-held key. A did:web account is sovereign — mediate through
-            // the holder channel. Any other DID with no key is simply unknown;
-            // surface that as-is rather than misroute it to the holder path.
-            if crate::identity::did_method::is_web(&auth.did) {
-                mint_service_jwt_via_holder(
-                    ctx.holder_signing_channel.as_ref(),
-                    &auth.did,
-                    &req.aud,
-                    exp_duration,
-                    req.lxm.as_deref(),
-                )
-                .await?
-            } else {
-                return Err(PdsError::NotFound(nf));
-            }
-        }
-        Err(e) => return Err(e),
-    };
+    let token =
+        mint_account_service_jwt(&ctx, &auth.did, &req.aud, exp_duration, req.lxm.as_deref())
+            .await?;
 
     tracing::info!(
         did = %auth.did,
