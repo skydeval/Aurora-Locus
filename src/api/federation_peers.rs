@@ -92,8 +92,6 @@ pub enum FedPeerError {
     BootSeedFailureActive,
     /// Phase D: the 60s relay-switch lock-acquisition timeout fired.
     LockAcquisitionTimeout,
-    /// Phase D: `RelayClient::reconfigure` failed after the CAS-write succeeded.
-    ReconfigureFailed(String),
     /// Phase D: relay operation requested but no relay client is configured.
     NoRelayClient,
     /// Substrate failure (DB / serialization).
@@ -153,11 +151,6 @@ impl FedPeerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "LockAcquisitionTimeout",
                 "relay-switch lock acquisition timed out; retry shortly".to_string(),
-            ),
-            FedPeerError::ReconfigureFailed(m) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ReconfigureFailed",
-                format!("relay reconfigure failed: {m}; runtime store updated, retry or restart"),
             ),
             FedPeerError::NoRelayClient => (
                 StatusCode::SERVICE_UNAVAILABLE,

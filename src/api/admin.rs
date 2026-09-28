@@ -8414,7 +8414,6 @@ async fn get_system_metrics(
     let mut cache_hits: i64 = 0;
     let mut cache_misses: i64 = 0;
     let mut sequencer_current_seq: i64 = 0;
-    let mut relay_events_total: i64 = 0;
 
     for mf in &metric_families {
         match mf.name() {
@@ -8441,11 +8440,6 @@ async fn get_system_metrics(
             "sequencer_current_seq" => {
                 if let Some(m) = mf.get_metric().first() {
                     sequencer_current_seq = m.get_gauge().value() as i64;
-                }
-            }
-            "relay_events_total" => {
-                for m in mf.get_metric() {
-                    relay_events_total += m.get_counter().value() as i64;
                 }
             }
             _ => {}
@@ -8480,10 +8474,6 @@ async fn get_system_metrics(
             "events_total": metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["commit"]).get() +
                            metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["identity"]).get() +
                            metrics::SEQUENCER_EVENTS_TOTAL.with_label_values(&["account"]).get(),
-        },
-        "relay": {
-            "events_received": relay_events_total,
-            "connection_status": metrics::RELAY_CONNECTION_STATUS.get(),
         },
         "accounts": {
             "total": metrics::ACCOUNTS_TOTAL.get(),
@@ -9922,8 +9912,13 @@ async fn get_relay_config(
     let federation_config = &ctx.config.federation;
     let has_relay = ctx.relay_client.is_some();
 
-    let servers: Vec<RelayServerInfo> = federation_config
-        .relay_urls
+    // The LIVE relay set (runtime relay switches land here), not the boot
+    // `PDS_FEDERATION_RELAY_URLS` seed (#460).
+    let live_relays: Vec<String> = match ctx.relay_client.as_ref() {
+        Some(client) => client.lock().await.servers().to_vec(),
+        None => federation_config.relay_urls.clone(),
+    };
+    let servers: Vec<RelayServerInfo> = live_relays
         .iter()
         .map(|url: &String| RelayServerInfo {
             url: url.clone(),
@@ -13415,6 +13410,38 @@ mod tests {
             count_chain_rows(&ctx, "account.update_handle", Some("did:plc:hh")).await,
             0
         );
+    }
+
+    // ---------- #460: getRelayConfig reports the LIVE relay set ----------
+
+    #[tokio::test]
+    async fn get_relay_config_reports_live_set_not_boot_seed() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.relay_urls = vec!["https://boot.example".to_string()];
+        })
+        .await;
+        crate::api::federation_relays::set_federation_relays(
+            &ctx,
+            "did:plc:op",
+            vec![
+                "https://live-a.example".to_string(),
+                "https://live-b.example".to_string(),
+            ],
+            "graceful",
+        )
+        .await
+        .unwrap();
+
+        let Json(resp) = get_relay_config(State(ctx.clone()), admin_test_auth())
+            .await
+            .unwrap();
+        let urls: Vec<&str> = resp.servers.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, ["https://live-a.example", "https://live-b.example"]);
+        assert_eq!(resp.status, "active");
     }
 
     // ---------- #456: admin handle change publishes to PLC + emits identity ----------

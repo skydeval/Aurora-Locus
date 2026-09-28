@@ -101,12 +101,6 @@ impl JobScheduler {
             info!("Federation discovery job started");
         }
 
-        // Spawn relay firehose subscription job (Phase 3)
-        if self.context.federation_enabled && self.context.relay_client.is_some() {
-            tokio::spawn(Self::relay_firehose_subscription_job(Arc::clone(&self)));
-            info!("Relay firehose subscription job started");
-        }
-
         // Spawn nonce cleanup job (Phase 4)
         if self.context.federation_enabled && self.context.nonce_store.is_some() {
             tokio::spawn(Self::nonce_cleanup_job(Arc::clone(&self)));
@@ -588,51 +582,6 @@ impl JobScheduler {
                 }
             }
         }
-    }
-
-    /// Relay firehose subscription job - Phase 3
-    async fn relay_firehose_subscription_job(scheduler: Arc<Self>) {
-        info!("Starting relay firehose subscription");
-
-        let relay_client = match &scheduler.context.relay_client {
-            Some(client) => client,
-            None => {
-                error!("Relay client not initialized");
-                return;
-            }
-        };
-
-        // Subscribe to firehose
-        let mut relay_client_locked = relay_client.lock().await;
-        let mut event_receiver = match relay_client_locked.subscribe_firehose().await {
-            Ok(rx) => {
-                info!("✓ Successfully subscribed to relay firehose");
-                rx
-            }
-            Err(e) => {
-                error!("Failed to subscribe to relay firehose: {}", e);
-                return;
-            }
-        };
-        drop(relay_client_locked);
-
-        // Process events as they arrive
-        let mut event_count = 0u64;
-        while let Some(event) = event_receiver.recv().await {
-            event_count += 1;
-
-            // Log progress every 100 events
-            if event_count.is_multiple_of(100) {
-                info!("Processed {} relay events", event_count);
-            }
-
-            // Process the event
-            if let Err(e) = tasks::process_relay_event(&scheduler.context, event).await {
-                error!("Failed to process relay event: {}", e);
-            }
-        }
-
-        error!("Relay firehose subscription ended unexpectedly");
     }
 
     /// Nonce cleanup job (runs every 5 minutes) - Phase 4

@@ -100,7 +100,7 @@ impl Instance {
         let pool = open_pool(url).await;
 
         // Sequencer + leader election (Postgres path mirrors AppContext::new).
-        let mut seq = Sequencer::with_relay(pool.clone(), SequencerConfig::default(), None);
+        let mut seq = Sequencer::new(pool.clone(), SequencerConfig::default());
         seq.attach_leader_flag(Arc::new(AtomicBool::new(false)));
         // PostgresLockProvider::new takes the connection URL (not a
         // pool clone) since chainlink #103 / Session 4 — the lock

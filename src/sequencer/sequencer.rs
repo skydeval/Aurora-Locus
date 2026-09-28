@@ -1,7 +1,6 @@
 /// Main Sequencer implementation
 use crate::{
     error::{PdsError, PdsResult},
-    federation::RelayClient,
     sequencer::{
         events::{AccountEvent, CommitEvent, IdentityEvent, OpAction, SyncEvent},
         EventType, SeqEvent, SeqRow,
@@ -12,7 +11,7 @@ use serde_cbor;
 use sqlx::{AnyPool, Row};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 /// Sequencer configuration.
 ///
@@ -50,7 +49,6 @@ pub struct Sequencer {
     db: AnyPool,
     config: SequencerConfig,
     last_seq: Arc<RwLock<Option<i64>>>,
-    relay_client: Option<Arc<Mutex<RelayClient>>>,
     /// Multi-instance leadership flag (chainlink #89, design doc §3.5).
     /// `true` = this process is the sequencer leader and may write
     /// firehose events; `false` = standby, writes return NotLeader.
@@ -63,29 +61,11 @@ pub struct Sequencer {
 impl Sequencer {
     /// Create a new sequencer (single-instance mode — `is_leader` defaults
     /// to true).
-    #[allow(dead_code)] // consumed by rebuild.rs (bin-invisible; not on the default runtime path)
     pub fn new(db: AnyPool, config: SequencerConfig) -> Self {
         Self {
             db,
             config,
             last_seq: Arc::new(RwLock::new(None)),
-            relay_client: None,
-            is_leader: Arc::new(AtomicBool::new(true)),
-        }
-    }
-
-    /// Create a new sequencer with relay client for federation
-    /// (single-instance mode — `is_leader` defaults to true).
-    pub fn with_relay(
-        db: AnyPool,
-        config: SequencerConfig,
-        relay_client: Option<Arc<Mutex<RelayClient>>>,
-    ) -> Self {
-        Self {
-            db,
-            config,
-            last_seq: Arc::new(RwLock::new(None)),
-            relay_client,
             is_leader: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -136,10 +116,6 @@ impl Sequencer {
             .insert_event(&evt.repo, EventType::Commit, event_bytes)
             .await?;
 
-        // Publish to relay if configured
-        self.publish_to_relay("commit", &evt.repo, seq, Some(&evt.commit))
-            .await;
-
         Ok(seq)
     }
 
@@ -152,9 +128,6 @@ impl Sequencer {
         let seq = self
             .insert_event(&evt.did, EventType::Sync, event_bytes)
             .await?;
-
-        // Publish to relay if configured
-        self.publish_to_relay("sync", &evt.did, seq, None).await;
 
         Ok(seq)
     }
@@ -169,9 +142,6 @@ impl Sequencer {
             .insert_event(&evt.did, EventType::Identity, event_bytes)
             .await?;
 
-        // Publish to relay if configured
-        self.publish_to_relay("identity", &evt.did, seq, None).await;
-
         Ok(seq)
     }
 
@@ -184,9 +154,6 @@ impl Sequencer {
         let seq = self
             .insert_event(&evt.did, EventType::Account, event_bytes)
             .await?;
-
-        // Publish to relay if configured
-        self.publish_to_relay("account", &evt.did, seq, None).await;
 
         Ok(seq)
     }
@@ -484,46 +451,6 @@ impl Sequencer {
                     evt,
                 }))
             }
-        }
-    }
-
-    /// Publish event to relay (non-blocking, errors logged but not propagated)
-    async fn publish_to_relay(
-        &self,
-        event_type: &str,
-        did: &str,
-        seq: i64,
-        commit_cid: Option<&str>,
-    ) {
-        if let Some(ref relay_client) = self.relay_client {
-            use crate::federation::relay::RelayEvent;
-
-            let relay_event = RelayEvent {
-                event_type: event_type.to_string(),
-                did: did.to_string(),
-                seq,
-                commit: commit_cid.map(|cid| serde_json::json!({ "cid": cid })),
-                time: Utc::now().to_rfc3339(),
-            };
-
-            let client = relay_client.clone();
-            let event_type_owned = event_type.to_string();
-            tokio::spawn(async move {
-                if let Err(e) = client.lock().await.publish_event(&relay_event).await {
-                    tracing::warn!(
-                        "Failed to publish event to relay: {} seq={}: {}",
-                        event_type_owned,
-                        relay_event.seq,
-                        e
-                    );
-                } else {
-                    tracing::debug!(
-                        "Event published to relay: {} seq={}",
-                        event_type_owned,
-                        relay_event.seq
-                    );
-                }
-            });
         }
     }
 

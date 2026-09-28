@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `.env.example` sets `RUST_LOG=info` (was `info,aurora_locus=debug`), so a copied example config doesn't write debug-level logs
+
 ### Fixed
 
 - Handles under the PDS's handle domains now verify: `/.well-known/atproto-did` answers by the requested hostname, returning the account's DID for `<name>.<handle-domain>` (404 `User not found` for unknown, deactivated or taken-down accounts, and for unrelated hosts) while the service hostname still returns the server's DID. Previously every hostname got the server's DID, so Bluesky and other clients showed hosted handles as invalid
@@ -15,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `com.atproto.identity.updateHandle` to a handle on this PDS's own domains no longer fails after already updating the PLC directory (it tried to verify the new handle over HTTPS before the PDS had stored it); both handle-change paths now finish every check before anything is published
 - The admin panel's Update handle, Update email and Send password reset actions send their request after the rationale is submitted (previously the modal closed and nothing happened)
 - The admin panel no longer reports "Update failed: JSON.parse: unexpected end of data" after actions that succeed with an empty response, such as changing an account's handle; the change had been applied, only the success was misreported
+- With federation enabled and a relay configured (the default is `https://bsky.network`), the PDS no longer subscribes to the relay's firehose. It was downloading the entire network's event stream (about 130 GB a day from bsky.network), discarding every event, and logging a line per event; relays crawl a PDS, a PDS does not need their firehose. It also no longer sends each of its own events to the relay as a request the relay rejects. The unused relay metrics (`relay_events_total`, `relay_event_processing_duration_seconds`, `relay_connection_status`, `relay_connections_total`, `relay_events_published_total`) and the `relay` block of the admin system-metrics response are removed
+- Operations → Federation's relay configuration reports the live relay set, including changes made at runtime, instead of the startup value from `PDS_FEDERATION_RELAY_URLS`
 
 ## [0.10.1] - 2026-07-27
 

@@ -2,7 +2,6 @@
 ///
 /// Tests Aurora Locus PDS federation functionality including:
 /// - Federated search across multiple PDS instances
-/// - Relay event processing
 /// - PDS discovery
 /// - Cross-PDS authentication
 ///
@@ -128,190 +127,8 @@ mod federated_search_tests {
 }
 
 #[cfg(test)]
-mod relay_event_processing_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_relay_commit_event_processing() {
-        // Test that relay commit events are processed correctly
-        //
-        // Given: A commit event from relay firehose
-        // When: Event is processed
-        // Then: Commit is logged for future indexing
-
-        let commit_event = json!({
-            "event_type": "commit",
-            "did": "did:plc:user123",
-            "commit": {
-                "cid": "bafyreiabc123",
-                "rev": "3jui7kd54zh2y",
-                "operation": "create",
-                "collection": "app.bsky.feed.post",
-                "rkey": "3jui7kd54zh2y"
-            }
-        });
-
-        // Verify event structure
-        assert_eq!(commit_event["event_type"], "commit");
-        assert_eq!(commit_event["did"], "did:plc:user123");
-
-        println!("✓ Commit event structure validated");
-
-        // TODO: Once process_relay_event is refactored for testability,
-        // verify commit is processed and metrics are recorded
-    }
-
-    #[tokio::test]
-    async fn test_relay_identity_event_invalidates_cache() {
-        // Test that identity events trigger DID cache invalidation
-        //
-        // Given: An identity update event from relay
-        // When: Event is processed
-        // Then: DID cache entry is invalidated
-
-        let identity_event = json!({
-            "event_type": "identity",
-            "did": "did:plc:user123",
-            "handle": "alice.newhandle.example"
-        });
-
-        assert_eq!(identity_event["event_type"], "identity");
-
-        println!("✓ Identity event triggers cache invalidation");
-
-        // TODO: Verify DidCache::invalidate_did() is called
-    }
-
-    #[tokio::test]
-    async fn test_relay_account_event_processing() {
-        // Test that account events (deactivation, deletion) are processed
-        //
-        // Given: An account status change event
-        // When: Event is processed
-        // Then: Account status is updated
-
-        let account_event = json!({
-            "event_type": "account",
-            "did": "did:plc:user123",
-            "status": "deactivated"
-        });
-
-        assert_eq!(account_event["event_type"], "account");
-
-        println!("✓ Account event structure validated");
-
-        // TODO: Verify account status update logic
-    }
-
-    #[tokio::test]
-    async fn test_relay_handle_event_invalidates_cache() {
-        // Test that handle change events trigger cache invalidation
-        //
-        // Given: A handle update event
-        // When: Event is processed
-        // Then: Both DID and handle caches are invalidated
-
-        let handle_event = json!({
-            "event_type": "handle",
-            "did": "did:plc:user123",
-            "handle": "alice.newhandle.example"
-        });
-
-        assert_eq!(handle_event["event_type"], "handle");
-
-        println!("✓ Handle event triggers dual cache invalidation");
-
-        // TODO: Verify both caches are invalidated
-    }
-
-    #[tokio::test]
-    async fn test_relay_tombstone_event_processing() {
-        // Test that tombstone events (deleted repos) are handled
-        //
-        // Given: A tombstone event for deleted repo
-        // When: Event is processed
-        // Then: Cleanup is logged for processing
-
-        let tombstone_event = json!({
-            "event_type": "tombstone",
-            "did": "did:plc:user123"
-        });
-
-        assert_eq!(tombstone_event["event_type"], "tombstone");
-
-        println!("✓ Tombstone event structure validated");
-
-        // TODO: Verify cleanup logic
-    }
-
-    #[tokio::test]
-    async fn test_relay_event_metrics_recorded() {
-        // Test that relay event processing records metrics
-        //
-        // Given: Any relay event
-        // When: Event is processed
-        // Then: RELAY_EVENTS_TOTAL and processing duration are recorded
-
-        println!("✓ Relay event metrics recording verified");
-
-        // TODO: Verify metrics are incremented after processing
-        // Expected metrics:
-        // - RELAY_EVENTS_TOTAL{event_type="commit"}
-        // - RELAY_EVENT_PROCESSING_DURATION_SECONDS{event_type="commit"}
-    }
-
-    #[tokio::test]
-    async fn test_relay_connection_auto_reconnect() {
-        // Test that relay connection auto-reconnects after failure
-        //
-        // Given: Relay WebSocket connection drops
-        // When: Connection is lost
-        // Then: Auto-reconnect kicks in with exponential backoff
-
-        println!("✓ Relay auto-reconnect logic verified");
-
-        // TODO: Mock WebSocket disconnect and verify reconnection
-        // Expected: Reconnect attempts with backoff: 1s, 2s, 4s, 8s, ...
-    }
-}
-
-#[cfg(test)]
 mod pds_discovery_tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_pds_discovery_from_relay() {
-        // Test that PDS instances are discovered from relay events
-        //
-        // Given: Relay events from different PDS origins
-        // When: Events are processed
-        // Then: New PDSs are added to discovered instances
-
-        let _event_from_pds1 = json!({
-            "event_type": "commit",
-            "origin": "https://pds1.example.com",
-            "did": "did:plc:user1"
-        });
-
-        let _event_from_pds2 = json!({
-            "event_type": "commit",
-            "origin": "https://pds2.example.com",
-            "did": "did:plc:user2"
-        });
-
-        // Simulate discovery
-        let mut discovered_pds = std::collections::HashSet::new();
-        discovered_pds.insert("https://pds1.example.com");
-        discovered_pds.insert("https://pds2.example.com");
-
-        assert_eq!(discovered_pds.len(), 2);
-        println!(
-            "✓ PDS discovery from relay verified: {} instances",
-            discovered_pds.len()
-        );
-
-        // TODO: Verify KNOWN_INSTANCES gauge is updated
-    }
 
     #[tokio::test]
     async fn test_pds_discovery_deduplication() {
@@ -496,56 +313,7 @@ mod cross_pds_authentication_tests {
 }
 
 #[cfg(test)]
-mod integration_end_to_end_tests {
-
-    #[tokio::test]
-    async fn test_federation_full_flow_simulation() {
-        // Simulated end-to-end federation flow
-        //
-        // This test simulates the full federation lifecycle:
-        // 1. PDS subscribes to relay firehose
-        // 2. Relay publishes commit events from other PDSs
-        // 3. This PDS processes events (discovers new PDSs)
-        // 4. User performs federated search across discovered PDSs
-        // 5. Results are aggregated and returned
-
-        println!("=== Federation End-to-End Flow Simulation ===");
-
-        // Step 1: Subscribe to relay
-        println!("1. ✓ Subscribed to relay firehose");
-
-        // Step 2: Receive events and discover PDSs
-        let discovered_pds = [
-            "https://pds1.example.com",
-            "https://pds2.example.com",
-            "https://pds3.example.com",
-        ];
-        println!(
-            "2. ✓ Discovered {} PDS instances from relay",
-            discovered_pds.len()
-        );
-
-        // Step 3: User initiates federated search
-        let search_query = "atproto";
-        println!("3. ✓ User searches for: '{}'", search_query);
-
-        // Step 4: Search across all discovered PDSs (parallel)
-        println!("4. ✓ Querying {} PDSs in parallel", discovered_pds.len());
-
-        // Step 5: Aggregate results
-        let total_results = 42; // Mock result count
-        println!("5. ✓ Aggregated {} results from federation", total_results);
-
-        println!("=== Federation flow completed successfully ===");
-
-        // TODO: Implement actual end-to-end test with test harness
-        // when federation components are stable
-    }
-}
-
-#[cfg(test)]
 mod performance_tests {
-    use super::*;
     use std::time::Instant;
 
     #[tokio::test]
@@ -570,32 +338,6 @@ mod performance_tests {
 
         println!(
             "✓ Federated search latency: {:?} (target: <2s p95)",
-            duration
-        );
-    }
-
-    #[tokio::test]
-    async fn test_relay_event_processing_latency() {
-        // Test that relay events are processed quickly
-        //
-        // Success Criteria (from Phase 5):
-        // - Relay event processing < 100ms (p95)
-
-        let start = Instant::now();
-
-        // Simulate event processing work (mock)
-        let _event = json!({"event_type": "commit", "did": "did:plc:test"});
-
-        let duration = start.elapsed();
-
-        assert!(
-            duration.as_millis() < 100,
-            "Event processing should complete in <100ms, took {:?}",
-            duration
-        );
-
-        println!(
-            "✓ Relay event processing: {:?} (target: <100ms p95)",
             duration
         );
     }

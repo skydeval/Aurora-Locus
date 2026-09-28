@@ -103,7 +103,7 @@ pub async fn remove_relay_url(ctx: &AppContext, operator_did: &str, url: &str) -
 }
 
 /// `setFederationRelays` — full-replace + switch. Carries `transition_mode`
-/// (audit-only in v0.9 — both values execute the same firehose-respawn switch).
+/// (audit-only — both values execute the same live-set swap).
 pub async fn set_federation_relays(
     ctx: &AppContext,
     operator_did: &str,
@@ -137,7 +137,7 @@ pub async fn set_federation_relays(
 }
 
 /// The shared relay-switch primitive (addendum §A2, R3-folded):
-/// no-op guard → CAS-first → lock(60s) → reconfigure → refresh discovery → audit.
+/// no-op guard → CAS-first → lock(60s) → swap live set → refresh discovery → audit.
 async fn switch_relay_set(
     ctx: &AppContext,
     operator_did: &str,
@@ -151,7 +151,7 @@ async fn switch_relay_set(
         .ok_or(FedPeerError::NoRelayClient)?;
 
     // 0. No-op guard (addendum H2-1): same relay set → no CAS, no switch, no
-    //    audit, no firehose disruption (mirrors the Phase C same-mode no-op).
+    //    audit (mirrors the Phase C same-mode no-op).
     let (current, current_raw) = read_relays(ctx).await;
     if current == new_relays {
         return Ok(());
@@ -228,12 +228,8 @@ async fn switch_relay_set(
         }
     };
 
-    // 3. Reconfigure the live client (abort old firehose tasks + respawn).
-    if let Err(e) = client.reconfigure(&new_relays).await {
-        drop(client);
-        emit_abort(ctx, operator_did, &op, &new_relays, "reconfigure_failed").await;
-        return Err(FedPeerError::ReconfigureFailed(e.to_string()));
-    }
+    // 3. Swap the live relay set.
+    client.reconfigure(&new_relays);
     drop(client);
 
     let duration_ms = switch_start.elapsed().as_millis() as u64;
@@ -422,7 +418,7 @@ mod tests {
         .await
         .unwrap();
         let before = audit_count(&ctx, ACTION_RELAY_SWITCHED).await;
-        // Setting the SAME set is a no-op: no audit, no firehose disruption.
+        // Setting the SAME set is a no-op: no CAS, no audit.
         set_federation_relays(
             &ctx,
             "did:plc:op",

@@ -26,7 +26,7 @@ pub use discovery::PdsInstance;
 pub use entryway::{EntrywayAdminClient, EntrywayClient};
 pub use entryway_headers::{entryway_auth_headers, entryway_passthru_headers};
 pub use nonce_store::NonceStore;
-pub use relay::{RelayClient, RelayConfig};
+pub use relay::RelayClient;
 pub use service_auth::ServiceAuthenticator;
 
 use serde::{Deserialize, Serialize};

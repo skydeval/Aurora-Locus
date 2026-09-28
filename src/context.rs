@@ -16,7 +16,7 @@ use crate::{
         discovery::PdsDiscovery,
         dpop::{DPopNonceStore, DPopVerifier},
         search::FederatedSearch,
-        NonceStore, RelayClient, RelayConfig,
+        NonceStore, RelayClient,
     },
     identity::{DidCache, IdentityResolver, IdentityResolverApi, IdentityResolverConfig},
     mailer::Mailer,
@@ -708,22 +708,18 @@ impl AppContext {
             config.service.public_url = Some(url);
         }
 
-        // Initialize relay client first (optional - only if relay servers configured and federation enabled)
+        // The live relay set: relays this PDS announces itself to (#459 — a PDS
+        // is crawled by relays; it never consumes a relay's firehose).
         let relay_client = if federation_enabled && !config.federation.relay_urls.is_empty() {
             tracing::info!(
-                "Federation enabled with {} relay server(s)",
+                "Federation enabled with {} relay(s)",
                 config.federation.relay_urls.len()
             );
-            let relay_config = RelayConfig {
-                servers: config.federation.relay_urls.clone(),
-                reconnect_interval: 5,
-                buffer_size: 1000,
-                enable_compression: true,
-            };
-            let client = RelayClient::new(relay_config);
-            Some(Arc::new(tokio::sync::Mutex::new(client)))
+            Some(Arc::new(tokio::sync::Mutex::new(RelayClient::new(
+                config.federation.relay_urls.clone(),
+            ))))
         } else {
-            tracing::info!("Federation disabled - no relay integration");
+            tracing::info!("Federation disabled or no relays configured");
             None
         };
 
@@ -885,11 +881,7 @@ impl AppContext {
                 }
             }
         }
-        let mut seq = Sequencer::with_relay(
-            account_db.clone(),
-            sequencer_config,
-            relay_client.clone(),
-        );
+        let mut seq = Sequencer::new(account_db.clone(), sequencer_config);
 
         // Multi-instance leader election (Postgres only). SQLite
         // deployments are inherently single-instance and skip election;
