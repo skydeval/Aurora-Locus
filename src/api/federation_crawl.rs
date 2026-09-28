@@ -99,6 +99,22 @@ pub async fn live_relays(ctx: &AppContext) -> Vec<String> {
     }
 }
 
+/// One-word relay state for health surfaces: `disabled` (federation off),
+/// `none` (empty relay set), `idle` (relays, but crawl off) or `announcing`
+/// (relays are being asked to crawl this PDS). There is no relay *connection*
+/// to report: relays connect to this PDS, not the other way round (#459).
+pub async fn relay_state(ctx: &AppContext) -> &'static str {
+    if !ctx.federation_enabled {
+        "disabled"
+    } else if live_relays(ctx).await.is_empty() {
+        "none"
+    } else if crawl_active(ctx).await {
+        "announcing"
+    } else {
+        "idle"
+    }
+}
+
 /// Relays present in `after` but not in `before`, in `after`'s order.
 pub fn newly_added(before: &[String], after: &[String]) -> Vec<String> {
     after
@@ -229,6 +245,26 @@ mod tests {
         config.service.public_url = Some("https://locus.example.app".to_string());
         ctx.config = std::sync::Arc::new(config);
         assert_eq!(crawl_hostname(&ctx).as_deref(), Some("locus.example.app"));
+    }
+
+    #[tokio::test]
+    async fn relay_state_covers_each_case() {
+        let _g = serial().lock().await;
+        let with = |fed: bool, crawl: bool, relays: Vec<String>| {
+            create_test_context_with(move |c| {
+                c.federation.enabled = fed;
+                c.federation.crawl_enabled = crawl;
+                c.federation.relay_urls = relays;
+            })
+        };
+        let r = || vec!["https://relay.example".to_string()];
+        assert_eq!(relay_state(&with(false, true, r()).await).await, "disabled");
+        assert_eq!(relay_state(&with(true, true, vec![]).await).await, "none");
+        assert_eq!(relay_state(&with(true, false, r()).await).await, "idle");
+        assert_eq!(
+            relay_state(&with(true, true, r()).await).await,
+            "announcing"
+        );
     }
 
     #[test]

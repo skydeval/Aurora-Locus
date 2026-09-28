@@ -62,18 +62,38 @@ pub fn routes() -> Router<AppContext> {
 /// Intentionally excludes `peer_pds` (the trusted-issuer allowlist — disclosing
 /// who this PDS trusts invites adversarial probing). When federation is off, only
 /// `enabled` + `auroraVersion` are emitted.
+///
+/// Every field is the live, effective value — the same resolution
+/// `describeServer` uses — because Aurora peers (and kryphocron) federate on
+/// this endpoint, the way standard PDSes federate on `describeServer`.
 async fn describe_posture(State(ctx): State<AppContext>) -> Json<FederationDescribePosture> {
+    use crate::api::aurora_admin::{
+        resolve_appview_url, resolve_federation_flag, FEDERATION_CRAWL_ENABLED_KEY,
+        FEDERATION_FIREHOSE_ENABLED_KEY,
+    };
     let fc = &ctx.config.federation;
     // §2.1 (#397): effective gate (runtime override → config), not raw env.
     let on = ctx.federation_enabled;
+    // Runtime overrides (→ env fallback), so a panel change is advertised
+    // without a restart, exactly as describeServer advertises it.
+    let firehose_enabled =
+        resolve_federation_flag(&ctx, FEDERATION_FIREHOSE_ENABLED_KEY, fc.firehose_enabled).await;
+    let crawl_enabled =
+        resolve_federation_flag(&ctx, FEDERATION_CRAWL_ENABLED_KEY, fc.crawl_enabled).await;
+    let appview_url = resolve_appview_url(&ctx).await;
+    // The live relay set (#460), not the boot env seed.
+    let relays = crate::api::federation_crawl::live_relays(&ctx).await;
     Json(FederationDescribePosture {
         enabled: on,
-        appview_url: if on { fc.appview_url.clone() } else { None },
-        public_url: if on { fc.public_url.clone() } else { None },
-        firehose_enabled: on.then_some(fc.firehose_enabled),
-        crawl_enabled: on.then_some(fc.crawl_enabled),
-        relay_urls: if on && !fc.relay_urls.is_empty() {
-            Some(fc.relay_urls.clone())
+        appview_url: if on { appview_url } else { None },
+        // The deployment's real public URL (PDS_SERVICE_PUBLIC_URL, runtime
+        // override applied at boot), not the deprecated, consumer-less
+        // PDS_PUBLIC_URL (federation.public_url), which is usually unset.
+        public_url: on.then(|| ctx.config.service.effective_public_url()),
+        firehose_enabled: on.then_some(firehose_enabled),
+        crawl_enabled: on.then_some(crawl_enabled),
+        relay_urls: if on && !relays.is_empty() {
+            Some(relays)
         } else {
             None
         },
@@ -106,7 +126,9 @@ struct FederationDescribePosture {
 async fn federation_status(State(ctx): State<AppContext>) -> Json<FederationStatusResponse> {
     // §2.1 (#397): effective gate (runtime override → config), not raw env.
     let enabled = ctx.federation_enabled;
-    let relay_connected = ctx.relay_client.is_some();
+    let relay_state = crate::api::federation_crawl::relay_state(&ctx)
+        .await
+        .to_string();
     let discovery_active = ctx.pds_discovery.is_some();
     let auth_active = ctx.federation_auth.is_some();
 
@@ -118,11 +140,11 @@ async fn federation_status(State(ctx): State<AppContext>) -> Json<FederationStat
 
     Json(FederationStatusResponse {
         enabled,
-        relay_connected,
+        relay_state,
         discovery_active,
         auth_active,
         known_instances,
-        relay_urls: ctx.config.federation.relay_urls.clone(),
+        relay_urls: crate::api::federation_crawl::live_relays(&ctx).await,
     })
 }
 
@@ -166,7 +188,8 @@ async fn refresh_discovery(
 #[serde(rename_all = "camelCase")]
 pub struct FederationStatusResponse {
     pub enabled: bool,
-    pub relay_connected: bool,
+    /// `disabled`, `none`, `idle` or `announcing` (see `federation_crawl::relay_state`).
+    pub relay_state: String,
     pub discovery_active: bool,
     pub auth_active: bool,
     pub known_instances: usize,
@@ -332,6 +355,60 @@ pub struct DPopNonceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Aurora peers and kryphocron federate on describePosture, so it must
+    /// advertise the live values: runtime overrides over env, the real service
+    /// public URL, and the live relay set.
+    #[tokio::test]
+    async fn describe_posture_advertises_live_values() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.firehose_enabled = false;
+            c.federation.crawl_enabled = false;
+            c.federation.appview_url = Some("https://env-appview.example".to_string());
+            c.federation.public_url = None; // deprecated PDS_PUBLIC_URL unset
+            c.federation.relay_urls = vec!["https://relay.example".to_string()];
+        })
+        .await;
+        for (key, value) in [
+            (
+                crate::api::aurora_admin::FEDERATION_FIREHOSE_ENABLED_KEY,
+                "true",
+            ),
+            (
+                crate::api::aurora_admin::FEDERATION_CRAWL_ENABLED_KEY,
+                "true",
+            ),
+            (
+                crate::api::aurora_admin::FEDERATION_APPVIEW_URL_KEY,
+                r#""https://runtime-appview.example""#,
+            ),
+        ] {
+            sqlx::query(
+                "INSERT INTO runtime_settings (key, value, last_modified, last_modified_by) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(key)
+            .bind(value)
+            .bind("2026-01-01T00:00:00Z")
+            .bind("did:plc:op")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        }
+
+        let Json(posture) = describe_posture(State(ctx.clone())).await;
+        let v = serde_json::to_value(posture).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["firehoseEnabled"], true, "runtime override, not env");
+        assert_eq!(v["crawlEnabled"], true, "runtime override, not env");
+        assert_eq!(v["appviewUrl"], "https://runtime-appview.example");
+        assert_eq!(v["publicUrl"], ctx.config.service.effective_public_url());
+        assert_eq!(v["relayUrls"], serde_json::json!(["https://relay.example"]));
+    }
 
     #[test]
     fn test_routes_compile() {

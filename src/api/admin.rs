@@ -6621,10 +6621,9 @@ async fn ops_list_accounts(
 /// Aggregated operator-flavored metrics for the instance.
 ///
 /// Fields that aren't populated from existing instrumentation are omitted
-/// rather than zero-filled, so absence is meaningful (e.g. no relay client
-/// configured → federation_health.relay_connected is false, but the field
-/// itself is always present; cpu_seconds_total may be None on platforms
-/// where prometheus doesn't surface process-level counters).
+/// rather than zero-filled, so absence is meaningful (e.g. cpu_seconds_total
+/// may be None on platforms where prometheus doesn't surface process-level
+/// counters).
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OpsInstanceMetrics {
@@ -6674,7 +6673,10 @@ struct OpsAccountGrowth {
 #[serde(rename_all = "camelCase")]
 struct OpsFederationHealth {
     federation_enabled: bool,
-    relay_connected: bool,
+    /// Relays in the live relay set (0 when federation is disabled).
+    relay_count: i64,
+    /// Whether the relays are being asked to crawl this PDS (#462).
+    crawl_active: bool,
     /// Known peer count from the federation registry; 0 when federation
     /// is disabled or the registry is empty.
     known_instances: i64,
@@ -6790,7 +6792,8 @@ async fn ops_get_instance_metrics(
 
     let federation_health = OpsFederationHealth {
         federation_enabled: ctx.federation_enabled, // §2.1 (#397) effective gate
-        relay_connected: ctx.relay_client.is_some(),
+        relay_count: crate::api::federation_crawl::live_relays(&ctx).await.len() as i64,
+        crawl_active: crate::api::federation_crawl::crawl_active(&ctx).await,
         known_instances,
     };
 
@@ -8123,7 +8126,7 @@ async fn get_system_health(
     let sequencer_healthy = true; // Sequencer is always available if context exists
 
     // Check optional services
-    let relay_connected = ctx.relay_client.is_some();
+    let relay_state = crate::api::federation_crawl::relay_state(&ctx).await;
     let federation_enabled = ctx.federation_enabled; // §2.1 (#397) effective gate
 
     // Determine overall health
@@ -8140,7 +8143,7 @@ async fn get_system_health(
         "services": {
             "database": if db_healthy { "healthy" } else { "unhealthy" },
             "sequencer": if sequencer_healthy { "healthy" } else { "unhealthy" },
-            "relay": if relay_connected { "connected" } else { "disconnected" },
+            "relay": relay_state,
             "federation": if federation_enabled { "enabled" } else { "disabled" },
         },
         "active_http_requests": metrics::HTTP_REQUESTS_ACTIVE.get(),
@@ -8351,11 +8354,12 @@ async fn run_health_checks(
         "response_time_ms": identity_start.elapsed().as_millis(),
     }));
 
-    // Relay check (if enabled)
-    if let Some(ref _relay) = ctx.relay_client {
+    // Relay set (if federation is on). There is no relay connection to probe:
+    // relays connect to this PDS (#459); report whether they are announced to.
+    if ctx.federation_enabled {
         checks.push(serde_json::json!({
-            "component": "relay_client",
-            "status": "connected",
+            "component": "relays",
+            "status": crate::api::federation_crawl::relay_state(&ctx).await,
             "response_time_ms": 0,
         }));
     }
@@ -8371,8 +8375,13 @@ async fn run_health_checks(
     }
 
     // Determine overall status
+    // The relay-set states (`none` / `idle` / `announcing`) are configuration,
+    // not faults, so they never degrade the verdict.
     let all_healthy = checks.iter().all(|c| {
-        c["status"] == "healthy" || c["status"] == "connected" || c["status"] == "configured"
+        c["component"] == "relays"
+            || c["status"] == "healthy"
+            || c["status"] == "connected"
+            || c["status"] == "configured"
     });
 
     Ok(Json(serde_json::json!({
@@ -12283,7 +12292,8 @@ mod tests {
 
         // Federation: disabled in test config.
         assert!(!resp.federation_health.federation_enabled);
-        assert!(!resp.federation_health.relay_connected);
+        assert_eq!(resp.federation_health.relay_count, 0);
+        assert!(!resp.federation_health.crawl_active);
         assert_eq!(resp.federation_health.known_instances, 0);
     }
 
@@ -13448,6 +13458,45 @@ mod tests {
             count_chain_rows(&ctx, "account.update_handle", Some("did:plc:hh")).await,
             0
         );
+    }
+
+    // ---------- #458: relay health reports the relay set, not a connection ----------
+
+    #[tokio::test]
+    async fn health_surfaces_report_relay_state_without_degrading() {
+        let _g = crate::api::federation_peers::test_support::serial()
+            .lock()
+            .await;
+        let ctx = create_test_context_with(|c| {
+            c.federation.enabled = true;
+            c.federation.crawl_enabled = false;
+            c.federation.relay_urls = vec!["https://relay.example".to_string()];
+        })
+        .await;
+
+        let Json(checks) = run_health_checks(State(ctx.clone()), admin_test_auth())
+            .await
+            .unwrap();
+        let relays = checks["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["component"] == "relays")
+            .expect("relays component reported when federation is on");
+        assert_eq!(relays["status"], "idle");
+        assert!(
+            !checks["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["component"] == "relay_client"),
+            "no fictional relay connection"
+        );
+
+        let Json(health) = get_system_health(State(ctx.clone()), admin_test_auth())
+            .await
+            .unwrap();
+        assert_eq!(health["services"]["relay"], "idle");
     }
 
     // ---------- #462: tools.aurora.ops.requestRelayCrawl ----------
