@@ -1370,8 +1370,8 @@ async fn get_service_auth(
 /// The header + claims + signing input are built by the SAME
 /// `service_auth::service_jwt_signing_input` the in-process path uses, so the two
 /// emit an identical JWT format; the holder's 64-byte compact ES256K signature
-/// is re-encoded to DER for the JWT wire form (`verify_service_jwt` decodes
-/// DER). Until Phase γ installs the real channel, the default
+/// goes on the wire as-is, normalized to low-S (#473). Until Phase γ installs
+/// the real channel, the default
 /// `UnavailableHolderSigningChannel` makes this return a clean 4xx
 /// (`HolderSigningError::ChannelNotAvailable` → `PdsError::Validation`).
 async fn mint_service_jwt_via_holder(
@@ -1383,8 +1383,11 @@ async fn mint_service_jwt_via_holder(
 ) -> PdsResult<String> {
     let signing_input = service_auth::service_jwt_signing_input(did, aud, exp_seconds, lxm)?;
     let compact = channel.sign_service_auth(did, signing_input.as_bytes()).await?;
-    let der = service_auth::compact_es256k_to_der(&compact)?;
-    Ok(service_auth::assemble_service_jwt(&signing_input, &der))
+    let signature = service_auth::normalize_compact_es256k(&compact)?;
+    Ok(service_auth::assemble_service_jwt(
+        &signing_input,
+        &signature,
+    ))
 }
 
 // ==================== New Endpoints for XRPC Parity ====================
@@ -2052,13 +2055,13 @@ mod service_auth_holder_mediation_tests {
         assert_eq!(claims["aud"], aud);
         assert_eq!(claims["lxm"], "com.atproto.repo.createRecord");
 
-        // The holder's signature verifies over the signing input via the SAME
-        // DER-decode path a receiving peer uses (service_auth::verify_service_jwt
-        // → Signature::from_der). This proves the compact→DER re-encode is
-        // wire-correct and the assembled JWT is verifiable.
+        // The holder's signature goes on the wire in the atproto compact form
+        // (#473) and verifies over the signing input, so the assembled JWT is
+        // verifiable by a receiving service.
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        let sig = Signature::from_der(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap())
-            .expect("signature segment is DER");
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        assert_eq!(sig_bytes.len(), 64, "compact signature");
+        let sig = Signature::from_slice(&sig_bytes).expect("signature segment is compact");
         mock.verifying_key()
             .verify(signing_input.as_bytes(), &sig)
             .expect("holder signature verifies against the mock's public key");

@@ -807,7 +807,7 @@ pub async fn validate_external_access_token(
     expected_audiences: &[&str],
 ) -> Result<AccessTokenClaims, PdsError> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use k256::ecdsa::{signature::Verifier, Signature};
+    use k256::ecdsa::signature::Verifier;
 
     // 1. Shape pre-check.
     let parts: Vec<&str> = token.split('.').collect();
@@ -896,16 +896,17 @@ pub async fn validate_external_access_token(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    // 4. Signature verification (ES256K, DER-encoded per
-    // ATProto convention).
+    // 4. Signature verification (ES256K: atproto's 64-byte compact form, or
+    // DER from older issuers — #473).
     let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|_| {
         PdsError::Authentication(
             "external access token signature base64 decode failed".to_string(),
         )
     })?;
-    let signature = Signature::from_der(&signature_bytes).map_err(|_| {
-        PdsError::Authentication("external access token signature DER parse failed".to_string())
-    })?;
+    let signature =
+        crate::service_auth::decode_es256k_signature(&signature_bytes).map_err(|_| {
+            PdsError::Authentication("external access token signature parse failed".to_string())
+        })?;
     let signing_input = format!("{}.{}", header_b64, claims_b64);
     entryway_jwt_public_key
         .verify(signing_input.as_bytes(), &signature)
@@ -1742,7 +1743,7 @@ mod admin_auth_third_path_tests {
         let claims_b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
         let signing_input = format!("{}.{}", header_b64, claims_b64);
         let sig: Signature = signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
         let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
 
         let result = admin_auth_from_token(&ctx, &token).await;

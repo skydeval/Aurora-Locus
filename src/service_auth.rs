@@ -154,8 +154,14 @@ impl From<ServiceAuthError> for PdsError {
     }
 }
 
-/// Maximum expiration time for tokens with a lexicon method (1 hour)
+/// Maximum expiration time for tokens with a lexicon method (1 hour). Also the
+/// hard cap on `exp - iat` for every minted token: strict atproto verifiers
+/// (e.g. kryphocron's) reject a longer-lived service-auth token (#473).
 const MAX_EXP_WITH_METHOD: i64 = 3600;
+
+/// Lifetime of a minted service-auth token when the caller asks for none: 60s,
+/// as the reference PDS uses for proxying and getServiceAuth (#473).
+const DEFAULT_SERVICE_JWT_LIFETIME: i64 = 60;
 
 /// Maximum expiration time for tokens without a lexicon method (1 minute)
 const MAX_EXP_WITHOUT_METHOD: i64 = 60;
@@ -168,6 +174,12 @@ pub struct ServiceAuthClaims {
 
     /// Audience DID (the service receiving the request)
     pub aud: String,
+
+    /// Issued-at timestamp (seconds since epoch). Always set on tokens this
+    /// PDS mints (#473: strict verifiers require it); optional when decoding
+    /// so tokens from older issuers without it still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iat: Option<i64>,
 
     /// Expiration timestamp (seconds since epoch)
     pub exp: i64,
@@ -212,6 +224,17 @@ impl ServiceAuthClaims {
             )));
         }
 
+        // Total lifetime cap (#473).
+        if let Some(iat) = self.iat {
+            if self.exp - iat > MAX_EXP_WITH_METHOD {
+                return Err(PdsError::Validation(format!(
+                    "Token lifetime exp - iat = {} seconds exceeds {}",
+                    self.exp - iat,
+                    MAX_EXP_WITH_METHOD
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -224,7 +247,8 @@ impl ServiceAuthClaims {
 ///
 /// * `iss` - Issuer DID (the actor making the request)
 /// * `aud` - Audience DID (the service receiving the request)
-/// * `exp_seconds` - Optional expiration duration in seconds (default: 60s for no method, 3600s with method)
+/// * `exp_seconds` - Optional lifetime in seconds (default 60s; at most 3600s
+///   with a method, 60s without)
 /// * `lxm` - Optional lexicon method for method-specific tokens
 /// * `signing_key` - The secp256k1 private key bytes (32 bytes)
 ///
@@ -272,7 +296,10 @@ pub fn create_service_jwt(
     let signing_key = SigningKey::from_slice(signing_key)
         .map_err(|e| PdsError::Authentication(format!("Invalid signing key: {}", e)))?;
     let signature: Signature = signing_key.sign(signing_input.as_bytes());
-    Ok(assemble_service_jwt(&signing_input, signature.to_der().as_bytes()))
+    // atproto JWTs carry the 64-byte compact R‖S signature in low-S form
+    // (#473: this was DER, which strict verifiers reject).
+    let signature = signature.normalize_s().unwrap_or(signature);
+    Ok(assemble_service_jwt(&signing_input, &signature.to_bytes()))
 }
 
 /// Build a service-auth JWT's **signing input** — `base64url(header) + "." +
@@ -288,20 +315,21 @@ pub fn service_jwt_signing_input(
     exp_seconds: Option<i64>,
     lxm: Option<&str>,
 ) -> PdsResult<String> {
+    // Claims per the atproto service-auth profile (#473): iat = now, a short
+    // exp (60s unless the caller asked for longer, capped by `validate`), a
+    // random jti, and aud as the bare service DID — a `#service` fragment names
+    // an endpoint in the DID document, not the audience.
     let now = Utc::now().timestamp();
-    let default_exp = if lxm.is_some() {
-        MAX_EXP_WITH_METHOD
-    } else {
-        MAX_EXP_WITHOUT_METHOD
-    };
-    let exp = now + exp_seconds.unwrap_or(default_exp);
+    let exp = now + exp_seconds.unwrap_or(DEFAULT_SERVICE_JWT_LIFETIME);
+    let aud = aud.split('#').next().unwrap_or(aud);
 
     let claims = ServiceAuthClaims {
         iss: iss.to_string(),
         aud: aud.to_string(),
+        iat: Some(now),
         exp,
         lxm: lxm.map(|s| s.to_string()),
-        jti: None, // Can be added if replay protection is needed
+        jti: Some(uuid::Uuid::new_v4().simple().to_string()),
     };
     claims.validate()?;
 
@@ -318,21 +346,33 @@ pub fn service_jwt_signing_input(
     Ok(format!("{}.{}", header_b64, claims_b64))
 }
 
-/// Assemble the final JWT string from a signing input and the DER-encoded
-/// signature bytes: `signing_input + "." + base64url(signature_der)`.
-pub fn assemble_service_jwt(signing_input: &str, signature_der: &[u8]) -> String {
-    format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature_der))
+/// Assemble the final JWT string from a signing input and the 64-byte compact
+/// signature: `signing_input + "." + base64url(signature)`.
+pub fn assemble_service_jwt(signing_input: &str, signature: &[u8]) -> String {
+    format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(signature))
 }
 
-/// Re-encode a 64-byte compact `R‖S` ES256K signature (the shape a holder
-/// returns over [`crate::holder_signing::HolderSigningChannel`]) into the DER
-/// form the service-auth / entryway JWT wire format uses — `verify_service_jwt`
-/// decodes signatures with `Signature::from_der`.
-pub fn compact_es256k_to_der(compact: &[u8]) -> PdsResult<Vec<u8>> {
+/// Check a 64-byte compact `R‖S` ES256K signature (the shape a holder returns
+/// over [`crate::holder_signing::HolderSigningChannel`]) and return it in
+/// low-S form, ready for the JWT wire (#473: atproto uses compact low-S; this
+/// used to re-encode to DER).
+pub fn normalize_compact_es256k(compact: &[u8]) -> PdsResult<Vec<u8>> {
     let signature = Signature::from_slice(compact).map_err(|e| {
         PdsError::Jwt(format!("holder returned an invalid compact ES256K signature: {}", e))
     })?;
-    Ok(signature.to_der().as_bytes().to_vec())
+    let signature = signature.normalize_s().unwrap_or(signature);
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// Decode a JWT's ES256K signature bytes: the atproto 64-byte compact form, or
+/// DER as minted by Aurora-Locus before #473, still accepted from peers not
+/// yet updated.
+pub fn decode_es256k_signature(bytes: &[u8]) -> Result<Signature, k256::ecdsa::Error> {
+    if bytes.len() == 64 {
+        Signature::from_slice(bytes)
+    } else {
+        Signature::from_der(bytes)
+    }
 }
 
 /// Verify a service auth JWT token
@@ -463,8 +503,9 @@ pub async fn verify_service_jwt(
     let signature_bytes = URL_SAFE_NO_PAD.decode(signature_b64).map_err(|e| {
         ServiceAuthError::InvalidSignatureFormat(format!("base64 decode failed: {}", e))
     })?;
-    let signature = Signature::from_der(&signature_bytes)
-        .map_err(|e| ServiceAuthError::InvalidSignatureFormat(format!("DER parse failed: {}", e)))?;
+    let signature = decode_es256k_signature(&signature_bytes).map_err(|e| {
+        ServiceAuthError::InvalidSignatureFormat(format!("signature parse failed: {}", e))
+    })?;
 
     let signing_input = format!("{}.{}", header_b64, claims_b64);
     verifying_key
@@ -564,6 +605,7 @@ mod tests {
         let claims = ServiceAuthClaims {
             iss: "did:plc:issuer".to_string(),
             aud: "did:plc:audience".to_string(),
+            iat: Some(now),
             exp: now + 300, // 5 minutes
             lxm: Some("com.atproto.repo.createRecord".to_string()),
             jti: None,
@@ -574,6 +616,7 @@ mod tests {
         let claims = ServiceAuthClaims {
             iss: "did:plc:issuer".to_string(),
             aud: "did:plc:audience".to_string(),
+            iat: Some(now),
             exp: now + 30, // 30 seconds
             lxm: None,
             jti: None,
@@ -584,6 +627,7 @@ mod tests {
         let claims = ServiceAuthClaims {
             iss: "did:plc:issuer".to_string(),
             aud: "did:plc:audience".to_string(),
+            iat: Some(now),
             exp: now - 60, // 1 minute ago
             lxm: None,
             jti: None,
@@ -594,6 +638,7 @@ mod tests {
         let claims = ServiceAuthClaims {
             iss: "did:plc:issuer".to_string(),
             aud: "did:plc:audience".to_string(),
+            iat: Some(now),
             exp: now + 120, // 2 minutes
             lxm: None,
             jti: None,
@@ -604,7 +649,20 @@ mod tests {
         let claims = ServiceAuthClaims {
             iss: "did:plc:issuer".to_string(),
             aud: "did:plc:audience".to_string(),
+            iat: Some(now),
             exp: now + 7200, // 2 hours
+            lxm: Some("com.atproto.repo.createRecord".to_string()),
+            jti: None,
+        };
+        assert!(claims.validate().is_err());
+
+        // #473: total lifetime exp - iat over an hour is refused even when the
+        // remaining time is short.
+        let claims = ServiceAuthClaims {
+            iss: "did:plc:issuer".to_string(),
+            aud: "did:plc:audience".to_string(),
+            iat: Some(now - 4000),
+            exp: now + 30,
             lxm: Some("com.atproto.repo.createRecord".to_string()),
             jti: None,
         };
@@ -746,12 +804,12 @@ mod tests {
         let sig_bytes = URL_SAFE_NO_PAD
             .decode(parts[2])
             .expect("signature segment must be valid base64url-no-pad");
-        // create_service_jwt emits DER-encoded signatures
-        // (`signature.to_der()` at the sign site); decode with the
-        // matching DER constructor, NOT from_slice (which expects
-        // fixed-length r||s).
-        let signature = Signature::from_der(&sig_bytes)
-            .expect("signature segment must be valid k256 ECDSA DER");
+        // #473: create_service_jwt emits the atproto 64-byte compact R‖S
+        // signature in low-S form.
+        assert_eq!(sig_bytes.len(), 64, "compact signature");
+        let signature = Signature::from_slice(&sig_bytes)
+            .expect("signature segment must be a compact k256 ECDSA signature");
+        assert!(signature.normalize_s().is_none(), "low-S");
 
         // Positive half: per-account verifying key MUST verify.
         // `Verifier::verify` matches `Signer::sign`'s ES256K shape
@@ -891,6 +949,105 @@ mod verify_service_jwt_tests {
     /// and a raw signature byte slice. Used for malformed-header
     /// negative tests where `create_service_jwt` would refuse to emit
     /// the shape we want to attack.
+    /// #473: a minted token carries all six claims (iss, aud, iat, exp, jti,
+    /// lxm) with `exp - iat` within the cap and `aud` stripped of any
+    /// `#service` fragment, and its compact signature verifies under an
+    /// independent strict atproto verifier (proto-blue's did:key check, which
+    /// rejects DER and high-S).
+    #[test]
+    fn minted_token_has_all_claims_and_verifies_strictly() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let did_key = crate::crypto::plc::PlcSigner::new(&key.to_bytes())
+            .unwrap()
+            .public_key_did_key();
+        let token = create_service_jwt(
+            "did:plc:issuer",
+            "did:web:api.nearhorizon.app#bsky_appview",
+            None,
+            Some("app.bsky.actor.getProfile"),
+            &key.to_bytes(),
+        )
+        .unwrap();
+
+        let parts: Vec<&str> = token.split('.').collect();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header["alg"], "ES256K");
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        let now = Utc::now().timestamp();
+        assert_eq!(claims["iss"], "did:plc:issuer");
+        assert_eq!(
+            claims["aud"], "did:web:api.nearhorizon.app",
+            "fragment stripped"
+        );
+        assert_eq!(claims["lxm"], "app.bsky.actor.getProfile");
+        let iat = claims["iat"].as_i64().expect("iat");
+        let exp = claims["exp"].as_i64().expect("exp");
+        assert!((iat - now).abs() <= 5, "iat is now");
+        assert_eq!(exp - iat, DEFAULT_SERVICE_JWT_LIFETIME);
+        assert!(exp - iat <= 3600);
+        assert!(
+            claims["jti"].as_str().is_some_and(|j| j.len() >= 16),
+            "random jti"
+        );
+
+        let sig = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        assert!(
+            proto_blue::crypto::verify_signature(&did_key, signing_input.as_bytes(), &sig, false)
+                .unwrap(),
+            "verifies under a strict (compact, low-S) atproto verifier"
+        );
+
+        // Distinct jti per token.
+        let again =
+            create_service_jwt("did:plc:issuer", "did:web:x", None, None, &key.to_bytes()).unwrap();
+        let again_claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(again.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(again_claims["jti"], claims["jti"]);
+    }
+
+    #[test]
+    fn requested_lifetime_is_capped_at_an_hour() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let method = Some("com.atproto.repo.createRecord");
+        assert!(create_service_jwt(
+            "did:plc:i",
+            "did:web:a",
+            Some(3600),
+            method,
+            &key.to_bytes()
+        )
+        .is_ok());
+        assert!(create_service_jwt(
+            "did:plc:i",
+            "did:web:a",
+            Some(3601),
+            method,
+            &key.to_bytes()
+        )
+        .is_err());
+    }
+
+    /// Verification accepts the atproto compact form and, for tokens minted
+    /// by Aurora-Locus before #473, DER.
+    #[test]
+    fn signature_decoding_accepts_compact_and_legacy_der() {
+        let key = SigningKey::random(&mut rand::thread_rng());
+        let sig: Signature = key.sign(b"payload");
+        assert_eq!(decode_es256k_signature(&sig.to_bytes()).unwrap(), sig);
+        assert_eq!(
+            decode_es256k_signature(sig.to_der().as_bytes()).unwrap(),
+            sig
+        );
+        assert!(decode_es256k_signature(b"garbage").is_err());
+    }
+
     fn manual_jwt(header_json: &str, claims_json: &str, signature: &[u8]) -> String {
         let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
         let claims_b64 = URL_SAFE_NO_PAD.encode(claims_json.as_bytes());
@@ -902,6 +1059,7 @@ mod verify_service_jwt_tests {
         serde_json::to_string(&ServiceAuthClaims {
             iss: iss.to_string(),
             aud: aud.to_string(),
+            iat: Some(exp - 30),
             exp,
             lxm: None,
             jti: None,
@@ -1142,7 +1300,7 @@ mod verify_service_jwt_tests {
         let claims_b64 = URL_SAFE_NO_PAD.encode(claims.as_bytes());
         let signing_input = format!("{}.{}", header_b64, claims_b64);
         let sig: Signature = signing_key.sign(signing_input.as_bytes());
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_der().as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes());
         let token = format!("{}.{}.{}", header_b64, claims_b64, sig_b64);
 
         let mock = MockIdentityResolver::new();

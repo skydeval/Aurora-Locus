@@ -121,9 +121,10 @@ pub async fn entryway_auth_headers(
     // signs in-process — did:plc and, as of v0.10, did:web accounts with a
     // PDS-held key (parity). A sovereign did:web with no stored key
     // (`NotFound`) mediates the signature through the holder channel (v0.11 /
-    // Phase γ; the default channel returns a clean 4xx today). The holder
-    // returns a 64-byte compact ES256K signature; re-encode to DER for the wire.
-    let sig_der: Vec<u8> = match entryway_signing_key_hex(db, user_did).await {
+    // Phase γ; the default channel returns a clean 4xx today). Either way the
+    // wire form is the atproto 64-byte compact low-S signature (#473; this was
+    // DER).
+    let signature: Vec<u8> = match entryway_signing_key_hex(db, user_did).await {
         Ok(signing_key_hex) => {
             let key_bytes = hex::decode(&signing_key_hex).map_err(|e| {
                 PdsError::Internal(format!(
@@ -138,7 +139,11 @@ pub async fn entryway_auth_headers(
                 ))
             })?;
             let signature: Signature = signing_key.sign(signing_input.as_bytes());
-            signature.to_der().as_bytes().to_vec()
+            signature
+                .normalize_s()
+                .unwrap_or(signature)
+                .to_bytes()
+                .to_vec()
         }
         Err(PdsError::NotFound(nf)) => {
             // No PDS-held key. A did:web account is sovereign — mediate through
@@ -148,7 +153,7 @@ pub async fn entryway_auth_headers(
                 let compact = channel
                     .sign_service_auth(user_did, signing_input.as_bytes())
                     .await?;
-                crate::service_auth::compact_es256k_to_der(&compact)?
+                crate::service_auth::normalize_compact_es256k(&compact)?
             } else {
                 return Err(PdsError::NotFound(nf));
             }
@@ -156,7 +161,7 @@ pub async fn entryway_auth_headers(
         Err(e) => return Err(e),
     };
 
-    let sig_b64 = URL_SAFE_NO_PAD.encode(&sig_der);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(&signature);
     let token = format!("{}.{}", signing_input, sig_b64);
 
     let mut h = HeaderMap::new();
@@ -471,10 +476,12 @@ mod tests {
             serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
         assert_eq!(claims["iss"], did);
 
-        // The holder signature verifies (DER) against the mock holder key —
-        // proves the compact→DER re-encode is wire-correct for entryway JWTs too.
+        // The holder signature goes on the wire compact (#473) and verifies
+        // against the mock holder key, for entryway JWTs too.
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        let sig = Signature::from_der(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        assert_eq!(sig_bytes.len(), 64, "compact signature");
+        let sig = Signature::from_slice(&sig_bytes).unwrap();
         mock.verifying_key()
             .verify(signing_input.as_bytes(), &sig)
             .expect("holder signature verifies");
