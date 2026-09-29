@@ -2,7 +2,7 @@
 ///
 /// Temporary/experimental ATProto endpoints. These are subject to change
 /// and may be deprecated in future versions of the protocol.
-use crate::{auth::AuthContext, context::AppContext};
+use crate::{auth::AccountOrOAuthAuth, context::AppContext};
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::Serialize;
 
@@ -44,7 +44,9 @@ struct CheckSignupQueueResponse {
 /// For PDSes without a signup queue, this always returns activated=true.
 async fn check_signup_queue(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    // Any account token, OAuth included: this reads the caller's own signup
+    // status (#485).
+    auth: AccountOrOAuthAuth,
 ) -> Result<Json<CheckSignupQueueResponse>, (StatusCode, String)> {
     // Get the account to check activation status
     let account = ctx

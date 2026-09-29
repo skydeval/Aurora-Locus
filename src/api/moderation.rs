@@ -1,6 +1,6 @@
 /// Moderation API Endpoints
 /// Implements com.atproto.moderation.* endpoints for user-submitted reports
-use crate::{admin::reports::ReportReason, auth::AuthContext, context::AppContext};
+use crate::{admin::reports::ReportReason, auth::AccountOrOAuthAuth, context::AppContext};
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::{Deserialize, Serialize};
 
@@ -108,9 +108,13 @@ pub struct CreateReportResponse {
 /// This is the standard ATProto endpoint for user-submitted reports.
 async fn create_report(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: AccountOrOAuthAuth,
     Json(req): Json<CreateReportRequest>,
 ) -> Result<Json<CreateReportResponse>, (StatusCode, String)> {
+    // An OAuth client needs permission to call createReport (#485). The
+    // report is handled here, so no service audience applies.
+    auth.require_rpc_method("com.atproto.moderation.createReport")
+        .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
     // Parse the reason type from ATProto format to our internal format
     let reason_type =
         parse_reason_type(&req.reason_type).map_err(|e| (StatusCode::BAD_REQUEST, e))?;

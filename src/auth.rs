@@ -180,13 +180,91 @@ impl AuthContextForwarded {
         &self,
         attr: crate::oauth::atproto::scope::IdentityAttr,
     ) -> Result<(), PdsError> {
+        require_identity_grant(self.oauth_scopes.as_ref(), attr)
+    }
+}
+
+/// `Ok` for sessions (`scopes` is `None`); for an atproto-OAuth token, only
+/// with a granted `identity:` permission covering `attr` (#478).
+fn require_identity_grant(
+    scopes: Option<&crate::oauth::atproto::scope::ScopeSet>,
+    attr: crate::oauth::atproto::scope::IdentityAttr,
+) -> Result<(), PdsError> {
+    match scopes {
+        Some(scopes) if !scopes.allows_identity(attr) => Err(PdsError::Authorization(
+            "this OAuth token was not granted permission to change the account's identity"
+                .to_string(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// A request from an account on this PDS: anything [`AuthContext`] accepts,
+/// or an atproto-OAuth token the OAuth gate verified (DPoP + registered
+/// device), with the scopes it was granted (#485). Handlers taking it check
+/// the permission their operation needs with the `require_*` methods, which
+/// pass sessions through unchanged.
+#[derive(Debug, Clone)]
+pub struct AccountOrOAuthAuth {
+    /// The account's DID.
+    pub did: String,
+    /// For an atproto-OAuth token, its granted scopes; `None` otherwise.
+    pub oauth_scopes: Option<crate::oauth::atproto::scope::ScopeSet>,
+}
+
+impl AccountOrOAuthAuth {
+    /// Require permission to change the account's identity `attr`.
+    pub fn require_identity(
+        &self,
+        attr: crate::oauth::atproto::scope::IdentityAttr,
+    ) -> Result<(), PdsError> {
+        require_identity_grant(self.oauth_scopes.as_ref(), attr)
+    }
+
+    /// Require permission to obtain a service-auth token for `aud`, scoped to
+    /// `lxm` (or to any method when `None`).
+    pub fn require_service_auth(&self, lxm: Option<&str>, aud: &str) -> Result<(), PdsError> {
         match &self.oauth_scopes {
-            Some(scopes) if !scopes.allows_identity(attr) => Err(PdsError::Authorization(
-                "this OAuth token was not granted permission to change the account's identity"
-                    .to_string(),
+            Some(scopes) if !scopes.allows_service_auth(lxm, aud) => {
+                Err(PdsError::Authorization(format!(
+                    "this OAuth token was not granted permission to call {} on {aud}",
+                    lxm.unwrap_or("any method")
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Require permission to call `lxm`, for a method this PDS serves itself.
+    pub fn require_rpc_method(&self, lxm: &str) -> Result<(), PdsError> {
+        match &self.oauth_scopes {
+            Some(scopes) if !scopes.allows_rpc_method(lxm) => Err(PdsError::Authorization(
+                format!("this OAuth token was not granted permission to call {lxm}"),
             )),
             _ => Ok(()),
         }
+    }
+}
+
+#[async_trait]
+impl FromRequestParts<AppContext> for AccountOrOAuthAuth {
+    type Rejection = PdsError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppContext,
+    ) -> Result<Self, Self::Rejection> {
+        if let Some(did) = crate::api::middleware::oauth_resolved_did(&parts.headers) {
+            return Ok(Self {
+                did,
+                oauth_scopes: crate::api::middleware::oauth_granted_scopes(&parts.headers),
+            });
+        }
+        let auth = AuthContext::from_request_parts(parts, state).await?;
+        Ok(Self {
+            did: auth.did,
+            oauth_scopes: None,
+        })
     }
 }
 

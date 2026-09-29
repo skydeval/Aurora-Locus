@@ -6,7 +6,7 @@ use crate::{
         RevokeAppPasswordRequest, SessionInfo, SessionResponse,
     },
     api::middleware,
-    auth::AuthContext,
+    auth::AccountOrOAuthAuth,
     context::AppContext,
     error::{PdsError, PdsResult},
     oauth::atproto::scope::{AccountAction, AccountAttr},
@@ -1272,7 +1272,8 @@ pub(crate) async fn mint_account_service_jwt(
 /// This allows the user's PDS to authenticate requests to other services on behalf of the user.
 ///
 /// # Authentication
-/// Requires a valid session token (Bearer token in Authorization header).
+/// A session token, or an atproto-OAuth token granted permission to call the
+/// requested method (`lxm`) on the requested service (`aud`).
 ///
 /// # Validation Rules
 /// - Token must not be expired when requested
@@ -1282,9 +1283,13 @@ pub(crate) async fn mint_account_service_jwt(
 /// - Some methods are "protected" and cannot use service auth
 async fn get_service_auth(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: AccountOrOAuthAuth,
     Query(req): Query<GetServiceAuthQuery>,
 ) -> PdsResult<Json<GetServiceAuthResponse>> {
+    // An OAuth client needs an rpc permission for this method on this
+    // service; this is how its video uploads get their token (#485).
+    auth.require_service_auth(req.lxm.as_deref(), &req.aud)?;
+
     // v0.10 Arc 1 §10 / R2 F-3: getServiceAuth signs an ES256K JWT with the
     // caller's own `#atproto` key. A public-key-only did:web account has no
     // substrate-held signing key, so signing it in-process is impossible (and
@@ -2628,5 +2633,111 @@ mod oauth_scope_tests {
         )
         .await
         .expect("account:status reads the status");
+    }
+    async fn oauth_auth(ctx: &AppContext, did: &str, granted: &str) -> AccountOrOAuthAuth {
+        use axum::extract::FromRequestParts;
+        let mut req = axum::http::Request::builder().body(()).unwrap();
+        *req.headers_mut() = oauth_gate_headers(did, granted);
+        let (mut parts, _) = req.into_parts();
+        AccountOrOAuthAuth::from_request_parts(&mut parts, ctx)
+            .await
+            .unwrap()
+    }
+
+    fn service_auth_query(lxm: Option<&str>) -> Query<GetServiceAuthQuery> {
+        Query(GetServiceAuthQuery {
+            aud: "did:web:video.bsky.app".to_string(),
+            exp: None,
+            lxm: lxm.map(str::to_string),
+        })
+    }
+
+    /// #485: OAuth clients get service-auth tokens (their video uploads need
+    /// one) when granted the method on that service, and not otherwise.
+    #[tokio::test]
+    async fn get_service_auth_serves_oauth_clients_by_grant() {
+        let (ctx, did) = ctx_with_account().await;
+        let upload = Some("com.atproto.repo.uploadBlob");
+
+        let generic = oauth_auth(&ctx, &did, "atproto transition:generic").await;
+        assert!(generic.oauth_scopes.is_some());
+        let token = get_service_auth(
+            State(ctx.clone()),
+            generic.clone(),
+            service_auth_query(upload),
+        )
+        .await
+        .expect("transition:generic covers uploadBlob")
+        .0
+        .token;
+        assert_eq!(token.split('.').count(), 3);
+
+        // Not for a token usable for any method.
+        assert!(matches!(
+            get_service_auth(State(ctx.clone()), generic, service_auth_query(None)).await,
+            Err(PdsError::Authorization(_))
+        ));
+
+        let base = oauth_auth(&ctx, &did, "atproto").await;
+        assert!(matches!(
+            get_service_auth(State(ctx.clone()), base, service_auth_query(upload)).await,
+            Err(PdsError::Authorization(_))
+        ));
+
+        let granular = oauth_auth(
+            &ctx,
+            &did,
+            "atproto rpc:com.atproto.repo.uploadBlob?aud=did:web:video.bsky.app%23bsky_video",
+        )
+        .await;
+        let _token = get_service_auth(State(ctx.clone()), granular, service_auth_query(upload))
+            .await
+            .expect("the granted method on the granted service");
+    }
+
+    /// Sessions are unaffected by the OAuth checks.
+    #[tokio::test]
+    async fn get_service_auth_still_serves_sessions() {
+        use axum::extract::FromRequestParts;
+        let (ctx, did) = ctx_with_account().await;
+        let session = ctx
+            .account_manager
+            .create_session(&did, None)
+            .await
+            .unwrap();
+        let (mut parts, _) = axum::http::Request::builder()
+            .header("authorization", format!("Bearer {}", session.access_token))
+            .body(())
+            .unwrap()
+            .into_parts();
+        let auth = AccountOrOAuthAuth::from_request_parts(&mut parts, &ctx)
+            .await
+            .unwrap();
+        assert!(auth.oauth_scopes.is_none());
+        let _token = get_service_auth(State(ctx.clone()), auth, service_auth_query(None))
+            .await
+            .expect("a session may mint a method-less token");
+    }
+
+    #[test]
+    fn identity_operations_need_identity_all() {
+        use crate::oauth::atproto::scope::{IdentityAttr, ScopeSet};
+        let auth = |granted: Option<&str>| AccountOrOAuthAuth {
+            did: "did:plc:x".to_string(),
+            oauth_scopes: granted.map(ScopeSet::from_granted),
+        };
+        assert!(auth(None).require_identity(IdentityAttr::All).is_ok());
+        assert!(auth(Some("atproto identity:handle"))
+            .require_identity(IdentityAttr::All)
+            .is_err());
+        assert!(auth(Some("atproto identity:*"))
+            .require_identity(IdentityAttr::All)
+            .is_ok());
+        assert!(auth(Some("atproto transition:generic"))
+            .require_rpc_method("com.atproto.moderation.createReport")
+            .is_ok());
+        assert!(auth(Some("atproto"))
+            .require_rpc_method("com.atproto.moderation.createReport")
+            .is_err());
     }
 }

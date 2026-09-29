@@ -655,6 +655,53 @@ impl ScopeSet {
         })
     }
 
+    /// May the client call `lxm` on some service? For methods this PDS serves
+    /// itself on the client's behalf, where no service audience applies.
+    pub fn allows_rpc_method(&self, lxm: &str) -> bool {
+        let chat = lxm.starts_with("chat.bsky.");
+        (chat && self.has(AtprotoScope::TransitionChatBsky))
+            || (!chat && self.has(AtprotoScope::TransitionGeneric))
+            || self.permissions().any(|p| match p {
+                Permission::Rpc { lxms, .. } => lxms.iter().any(|l| l == "*" || l == lxm),
+                _ => false,
+            })
+    }
+
+    /// May the client obtain a service-auth token for `aud` (a DID, possibly
+    /// with a `#service` fragment) scoped to `lxm`, or to any method when
+    /// `lxm` is `None` (`com.atproto.server.getServiceAuth`)?
+    ///
+    /// A service-auth token's audience is the service's DID, so an rpc
+    /// permission naming `did#service` covers a request for that DID (and for
+    /// that exact `did#service`). A token for any method needs an rpc
+    /// permission for every method (`rpc:*`) on that service; the transition
+    /// scopes grant only tokens scoped to a method they cover.
+    pub fn allows_service_auth(&self, lxm: Option<&str>, aud: &str) -> bool {
+        let aud_did = aud.split('#').next().unwrap_or(aud);
+        let aud_covered = |allowed: &str| {
+            allowed == "*"
+                || allowed == aud
+                || (!aud.contains('#') && allowed.split('#').next() == Some(aud_did))
+        };
+        if let Some(lxm) = lxm {
+            let chat = lxm.starts_with("chat.bsky.");
+            if (chat && self.has(AtprotoScope::TransitionChatBsky))
+                || (!chat && self.has(AtprotoScope::TransitionGeneric))
+            {
+                return true;
+            }
+        }
+        self.permissions().any(|p| match p {
+            Permission::Rpc { lxms, aud: allowed } => {
+                aud_covered(allowed)
+                    && lxms
+                        .iter()
+                        .any(|l| l == "*" || lxm.is_some_and(|lxm| l == lxm))
+            }
+            _ => false,
+        })
+    }
+
     /// May the client `action` the account's `attr`?
     pub fn allows_account(&self, attr: AccountAttr, action: AccountAction) -> bool {
         if attr == AccountAttr::Email
@@ -1020,5 +1067,49 @@ mod tests {
         // Granular grants are checked against the ScopeSet, not translated.
         assert_eq!(to_internal_scope("atproto repo:*"), "");
         assert!(!to_internal_scope("atproto transition:generic").contains("admin"));
+    }
+    #[test]
+    fn service_auth_grants_follow_method_and_audience() {
+        let video = "did:web:video.bsky.app";
+        let upload = Some("com.atproto.repo.uploadBlob");
+
+        // transition:generic: method-scoped tokens, not chat, not method-less.
+        let generic = ScopeSet::from_granted("atproto transition:generic");
+        assert!(generic.allows_service_auth(upload, video));
+        assert!(!generic.allows_service_auth(Some("chat.bsky.convo.getLog"), video));
+        assert!(!generic.allows_service_auth(None, video));
+        let chat = ScopeSet::from_granted("atproto transition:chat.bsky");
+        assert!(chat.allows_service_auth(Some("chat.bsky.convo.getLog"), "did:web:api.bsky.chat"));
+
+        // A granular permission naming did#service covers the bare DID.
+        let granular = ScopeSet::from_granted(
+            "atproto rpc:com.atproto.repo.uploadBlob?aud=did:web:video.bsky.app%23bsky_video",
+        );
+        assert!(granular.allows_service_auth(upload, video));
+        assert!(granular.allows_service_auth(upload, "did:web:video.bsky.app#bsky_video"));
+        assert!(!granular.allows_service_auth(upload, "did:web:video.bsky.app#other"));
+        assert!(!granular.allows_service_auth(upload, "did:web:evil.example"));
+        assert!(!granular.allows_service_auth(Some("com.atproto.repo.createRecord"), video));
+        assert!(!granular.allows_service_auth(None, video));
+
+        // rpc:* on a service allows method-less tokens for it.
+        let any = ScopeSet::from_granted("atproto rpc:*?aud=did:web:video.bsky.app%23bsky_video");
+        assert!(any.allows_service_auth(None, video));
+        assert!(!any.allows_service_auth(None, "did:web:other.example"));
+
+        let base = ScopeSet::from_granted("atproto");
+        assert!(!base.allows_service_auth(upload, video));
+    }
+
+    #[test]
+    fn rpc_method_grants_ignore_the_audience() {
+        let report = "com.atproto.moderation.createReport";
+        assert!(ScopeSet::from_granted("atproto transition:generic").allows_rpc_method(report));
+        assert!(ScopeSet::from_granted(
+            "atproto rpc:com.atproto.moderation.createReport?aud=did:plc:mod%23atproto_labeler"
+        )
+        .allows_rpc_method(report));
+        assert!(!ScopeSet::from_granted("atproto").allows_rpc_method(report));
+        assert!(!ScopeSet::from_granted("atproto transition:chat.bsky").allows_rpc_method(report));
     }
 }

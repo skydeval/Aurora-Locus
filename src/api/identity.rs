@@ -2,7 +2,7 @@
 /// Implements com.atproto.identity.* endpoints for handle and DID resolution
 use crate::identity::handle_validation::is_under_service_handle_domain;
 use crate::{
-    auth::AuthContext,
+    auth::AccountOrOAuthAuth,
     error::{PdsError, PdsResult},
     AppContext,
 };
@@ -224,8 +224,11 @@ pub struct Service {
 
 pub async fn get_recommended_did_credentials(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: AccountOrOAuthAuth,
 ) -> PdsResult<Json<RecommendedDidCredentialsResponse>> {
+    // An OAuth client needs identity:* (these are the keys a migration would
+    // put in the DID document) (#485).
+    auth.require_identity(crate::oauth::atproto::scope::IdentityAttr::All)?;
     // Arc 13 §6.3.6 Step 3.6 rewrite — return *server-recommended*
     // credentials (what an account migrating TO this PDS should
     // adopt), not the credentials currently in the resolved DID
@@ -784,9 +787,10 @@ pub struct SubmitPlcOperationRequest {
 
 pub async fn submit_plc_operation(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: AccountOrOAuthAuth,
     Json(req): Json<SubmitPlcOperationRequest>,
 ) -> PdsResult<Json<()>> {
+    auth.require_identity(crate::oauth::atproto::scope::IdentityAttr::All)?;
     let did = auth.did;
 
     // Ensure this is a did:plc
@@ -956,8 +960,9 @@ pub async fn submit_plc_operation(
 /// minutes. Single-use via CAS at consume time.
 pub async fn request_plc_operation_signature(
     State(ctx): State<AppContext>,
-    auth: AuthContext,
+    auth: AccountOrOAuthAuth,
 ) -> PdsResult<Json<serde_json::Value>> {
+    auth.require_identity(crate::oauth::atproto::scope::IdentityAttr::All)?;
     let did = auth.did;
 
     // Ensure this is a did:plc — only did:plc supports PLC ops.
