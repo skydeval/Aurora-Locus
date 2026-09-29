@@ -1111,9 +1111,10 @@ pub fn classify_namespace_scope(
 /// Axum middleware: enforces namespace scope rules on admin paths.
 ///
 /// Looks up the OAuth scope by validating the bearer token against the
-/// token table; if the token is not an OAuth token (e.g. session/JWT),
-/// `validate_oauth_token` returns Err and we treat this as the
-/// session-token case (pass-through).
+/// token table; if the token is not an OAuth bearer (e.g. session/JWT, or a
+/// DPoP-bound token, which is not valid as a `Bearer`),
+/// `validate_bearer_oauth_token` returns Err and we treat this as the
+/// session-token case (pass-through; the downstream extractor decides).
 pub async fn namespace_scope_check(
     State(ctx): State<AppContext>,
     req: Request,
@@ -1122,7 +1123,7 @@ pub async fn namespace_scope_check(
     let path = req.uri().path().to_string();
 
     let oauth_scope = match extract_bearer_token(req.headers()) {
-        Some(token) => crate::auth::validate_oauth_token(&ctx, &token)
+        Some(token) => crate::auth::validate_bearer_oauth_token(&ctx, &token)
             .await
             .ok()
             .map(|t| t.scope),

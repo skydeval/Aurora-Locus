@@ -103,7 +103,7 @@ impl FromRequestParts<AppContext> for AuthContext {
         let start = Instant::now();
 
         // Try OAuth validation first (modern standard)
-        match validate_oauth_token(state, &token).await {
+        match validate_bearer_oauth_token(state, &token).await {
             Ok(oauth_token) => {
                 let duration = start.elapsed().as_secs_f64();
 
@@ -220,7 +220,7 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
             let start = Instant::now();
 
             // Try OAuth validation first
-            match validate_oauth_token(state, &token).await {
+            match validate_bearer_oauth_token(state, &token).await {
                 Ok(oauth_token) => {
                     let duration = start.elapsed().as_secs_f64();
 
@@ -1003,6 +1003,26 @@ pub async fn validate_oauth_token(
     })
 }
 
+/// Validate an OAuth access token presented with the `Bearer` scheme.
+///
+/// A DPoP-bound token (every token the atproto-OAuth provider issues) is
+/// refused here: it is only usable as `Authorization: DPoP <token>` with a
+/// proof from the bound key (RFC 9449 §7.1), which the atproto-OAuth gate
+/// checks. Accepting it as a plain bearer would let anyone holding a copy of
+/// the token use it without the client's key.
+pub async fn validate_bearer_oauth_token(
+    ctx: &AppContext,
+    access_token: &str,
+) -> Result<OAuthToken, PdsError> {
+    let token = validate_oauth_token(ctx, access_token).await?;
+    if token.dpop_thumbprint.is_some() {
+        return Err(PdsError::Authentication(
+            "DPoP-bound access token must be presented with the DPoP scheme".to_string(),
+        ));
+    }
+    Ok(token)
+}
+
 /// Extract DPoP header from request
 ///
 /// DPoP proof is sent in the "DPoP" HTTP header (not Authorization).
@@ -1187,7 +1207,7 @@ async fn route_opaque_oauth(
     ctx: &AppContext,
     token: &str,
 ) -> Result<crate::api::middleware::UnifiedAuthContext, PdsError> {
-    match validate_oauth_token(ctx, token).await {
+    match validate_bearer_oauth_token(ctx, token).await {
         Ok(token_info) => {
             tracing::info!(
                 did = %token_info.did,
@@ -2164,6 +2184,47 @@ mod admin_auth_third_path_tests {
             super::validate_oauth_token(&ctx, "tok-old").await.is_err(),
             "pre-β.1 row must not validate by token_id either"
         );
+    }
+
+    #[tokio::test]
+    async fn dpop_bound_token_is_refused_as_a_plain_bearer() {
+        let (ctx, _mock) = build_test_ctx_with_mock().await;
+        let bearer = "at_boundboundboundboundbound0001";
+        let hash = crate::oauth::access_token_hash(bearer);
+        seed_oauth_token(
+            &ctx,
+            "tok-bound",
+            "did:web:dana.example.com",
+            Some(&hash),
+            false,
+        )
+        .await;
+        sqlx::query("UPDATE token SET dpop_thumbprint = $1 WHERE token_id = $2")
+            .bind("some-jkt")
+            .bind("tok-bound")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+
+        // The row itself is valid (the DPoP gate looks it up this way)...
+        assert!(super::validate_oauth_token(&ctx, bearer).await.is_ok());
+        // ...but as a `Bearer` it needs no proof, so it is refused.
+        assert!(super::validate_bearer_oauth_token(&ctx, bearer)
+            .await
+            .is_err());
+        // An unbound token is still a valid bearer.
+        let plain = "at_plainplainplainplainplain0001";
+        seed_oauth_token(
+            &ctx,
+            "tok-plain",
+            "did:web:dana.example.com",
+            Some(&crate::oauth::access_token_hash(plain)),
+            false,
+        )
+        .await;
+        assert!(super::validate_bearer_oauth_token(&ctx, plain)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

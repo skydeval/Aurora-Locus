@@ -242,10 +242,10 @@ async fn case_01_opaque_oauth_token_routes_to_oauth_path() {
     let now = Utc::now();
     sqlx::query(
         "INSERT INTO token (token_id, did, client_id, current_refresh_token, scope, \
-         created_at, updated_at, expires_at, dpop_thumbprint, device_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+         created_at, updated_at, expires_at, dpop_thumbprint, device_id, access_token_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
-    .bind(token)
+    .bind("tok_opaque_test_01")
     .bind(TEST_USER_DID)
     .bind("test-client")
     .bind("rt_test_refresh_01")
@@ -255,6 +255,11 @@ async fn case_01_opaque_oauth_token_routes_to_oauth_path() {
     .bind((now + chrono::Duration::hours(1)).to_rfc3339())
     .bind(Option::<String>::None)
     .bind(Option::<String>::None)
+    // Bearers are looked up by their SHA-256 hex digest, never stored raw.
+    .bind({
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(token.as_bytes()))
+    })
     .execute(&ctx.account_db)
     .await
     .expect("seed oauth token");
@@ -266,6 +271,44 @@ async fn case_01_opaque_oauth_token_routes_to_oauth_path() {
     }
     // Opaque-token path never touches PLC.
     assert_eq!(mock.resolve_did_calls(), 0);
+}
+
+/// A DPoP-bound token (as the atproto-OAuth provider issues) presented as a
+/// plain `Bearer` is refused: it needs a proof from its bound key, which only
+/// the `DPoP`-scheme gate checks.
+#[tokio::test]
+async fn case_01b_dpop_bound_token_as_bearer_is_refused() {
+    let (ctx, _mock) = build_test_ctx().await;
+
+    let token = "at_dpop_bound_test_token_01b";
+    let now = Utc::now();
+    sqlx::query(
+        "INSERT INTO token (token_id, did, client_id, current_refresh_token, scope, \
+         created_at, updated_at, expires_at, dpop_thumbprint, device_id, access_token_hash) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+    )
+    .bind("tok_bound_test_01b")
+    .bind(TEST_USER_DID)
+    .bind("https://app.example.com/client-metadata.json")
+    .bind("rt_test_refresh_01b")
+    .bind("atproto transition:generic")
+    .bind(now.to_rfc3339())
+    .bind(now.to_rfc3339())
+    .bind((now + chrono::Duration::hours(1)).to_rfc3339())
+    .bind("bound-key-thumbprint")
+    .bind(Option::<String>::None)
+    .bind({
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(token.as_bytes()))
+    })
+    .execute(&ctx.account_db)
+    .await
+    .expect("seed oauth token");
+
+    assert!(
+        call_auth(&ctx, token).await.is_err(),
+        "a DPoP-bound token must not authenticate as a plain bearer"
+    );
 }
 
 // ============================================================
