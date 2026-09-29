@@ -73,6 +73,9 @@ pub struct TokenResponse {
     pub expires_in: i64,
     #[serde(default)]
     pub scope: String,
+    /// The account the tokens act for. atproto OAuth requires it in every
+    /// token response, so its absence fails the parse (#484).
+    pub sub: String,
 }
 
 /// Errors from the admin OAuth client flow.
@@ -482,7 +485,7 @@ mod tests {
                     });
                     json_response(
                         StatusCode::OK,
-                        r#"{"access_token":"at_1","refresh_token":"rt_1","token_type":"DPoP","expires_in":3600,"scope":"atproto transition:generic"}"#,
+                        r#"{"access_token":"at_1","refresh_token":"rt_1","token_type":"DPoP","expires_in":3600,"scope":"atproto transition:generic","sub":"did:plc:admin"}"#,
                     )
                 }
             }),
@@ -498,6 +501,7 @@ mod tests {
         assert_eq!(tokens.refresh_token, "rt_1");
         assert_eq!(tokens.token_type, "DPoP");
         assert_eq!(tokens.expires_in, 3600);
+        assert_eq!(tokens.sub, "did:plc:admin");
 
         let captured = cap.lock().unwrap().clone();
         assert_eq!(captured.len(), 1);
@@ -525,7 +529,7 @@ mod tests {
                     });
                     json_response(
                         StatusCode::OK,
-                        r#"{"access_token":"at_2","refresh_token":"rt_2","token_type":"DPoP","expires_in":3600,"scope":"atproto transition:generic"}"#,
+                        r#"{"access_token":"at_2","refresh_token":"rt_2","token_type":"DPoP","expires_in":3600,"scope":"atproto transition:generic","sub":"did:plc:admin"}"#,
                     )
                 }
             }),
@@ -577,7 +581,7 @@ mod tests {
                     } else {
                         json_response(
                             StatusCode::OK,
-                            r#"{"access_token":"at_n","refresh_token":"rt_n","token_type":"DPoP","expires_in":3600,"scope":"atproto"}"#,
+                            r#"{"access_token":"at_n","refresh_token":"rt_n","token_type":"DPoP","expires_in":3600,"scope":"atproto","sub":"did:plc:admin"}"#,
                         )
                     }
                 }

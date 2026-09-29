@@ -885,10 +885,9 @@ async fn handle_oauth_callback(
             )
         })?;
 
-    // Loopback DID resolution: Aurora's AS token response carries no `sub`, but
-    // the token it just minted lives in this PDS's own `token` table, so we
-    // validate it locally to learn the authenticated DID — the loopback
-    // equivalent of the userinfo call an external client would make.
+    // Loopback DID resolution: the token our AS just minted lives in this PDS's
+    // own `token` table, so we validate it locally to learn the authenticated
+    // DID, and require the response's `sub` to name the same account (#484).
     let did = crate::auth::validate_oauth_token(&ctx, &tokens.access_token)
         .await
         .map_err(|e| {
@@ -899,6 +898,13 @@ async fn handle_oauth_callback(
             )
         })?
         .did;
+    if tokens.sub != did {
+        tracing::error!(sub = %tokens.sub, did = %did, "token response sub does not match the token");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to resolve authenticated identity".to_string(),
+        ));
+    }
     tracing::info!("OAuth authentication successful for DID: {}", did);
 
     // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL

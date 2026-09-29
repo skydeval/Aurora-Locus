@@ -134,7 +134,7 @@ async fn authorization_code_grant(
         .await
         .map_err(server_error)?;
 
-    Ok(token_response(&issued, &request.scope))
+    Ok(token_response(&issued, &request.scope, did))
 }
 
 async fn refresh_token_grant(
@@ -155,14 +155,16 @@ async fn refresh_token_grant(
     // 2. Proof-of-possession: the presented DPoP key must match the key the
     //    token was bound to at issuance. Look up the row's thumbprint directly;
     //    a mismatch is a stolen-refresh-token signal → reject before rotating.
-    let bound: Option<Option<String>> =
-        sqlx::query("SELECT dpop_thumbprint FROM token WHERE current_refresh_token = $1")
+    let row =
+        sqlx::query("SELECT did, dpop_thumbprint FROM token WHERE current_refresh_token = $1")
             .bind(refresh_token)
             .fetch_optional(&ctx.account_db)
             .await
             .map_err(|e| server_error(crate::error::PdsError::Database(e)))?
-            .map(|row| row.get::<Option<String>, _>("dpop_thumbprint"));
-    if let Some(Some(bound_thumbprint)) = bound {
+            .ok_or_else(invalid_grant)?;
+    // The account the token acts for, reported as `sub` (#484).
+    let did: String = row.get("did");
+    if let Some(bound_thumbprint) = row.get::<Option<String>, _>("dpop_thumbprint") {
         if bound_thumbprint != thumbprint {
             return Err(oauth_error_json(
                 StatusCode::UNAUTHORIZED,
@@ -188,6 +190,7 @@ async fn refresh_token_grant(
         "token_type": "DPoP",
         "expires_in": rotated.expires_in,
         "scope": rotated.scope,
+        "sub": did,
     });
     Ok(json_ok(&body))
 }
@@ -298,13 +301,16 @@ async fn issue_tokens(
     })
 }
 
-fn token_response(issued: &IssuedTokens, scope: &str) -> Response {
+/// The token response. atproto OAuth requires `sub`, the account's DID, in
+/// every token response; clients discard a response without it (#484).
+fn token_response(issued: &IssuedTokens, scope: &str, sub: &str) -> Response {
     let body = serde_json::json!({
         "access_token": issued.access_token,
         "refresh_token": issued.refresh_token,
         "token_type": "DPoP",
         "expires_in": ACCESS_TOKEN_TTL_SECS,
         "scope": scope,
+        "sub": sub,
     });
     json_ok(&body)
 }
@@ -315,6 +321,7 @@ fn json_ok(body: &serde_json::Value) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
+        .header(header::PRAGMA, "no-cache")
         .body(bytes.into())
         .expect("static header set builds a valid response")
 }
@@ -546,11 +553,16 @@ mod tests {
             Form(form),
         )
         .await;
+        // RFC 6749 section 5.1: token responses are never cached.
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(resp.headers()[header::PRAGMA], "no-cache");
         let (status, json) = body_json(resp).await;
         assert_eq!(status, StatusCode::OK, "issued: {json:?}");
         assert_eq!(json["token_type"], "DPoP");
         assert_eq!(json["expires_in"], ACCESS_TOKEN_TTL_SECS);
         assert_eq!(json["scope"], "atproto transition:generic");
+        // #484: `sub` is the account the code was issued for.
+        assert_eq!(json["sub"], "did:web:alice.example.com");
         let access_token = json["access_token"].as_str().unwrap().to_string();
 
         // β.1: the issued bearer validates via the shared validation path.
@@ -634,6 +646,12 @@ mod tests {
         .await;
         assert_eq!(rstatus, StatusCode::OK, "rotate: {rjson:?}");
         assert_eq!(rjson["token_type"], "DPoP");
+        assert_eq!(rjson["sub"], "did:web:alice.example.com");
+        assert!(rjson["scope"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .any(|s| s == "atproto"));
         assert!(rjson["access_token"].as_str().unwrap().starts_with("at_"));
 
         // Refresh with a DIFFERENT DPoP key → POP failure, 401.
