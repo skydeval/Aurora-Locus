@@ -288,9 +288,15 @@ fn render_consent_screen(
         .client_name
         .as_deref()
         .unwrap_or(&metadata.client_id);
-    let scope_items: String = scope
-        .split_whitespace()
-        .map(|s| format!("<li><code>{}</code></li>", html_escape(s)))
+    let scope_items: String = super::scope::ScopeSet::from_granted(scope)
+        .tokens()
+        .map(|(token, parsed)| {
+            format!(
+                "<li>{} <small><code>{}</code></small></li>",
+                html_escape(&parsed.describe()),
+                html_escape(token)
+            )
+        })
         .collect();
 
     let body = format!(
@@ -491,6 +497,9 @@ mod tests {
         assert!(html.contains("Cool &lt;App&gt;"));
         assert!(html.contains("<code>atproto</code>"));
         assert!(html.contains("<code>transition:generic</code>"));
+        // Each permission is described in words (#478).
+        assert!(html.contains("Sign in as your account"));
+        assert!(html.contains("upload files"));
     }
 
     // ---- First-party admin auto-approve (chainlink #439) ----

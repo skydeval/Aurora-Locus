@@ -5,7 +5,8 @@
 //! the same OAuth + PKCE parameter set, so the raw shape and its validation
 //! live here once. Validation enforces the atproto-OAuth profile: PKCE is
 //! mandatory and S256-only, the only `response_type` is `code`, and the scope
-//! string must parse against the closed [`super::scope`] vocabulary.
+//! string must name the base `atproto` scope (unsupported scope tokens are
+//! dropped, as the reference authorization server does; see [`super::scope`]).
 
 use serde::Deserialize;
 
@@ -193,6 +194,28 @@ mod tests {
             validate(&raw),
             Err(AuthParamError::MissingParameter("code_challenge"))
         );
+    }
+
+    #[test]
+    fn keeps_supported_scopes_and_drops_the_rest() {
+        let mut raw = good();
+        raw.scope = Some(
+            "atproto transition:email identity:handle account:status?action=manage \
+             com.example.unknown"
+                .to_string(),
+        );
+        let v = validate(&raw).unwrap();
+        assert_eq!(
+            v.scope.to_canonical_string(),
+            "atproto transition:email identity:handle account:status?action=manage"
+        );
+    }
+
+    #[test]
+    fn rejects_openid() {
+        let mut raw = good();
+        raw.scope = Some("atproto openid".to_string());
+        assert_eq!(validate(&raw).unwrap_err().oauth_code(), "invalid_scope");
     }
 
     #[test]

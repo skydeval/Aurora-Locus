@@ -103,5 +103,15 @@ mod tests {
         // The atproto base scope is advertised.
         let scopes = doc["scopes_supported"].as_array().unwrap();
         assert!(scopes.iter().any(|s| s == "atproto"));
+        // The four static scopes, as bsky.social advertises them (#478).
+        assert_eq!(
+            doc["scopes_supported"],
+            serde_json::json!([
+                "atproto",
+                "transition:email",
+                "transition:generic",
+                "transition:chat.bsky"
+            ])
+        );
     }
 }

@@ -83,7 +83,13 @@ pub struct ProxyTarget {
     pub did: String,
     /// The service's base URL.
     pub url: String,
+    /// The service as `did#id`: the `aud` an OAuth rpc permission names.
+    pub service: String,
 }
+
+/// The service id Bluesky AppViews publish, used for `app.bsky.*` calls
+/// forwarded without an `atproto-proxy` header.
+const APPVIEW_SERVICE_ID: &str = "bsky_appview";
 
 /// Split an `atproto-proxy` value into `(did, service id)`.
 fn parse_proxy_header(value: &str) -> PdsResult<(String, String)> {
@@ -108,6 +114,14 @@ pub fn appview_did_from_url(url: &str) -> Option<String> {
         Some(port) => format!("did:web:{host}%3A{port}"),
         None => format!("did:web:{host}"),
     })
+}
+
+/// The configured AppView as `did#bsky_appview`, the service an OAuth rpc
+/// permission for an `app.bsky` method names; `None` without an AppView.
+pub async fn appview_service(ctx: &AppContext) -> Option<String> {
+    let url = crate::api::aurora_admin::resolve_appview_url(ctx).await?;
+    let did = appview_did_from_url(&url)?;
+    Some(format!("{did}#{APPVIEW_SERVICE_ID}"))
 }
 
 /// Resolve where `nsid` should go, from the `atproto-proxy` header or, for
@@ -136,7 +150,8 @@ pub async fn resolve_target(
                     "service {short} not found in the DID document of {did}"
                 ))
             })?;
-        return Ok(ProxyTarget { did, url });
+        let service = full;
+        return Ok(ProxyTarget { did, url, service });
     }
 
     if nsid.starts_with("app.bsky.") {
@@ -150,7 +165,8 @@ pub async fn resolve_target(
         let did = appview_did_from_url(&url).ok_or_else(|| {
             PdsError::Internal(format!("configured AppView URL has no host: {url}"))
         })?;
-        return Ok(ProxyTarget { did, url });
+        let service = format!("{did}#{APPVIEW_SERVICE_ID}");
+        return Ok(ProxyTarget { did, url, service });
     }
 
     Err(PdsError::MethodNotImplemented(format!(
@@ -183,6 +199,9 @@ pub async fn forward(
         }
     }
     if let Some(auth) = auth {
+        // An OAuth client may only act as the account where its scopes allow
+        // this method on this service (#478).
+        auth.require_rpc(nsid, &target.service)?;
         let token = crate::api::server::mint_account_service_jwt(
             ctx,
             &auth.did,

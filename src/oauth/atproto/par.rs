@@ -262,4 +262,37 @@ mod tests {
             .unwrap()
             .starts_with("urn:ietf:params:oauth:request_uri:"));
     }
+
+    /// #478: the Blacksky client's exact request — its full scope string and
+    /// a proof without exp — is accepted, and the scope recorded for the
+    /// grant is exactly the one requested (every token in it is supported).
+    #[tokio::test]
+    async fn par_accepts_the_blacksky_request() {
+        const SCOPE: &str = "atproto transition:generic transition:email transition:chat.bsky \
+                             identity:handle account:email?action=manage account:status?action=manage";
+        let ctx = ctx().await;
+        let redirect_uri = "https://app.example.com/cb";
+        let client_id = serve_client_metadata(redirect_uri).await;
+        let (sk, jwk) = fresh_keypair_jwk();
+        let htu = format!("{}/oauth/atproto/par", ctx.service_url());
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu).parse().unwrap());
+        let mut params = form(&client_id, redirect_uri);
+        params.scope = Some(SCOPE.to_string());
+
+        let resp = par(State(ctx.clone()), headers, Form(params)).await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::CREATED, "PAR response: {doc}");
+
+        let stored = request_store::get_by_request_uri(
+            &ctx.account_db,
+            doc["request_uri"].as_str().unwrap(),
+        )
+        .await
+        .unwrap()
+        .expect("pushed request stored");
+        assert_eq!(stored.scope, SCOPE);
+    }
 }

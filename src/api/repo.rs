@@ -4,7 +4,7 @@ use crate::{
     api::{labels::LabelView, middleware},
     context::AppContext,
     error::{PdsError, PdsResult},
-    oauth::AtProtoScope,
+    oauth::{atproto::scope::RepoAction, AtProtoScope},
 };
 use axum::{
     extract::{Query, State},
@@ -424,7 +424,12 @@ async fn create_record(
         })?;
 
     // Enforce OAuth scope if using OAuth authentication
-    middleware::enforce_scope(&auth, &AtProtoScope::RepoCreate)?;
+    middleware::enforce_repo_permission(
+        &auth,
+        &req.collection,
+        RepoAction::Create,
+        &AtProtoScope::RepoCreate,
+    )?;
 
     let auth_did = auth.did();
     tracing::debug!(
@@ -551,7 +556,15 @@ async fn put_record(
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
 
     // Enforce OAuth scope if using OAuth authentication
-    middleware::enforce_scope(&auth, &AtProtoScope::RepoUpdate)?;
+    // putRecord creates the record when it does not exist yet.
+    for action in [RepoAction::Create, RepoAction::Update] {
+        middleware::enforce_repo_permission(
+            &auth,
+            &req.collection,
+            action,
+            &AtProtoScope::RepoUpdate,
+        )?;
+    }
 
     let auth_did = auth.did();
 
@@ -633,7 +646,12 @@ async fn delete_record(
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
 
     // Enforce OAuth scope if using OAuth authentication
-    middleware::enforce_scope(&auth, &AtProtoScope::RepoDelete)?;
+    middleware::enforce_repo_permission(
+        &auth,
+        &req.collection,
+        RepoAction::Delete,
+        &AtProtoScope::RepoDelete,
+    )?;
 
     let auth_did = auth.did();
 
@@ -935,8 +953,11 @@ async fn apply_writes(
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
 
     // Enforce OAuth scope if using OAuth authentication
-    // apply_writes can do create/update/delete, so it requires RepoAll or Write scope
-    middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?;
+    // apply_writes can do create/update/delete, so a legacy OAuth token needs
+    // RepoAll; an atproto-OAuth token is checked per write below.
+    if auth.granted_scopes().is_none() {
+        middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?;
+    }
 
     let auth_did = auth.did();
 
@@ -965,6 +986,22 @@ async fn apply_writes(
         .into_iter()
         .map(WriteOpInput::into_write_op)
         .collect::<PdsResult<Vec<WriteOp>>>()?;
+    // An OAuth client needs a permission for every write in the batch.
+    if auth.granted_scopes().is_some() {
+        for write in &writes {
+            let action = match write.action {
+                WriteOpAction::Create => RepoAction::Create,
+                WriteOpAction::Update => RepoAction::Update,
+                WriteOpAction::Delete => RepoAction::Delete,
+            };
+            middleware::enforce_repo_permission(
+                &auth,
+                &write.collection,
+                action,
+                &AtProtoScope::RepoAll,
+            )?;
+        }
+    }
     let prepared = repo_mgr.prepare_writes(writes)?;
 
     tracing::info!(

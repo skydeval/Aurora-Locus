@@ -71,6 +71,7 @@ pub async fn update_handle(
     auth: crate::auth::AuthContextForwarded,
     Json(req): Json<UpdateHandleRequest>,
 ) -> PdsResult<Json<()>> {
+    auth.require_identity(crate::oauth::atproto::scope::IdentityAttr::Handle)?;
     let did = auth.did;
 
     // Arc 12 §5.3.8 mint-pattern forward.
@@ -363,6 +364,7 @@ pub async fn sign_plc_operation(
     auth: crate::auth::AuthContextForwarded,
     Json(req): Json<SignPlcOperationRequest>,
 ) -> PdsResult<Json<SignPlcOperationResponse>> {
+    auth.require_identity(crate::oauth::atproto::scope::IdentityAttr::All)?;
     let did = auth.did;
 
     // Arc 12 §5.3.8 mint-pattern forward. When entryway mode is

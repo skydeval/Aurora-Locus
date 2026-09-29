@@ -9,6 +9,7 @@ use crate::{
     auth::AuthContext,
     context::AppContext,
     error::{PdsError, PdsResult},
+    oauth::atproto::scope::{AccountAction, AccountAttr},
     service_auth,
 };
 use axum::{
@@ -464,19 +465,40 @@ async fn get_session(
         // The entryway owns identity but not this PDS's operator roles — graft
         // the locally-resolved role onto the forwarded session.
         resp.role = role;
-        return Ok(Json(resp));
+        return Ok(Json(hide_email_unless_granted(&unified, resp)));
     }
 
     // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
 
-    Ok(Json(SessionInfo {
-        did: account.did,
-        handle: account.handle.unwrap_or_default(),
-        email: account.email,
-        email_confirmed: Some(account.email_confirmed_at.is_some()),
-        role,
-    }))
+    Ok(Json(hide_email_unless_granted(
+        &unified,
+        SessionInfo {
+            did: account.did,
+            handle: account.handle.unwrap_or_default(),
+            email: account.email,
+            email_confirmed: Some(account.email_confirmed_at.is_some()),
+            role,
+        },
+    )))
+}
+
+/// An OAuth client sees the account's email (and whether it is confirmed) only
+/// when it was granted `transition:email` or `account:email` (#478), as the
+/// reference PDS does.
+fn hide_email_unless_granted(
+    auth: &middleware::UnifiedAuthContext,
+    mut session: SessionInfo,
+) -> SessionInfo {
+    use crate::oauth::atproto::scope::{AccountAction, AccountAttr};
+    if auth
+        .granted_scopes()
+        .is_some_and(|s| !s.allows_account(AccountAttr::Email, AccountAction::Read))
+    {
+        session.email = None;
+        session.email_confirmed = None;
+    }
+    session
 }
 
 /// Forensic debug log for session endpoints that receive no usable refresh
@@ -562,6 +584,11 @@ async fn request_email_confirmation(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Email, AccountAction::Manage),
+        "manage the account's email",
+    )?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -728,6 +755,11 @@ async fn request_email_update(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Email, AccountAction::Manage),
+        "manage the account's email",
+    )?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -799,6 +831,11 @@ async fn update_email(
     headers: HeaderMap,
     Json(req): Json<UpdateEmailRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Email, AccountAction::Manage),
+        "manage the account's email",
+    )?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -850,6 +887,7 @@ async fn request_account_delete(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::refuse_oauth(&headers, "Account deletion")?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -1087,6 +1125,7 @@ async fn create_app_password(
     headers: HeaderMap,
     Json(req): Json<CreateAppPasswordRequest>,
 ) -> PdsResult<Json<CreateAppPasswordResponse>> {
+    middleware::refuse_oauth(&headers, "App password management")?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -1114,6 +1153,7 @@ async fn list_app_passwords(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<ListAppPasswordsResponse>> {
+    middleware::refuse_oauth(&headers, "App password management")?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -1134,6 +1174,7 @@ async fn revoke_app_password(
     headers: HeaderMap,
     Json(req): Json<RevokeAppPasswordRequest>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::refuse_oauth(&headers, "App password management")?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -1520,6 +1561,7 @@ async fn get_account_invite_codes(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<GetAccountInviteCodesResponse>> {
+    middleware::refuse_oauth(&headers, "Invite codes")?;
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
     let codes = ctx
@@ -1718,6 +1760,12 @@ async fn activate_account(
 ) -> PdsResult<Json<serde_json::Value>> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Status, AccountAction::Manage),
+        "manage the account's status",
+    )?;
+
     // Resolve the DID: try JWT first; fall back to {handle, password}.
     let did =
         match middleware::require_auth(State(ctx.clone()), headers).await {
@@ -1850,6 +1898,11 @@ async fn deactivate_account(
     headers: HeaderMap,
     body: Option<Json<DeactivateAccountRequest>>,
 ) -> PdsResult<Json<serde_json::Value>> {
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Status, AccountAction::Manage),
+        "manage the account's status",
+    )?;
     // Require authentication.
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
@@ -1917,6 +1970,11 @@ async fn check_account_status(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<Json<CheckAccountStatusResponse>> {
+    middleware::require_oauth_permission(
+        &headers,
+        |s| s.allows_account(AccountAttr::Status, AccountAction::Read),
+        "read the account's status",
+    )?;
     // Require authentication
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
 
@@ -2476,5 +2534,99 @@ mod invite_tests {
         .await
         .unwrap_err();
         assert!(matches!(bad, PdsError::InvalidInviteCode(_)), "{bad:?}");
+    }
+}
+
+#[cfg(test)]
+mod oauth_scope_tests {
+    //! #478: OAuth clients see and change account details only as granted.
+    use super::*;
+    use crate::api::middleware::oauth_gate_headers;
+    use axum::extract::State;
+    use axum::Json;
+
+    async fn ctx_with_account() -> (AppContext, String) {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let account = ctx
+            .account_manager
+            .create_account(
+                "scopes.localhost".to_string(),
+                Some("scopes@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        (ctx, account.did)
+    }
+
+    #[tokio::test]
+    async fn get_session_shows_email_only_when_granted() {
+        let (ctx, did) = ctx_with_account().await;
+
+        let hidden = get_session(
+            State(ctx.clone()),
+            oauth_gate_headers(&did, "atproto transition:generic"),
+        )
+        .await
+        .expect("OAuth clients can call getSession")
+        .0;
+        assert_eq!(hidden.did, did);
+        assert_eq!(hidden.email, None);
+        assert_eq!(hidden.email_confirmed, None);
+        let wire = serde_json::to_value(&hidden).unwrap();
+        assert!(wire.get("email").is_none(), "omitted, not null: {wire}");
+
+        for granted in ["atproto transition:email", "atproto account:email"] {
+            let shown = get_session(State(ctx.clone()), oauth_gate_headers(&did, granted))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(
+                shown.email.as_deref(),
+                Some("scopes@example.com"),
+                "{granted}"
+            );
+            assert_eq!(shown.email_confirmed, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn account_operations_follow_the_grant() {
+        let (ctx, did) = ctx_with_account().await;
+        let generic = oauth_gate_headers(&did, "atproto transition:generic");
+
+        // No OAuth scope manages app passwords.
+        let app_pw = create_app_password(
+            State(ctx.clone()),
+            oauth_gate_headers(
+                &did,
+                "atproto transition:generic account:status?action=manage",
+            ),
+            Json(CreateAppPasswordRequest {
+                name: "x".to_string(),
+                privileged: None,
+            }),
+        )
+        .await;
+        assert!(matches!(app_pw, Err(PdsError::Authorization(_))));
+
+        // Deactivation needs account:status?action=manage.
+        let deactivate = deactivate_account(State(ctx.clone()), generic.clone(), None).await;
+        assert!(matches!(deactivate, Err(PdsError::Authorization(_))));
+
+        // Reading the status needs account:status (read is enough).
+        assert!(matches!(
+            check_account_status(State(ctx.clone()), generic).await,
+            Err(PdsError::Authorization(_))
+        ));
+        let _status = check_account_status(
+            State(ctx.clone()),
+            oauth_gate_headers(&did, "atproto account:status"),
+        )
+        .await
+        .expect("account:status reads the status");
     }
 }

@@ -60,7 +60,11 @@ pub struct SessionResponse {
 pub struct SessionInfo {
     pub did: String,
     pub handle: String,
+    /// Omitted (not `null`) when absent or not granted to an OAuth client:
+    /// the lexicon field is an optional string.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub email_confirmed: Option<bool>,
     /// The caller's operator role (`"moderator"` / `"admin"` / `"superadmin"`)
     /// when the DID holds a non-revoked `admin_roles` grant; absent for regular

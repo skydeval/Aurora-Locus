@@ -167,6 +167,27 @@ impl FromRequestParts<AppContext> for AuthContext {
 #[derive(Debug, Clone)]
 pub struct AuthContextForwarded {
     pub did: String,
+    /// For an atproto-OAuth token (verified by the OAuth gate), the scopes it
+    /// was granted; `None` for sessions and service-auth tokens.
+    pub oauth_scopes: Option<crate::oauth::atproto::scope::ScopeSet>,
+}
+
+impl AuthContextForwarded {
+    /// Require that the caller may change the account's identity `attr`:
+    /// always for sessions, and for an atproto-OAuth token only with a granted
+    /// `identity:` permission covering it (#478).
+    pub fn require_identity(
+        &self,
+        attr: crate::oauth::atproto::scope::IdentityAttr,
+    ) -> Result<(), PdsError> {
+        match &self.oauth_scopes {
+            Some(scopes) if !scopes.allows_identity(attr) => Err(PdsError::Authorization(
+                "this OAuth token was not granted permission to change the account's identity"
+                    .to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -177,6 +198,13 @@ impl FromRequestParts<AppContext> for AuthContextForwarded {
         parts: &mut Parts,
         ctx: &AppContext,
     ) -> Result<Self, Self::Rejection> {
+        // An atproto-OAuth token the gate already verified (DPoP + device).
+        if let Some(did) = crate::api::middleware::oauth_resolved_did(&parts.headers) {
+            return Ok(Self {
+                did,
+                oauth_scopes: crate::api::middleware::oauth_granted_scopes(&parts.headers),
+            });
+        }
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
         let service_did = ctx.service_did().to_string();
@@ -193,6 +221,7 @@ impl FromRequestParts<AppContext> for AuthContextForwarded {
             .await?;
         Ok(Self {
             did: auth.did().to_string(),
+            oauth_scopes: None,
         })
     }
 }
@@ -1218,6 +1247,7 @@ async fn route_opaque_oauth(
             Ok(crate::api::middleware::UnifiedAuthContext::OAuth {
                 did: token_info.did,
                 scope: token_info.scope,
+                granted: None,
             })
         }
         Err(e) => {
@@ -2225,6 +2255,25 @@ mod admin_auth_third_path_tests {
         assert!(super::validate_bearer_oauth_token(&ctx, plain)
             .await
             .is_ok());
+    }
+
+    #[test]
+    fn identity_changes_need_an_identity_grant() {
+        use crate::oauth::atproto::scope::{IdentityAttr, ScopeSet};
+        let forwarded = |granted: Option<&str>| super::AuthContextForwarded {
+            did: "did:web:ident.example.com".to_string(),
+            oauth_scopes: granted.map(ScopeSet::from_granted),
+        };
+        // Sessions may change their identity.
+        assert!(forwarded(None).require_identity(IdentityAttr::All).is_ok());
+        // transition:generic grants no identity changes (#478).
+        let generic = forwarded(Some("atproto transition:generic"));
+        assert!(generic.require_identity(IdentityAttr::Handle).is_err());
+        let handle = forwarded(Some("atproto identity:handle"));
+        assert!(handle.require_identity(IdentityAttr::Handle).is_ok());
+        assert!(handle.require_identity(IdentityAttr::All).is_err());
+        let all = forwarded(Some("atproto identity:*"));
+        assert!(all.require_identity(IdentityAttr::All).is_ok());
     }
 
     #[tokio::test]

@@ -3,9 +3,15 @@
 //! Served by the PDS from `account_pref`, never proxied: preferences belong to
 //! the account, and the reference PDS keeps them locally for the same reason.
 //! Accepts any account session (password, app password or OAuth); app-password
-//! sessions can neither see nor set full-access-only preferences.
+//! sessions can neither see nor set full-access-only preferences. An OAuth
+//! client needs permission to call the method on the AppView, as the reference
+//! PDS requires (`transition:generic` includes it).
 
-use crate::{api::middleware::AccountAuth, context::AppContext, error::PdsResult};
+use crate::{
+    api::{middleware::AccountAuth, service_proxy},
+    context::AppContext,
+    error::PdsResult,
+};
 use axum::{
     extract::State,
     routing::{get, post},
@@ -31,10 +37,23 @@ pub struct Preferences {
     pub preferences: Vec<serde_json::Value>,
 }
 
+/// For an OAuth client, require permission to call `lxm` on the AppView.
+async fn require_permission(ctx: &AppContext, auth: &AccountAuth, lxm: &str) -> PdsResult<()> {
+    if auth.oauth_scopes.is_none() {
+        return Ok(());
+    }
+    // Without an AppView only a permission for any service can match.
+    let aud = service_proxy::appview_service(ctx)
+        .await
+        .unwrap_or_default();
+    auth.require_rpc(lxm, &aud)
+}
+
 async fn get_preferences(
     State(ctx): State<AppContext>,
     auth: AccountAuth,
 ) -> PdsResult<Json<Preferences>> {
+    require_permission(&ctx, &auth, "app.bsky.actor.getPreferences").await?;
     let preferences = ctx
         .account_manager
         .get_preferences(&auth.did, NAMESPACE, auth.full_access)
@@ -47,6 +66,7 @@ async fn put_preferences(
     auth: AccountAuth,
     Json(body): Json<Preferences>,
 ) -> PdsResult<()> {
+    require_permission(&ctx, &auth, "app.bsky.actor.putPreferences").await?;
     ctx.account_manager
         .put_preferences(&auth.did, NAMESPACE, body.preferences, auth.full_access)
         .await
@@ -231,5 +251,46 @@ mod tests {
         assert!(AccountAuth::from_request_parts(&mut parts, &ctx)
             .await
             .is_err());
+    }
+
+    fn oauth_auth(did: &str, scope: &str) -> AccountAuth {
+        AccountAuth {
+            did: did.to_string(),
+            full_access: true,
+            privileged: true,
+            oauth_scopes: Some(crate::oauth::atproto::scope::ScopeSet::from_granted(scope)),
+        }
+    }
+
+    /// An OAuth client needs a grant that covers preferences (#478).
+    #[tokio::test]
+    async fn oauth_clients_need_a_scope_covering_preferences() {
+        let (ctx, did) = ctx_with_account().await;
+
+        let base_only = oauth_auth(&did, "atproto");
+        assert!(matches!(
+            get_preferences(State(ctx.clone()), base_only.clone()).await,
+            Err(PdsError::Authorization(_))
+        ));
+        assert!(matches!(
+            put_preferences(State(ctx.clone()), base_only, prefs(vec![])).await,
+            Err(PdsError::Authorization(_))
+        ));
+
+        let generic = oauth_auth(&did, "atproto transition:generic");
+        let values =
+            vec![json!({"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false})];
+        put_preferences(State(ctx.clone()), generic.clone(), prefs(values.clone()))
+            .await
+            .expect("transition:generic covers putPreferences");
+        assert_eq!(stored(&ctx, &generic).await, values);
+
+        // A granular grant for any service covers the one method it names.
+        let granular = oauth_auth(&did, "atproto rpc:app.bsky.actor.getPreferences?aud=*");
+        assert_eq!(stored(&ctx, &granular).await, values);
+        assert!(matches!(
+            put_preferences(State(ctx.clone()), granular, prefs(vec![])).await,
+            Err(PdsError::Authorization(_))
+        ));
     }
 }

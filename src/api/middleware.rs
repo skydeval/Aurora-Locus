@@ -8,7 +8,7 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
-    oauth::AtProtoScope,
+    oauth::{atproto::scope::ScopeSet as AtprotoScopeSet, AtProtoScope},
 };
 use axum::{
     extract::{Request, State},
@@ -49,9 +49,13 @@ const OAUTH_RESOLVED_DID_HEADER: &str = "x-aurora-oauth-resolved-did";
 /// the OAuth path resolved to. ε.3 stubs this to the internal all-scope
 /// (`atproto:*`); ε.4's scope-translation replaces the stub.
 const OAUTH_RESOLVED_SCOPE_HEADER: &str = "x-aurora-oauth-resolved-scope";
+/// Companion to [`OAUTH_RESOLVED_DID_HEADER`] carrying the atproto-OAuth scope
+/// string the token was granted (#478), which the granular permission checks
+/// ([`AtprotoScopeSet`]) evaluate.
+const OAUTH_RESOLVED_GRANTED_HEADER: &str = "x-aurora-oauth-granted-scope";
 
 /// Read the gate-resolved atproto-OAuth DID, if the middleware authenticated one.
-fn oauth_resolved_did(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn oauth_resolved_did(headers: &HeaderMap) -> Option<String> {
     headers
         .get(OAUTH_RESOLVED_DID_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -64,6 +68,67 @@ fn oauth_resolved_scope(headers: &HeaderMap) -> Option<String> {
         .get(OAUTH_RESOLVED_SCOPE_HEADER)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// The atproto-OAuth scopes granted to the gate-resolved token, if the
+/// request was authenticated by an atproto-OAuth token.
+pub fn oauth_granted_scopes(headers: &HeaderMap) -> Option<AtprotoScopeSet> {
+    oauth_resolved_did(headers)?;
+    let granted = headers
+        .get(OAUTH_RESOLVED_GRANTED_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    Some(AtprotoScopeSet::from_granted(granted))
+}
+
+/// For a request authenticated by an atproto-OAuth token, require that its
+/// granted scopes pass `allowed`; `what` names the missing permission in the
+/// 403. Requests authenticated any other way pass: their access is decided by
+/// the session type as before.
+pub fn require_oauth_permission(
+    headers: &HeaderMap,
+    allowed: impl FnOnce(&AtprotoScopeSet) -> bool,
+    what: &str,
+) -> PdsResult<()> {
+    match oauth_granted_scopes(headers) {
+        Some(scopes) if !allowed(&scopes) => Err(PdsError::Authorization(format!(
+            "this OAuth token was not granted permission to {what}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Test support: the headers [`atproto_oauth_gate`] sets for a verified
+/// atproto-OAuth token acting for `did` with the `granted` scopes.
+#[cfg(test)]
+pub(crate) fn oauth_gate_headers(did: &str, granted: &str) -> HeaderMap {
+    let internal = crate::oauth::atproto::scope::to_internal_scope(granted);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        OAUTH_RESOLVED_DID_HEADER,
+        HeaderValue::from_str(did).unwrap(),
+    );
+    headers.insert(
+        OAUTH_RESOLVED_SCOPE_HEADER,
+        HeaderValue::from_str(&internal).unwrap(),
+    );
+    headers.insert(
+        OAUTH_RESOLVED_GRANTED_HEADER,
+        HeaderValue::from_str(granted).unwrap(),
+    );
+    headers
+}
+
+/// Refuse a request authenticated by an atproto-OAuth token: for account
+/// operations no OAuth scope grants (the reference PDS keeps them to full
+/// sessions).
+pub fn refuse_oauth(headers: &HeaderMap, what: &str) -> PdsResult<()> {
+    if oauth_resolved_did(headers).is_some() {
+        return Err(PdsError::Authorization(format!(
+            "{what} is not available to OAuth clients"
+        )));
+    }
+    Ok(())
 }
 
 /// Arc 2 Phase ε.3 — the general-XRPC atproto-OAuth bearer gate (registry-
@@ -81,9 +146,10 @@ fn oauth_resolved_scope(headers: &HeaderMap) -> Option<String> {
 /// failure fails closed (the request does not fall through to the session
 /// path). A request with no `DPoP`-scheme auth passes through untouched.
 ///
-/// Scope is STUBBED at ε.3: a bearer carrying the `atproto` scope is admitted
-/// broadly (mapped to the internal `atproto:*` all-scope so handler-side
-/// `enforce_scope` passes). ε.4's scope-translation replaces the stub.
+/// Scope: the bearer must carry the base `atproto` scope. The gate passes on
+/// both the token's grants in the internal vocabulary (for `enforce_scope`)
+/// and the atproto scope string it was granted, which the handlers check
+/// against their collection, blob type, method or account attribute (#478).
 pub async fn atproto_oauth_gate(
     State(ctx): State<AppContext>,
     mut req: Request,
@@ -92,6 +158,7 @@ pub async fn atproto_oauth_gate(
     // Spoof defense: never trust an inbound value of the internal headers.
     req.headers_mut().remove(OAUTH_RESOLVED_DID_HEADER);
     req.headers_mut().remove(OAUTH_RESOLVED_SCOPE_HEADER);
+    req.headers_mut().remove(OAUTH_RESOLVED_GRANTED_HEADER);
 
     let Some(token) = extract_dpop_bearer(req.headers()) else {
         // Not an atproto-OAuth bearer — the Bearer/JWT session path handles it.
@@ -110,11 +177,16 @@ pub async fn atproto_oauth_gate(
         .map(|s| s.to_string());
 
     match resolve_atproto_oauth(&ctx, &method, &htu, dpop_proof.as_deref(), &token).await {
-        Ok((did, scope)) => {
-            match (HeaderValue::from_str(&did), HeaderValue::from_str(&scope)) {
-                (Ok(dv), Ok(sv)) => {
+        Ok(resolved) => {
+            match (
+                HeaderValue::from_str(&resolved.did),
+                HeaderValue::from_str(&resolved.internal_scope),
+                HeaderValue::from_str(&resolved.granted_scope),
+            ) {
+                (Ok(dv), Ok(sv), Ok(gv)) => {
                     req.headers_mut().insert(OAUTH_RESOLVED_DID_HEADER, dv);
                     req.headers_mut().insert(OAUTH_RESOLVED_SCOPE_HEADER, sv);
+                    req.headers_mut().insert(OAUTH_RESOLVED_GRANTED_HEADER, gv);
                     next.run(req).await
                 }
                 _ => PdsError::Internal("resolved DID/scope not header-safe".to_string())
@@ -126,16 +198,26 @@ pub async fn atproto_oauth_gate(
     }
 }
 
+/// What an atproto-OAuth token resolved to at the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedOAuth {
+    /// The account the token acts for.
+    did: String,
+    /// The token's grants in the internal capability vocabulary.
+    internal_scope: String,
+    /// The atproto-OAuth scope string the token was granted.
+    granted_scope: String,
+}
+
 /// The gate's validation core — takes owned request bits (never a `&Request`,
-/// which would make the caller's future non-`Send`). Returns
-/// `(did, internal_scope)` on success.
+/// which would make the caller's future non-`Send`).
 async fn resolve_atproto_oauth(
     ctx: &AppContext,
     method: &str,
     htu: &str,
     dpop_proof: Option<&str>,
     token: &str,
-) -> PdsResult<(String, String)> {
+) -> PdsResult<ResolvedOAuth> {
     // 1. bearer → token row (β.1 access_token_hash lookup; missing/revoked/
     //    expired → Authentication error → 401).
     let token_info = crate::auth::validate_oauth_token(ctx, token).await?;
@@ -181,7 +263,11 @@ async fn resolve_atproto_oauth(
         ));
     }
     let internal_scope = crate::oauth::atproto::scope::to_internal_scope(&token_info.scope);
-    Ok((token_info.did, internal_scope))
+    Ok(ResolvedOAuth {
+        did: token_info.did,
+        internal_scope,
+        granted_scope: token_info.scope,
+    })
 }
 
 /// Authenticate request and add session to extensions
@@ -275,7 +361,14 @@ pub enum UnifiedAuthContext {
     CrossPDS { did: String },
 
     /// OAuth 2.1 authenticated user with scopes
-    OAuth { did: String, scope: String },
+    OAuth {
+        did: String,
+        /// The grants in the internal capability vocabulary.
+        scope: String,
+        /// The atproto-OAuth scopes granted, for a token from the atproto
+        /// provider (`None` for a legacy-provider token).
+        granted: Option<AtprotoScopeSet>,
+    },
 }
 
 impl UnifiedAuthContext {
@@ -310,6 +403,14 @@ impl UnifiedAuthContext {
             _ => None,
         }
     }
+
+    /// The atproto-OAuth scopes granted, for an atproto-OAuth token.
+    pub fn granted_scopes(&self) -> Option<&AtprotoScopeSet> {
+        match self {
+            UnifiedAuthContext::OAuth { granted, .. } => granted.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Require authentication — Arc 12 §5.3.3 tuple-routed, §5.3.4
@@ -325,7 +426,12 @@ pub async fn require_auth_unified(
     // (`atproto:*`) until ε.4's scope-translation.
     if let Some(did) = oauth_resolved_did(&headers) {
         let scope = oauth_resolved_scope(&headers).unwrap_or_default();
-        return Ok(UnifiedAuthContext::OAuth { did, scope });
+        let granted = oauth_granted_scopes(&headers);
+        return Ok(UnifiedAuthContext::OAuth {
+            did,
+            scope,
+            granted,
+        });
     }
 
     let token = extract_bearer_token(&headers).ok_or_else(|| {
@@ -361,6 +467,24 @@ pub struct AccountAuth {
     /// Full access, or an app password created as privileged. The reference
     /// PDS requires this for proxied `chat.bsky.*` calls (#471).
     pub privileged: bool,
+    /// For an atproto-OAuth token, the scopes it was granted; what it may do
+    /// is decided by these (#478). `None` for sessions.
+    pub oauth_scopes: Option<AtprotoScopeSet>,
+}
+
+impl AccountAuth {
+    /// Require that this caller may call `lxm` on the service `aud`
+    /// (`did#service`) in the account's name. Sessions may (subject to the
+    /// app-password rules their callers apply); an atproto-OAuth token needs a
+    /// granted rpc permission (or a transition scope that includes it).
+    pub fn require_rpc(&self, lxm: &str, aud: &str) -> PdsResult<()> {
+        match &self.oauth_scopes {
+            Some(scopes) if !scopes.allows_rpc(lxm, aud) => Err(PdsError::Authorization(format!(
+                "this OAuth token was not granted permission to call {lxm} on {aud}"
+            ))),
+            _ => Ok(()),
+        }
+    }
 }
 
 #[axum::async_trait]
@@ -382,12 +506,14 @@ impl axum::extract::FromRequestParts<AppContext> for AccountAuth {
                     did: session.did,
                     full_access: !session.is_app_password,
                     privileged,
+                    oauth_scopes: None,
                 })
             }
-            UnifiedAuthContext::OAuth { did, .. } => Ok(AccountAuth {
+            UnifiedAuthContext::OAuth { did, granted, .. } => Ok(AccountAuth {
                 did,
                 full_access: true,
                 privileged: true,
+                oauth_scopes: granted,
             }),
             UnifiedAuthContext::CrossPDS { .. } => Err(PdsError::Authentication(
                 "This endpoint requires an account session on this PDS".to_string(),
@@ -407,6 +533,17 @@ pub async fn require_auth_forwarded(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
 ) -> PdsResult<UnifiedAuthContext> {
+    // An atproto-OAuth token the gate already verified (DPoP + registered
+    // device); without this, OAuth clients could not call getSession (#478).
+    if let Some(did) = oauth_resolved_did(&headers) {
+        let scope = oauth_resolved_scope(&headers).unwrap_or_default();
+        let granted = oauth_granted_scopes(&headers);
+        return Ok(UnifiedAuthContext::OAuth {
+            did,
+            scope,
+            granted,
+        });
+    }
     let token = extract_bearer_token(&headers).ok_or_else(|| {
         warn!("authentication_failed: missing authorization header");
         metrics::record_error("AuthenticationFailed", "middleware");
@@ -446,72 +583,66 @@ pub async fn check_account_moderation(
             .validate_access_token_with_ip(&token, current_ip)
             .await
         {
-            // Check if this is an admin - admins bypass moderation checks
-            let is_admin = ctx
-                .admin_role_manager
-                .get_role(&session.did)
-                .await
-                .unwrap_or(None)
-                .is_some();
-
-            if !is_admin {
-                // Check if account is taken down (ignore database errors)
-                match ctx.moderation_manager.is_taken_down(&session.did).await {
-                    Ok(true) => {
-                        warn!(
-                            did = %session.did,
-                            "moderation_blocked: account_taken_down"
-                        );
-                        return Err(PdsError::AccountTakenDown(
-                            "Account has been taken down due to terms of service violations"
-                                .to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        // Log but don't fail the request if moderation check fails
-                        warn!(
-                            did = %session.did,
-                            error = %e,
-                            "moderation_check_failed: is_taken_down"
-                        );
-                    }
-                    Ok(false) => {}
-                }
-
-                // Check if account is suspended (ignore database errors)
-                match ctx.moderation_manager.is_suspended(&session.did).await {
-                    Ok(true) => {
-                        warn!(
-                            did = %session.did,
-                            "moderation_blocked: account_suspended"
-                        );
-                        return Err(PdsError::AccountSuspended(
-                            "Account is currently suspended".to_string(),
-                        ));
-                    }
-                    Err(e) => {
-                        // Log but don't fail the request if moderation check fails
-                        warn!(
-                            did = %session.did,
-                            error = %e,
-                            "moderation_check_failed: is_suspended"
-                        );
-                    }
-                    Ok(false) => {}
-                }
-            } else {
-                info!(
-                    did = %session.did,
-                    "admin_access_granted"
-                );
-            }
+            enforce_account_moderation(&ctx, &session.did).await?;
 
             // Add session to request extensions for downstream use
             req.extensions_mut().insert(session);
         }
+    } else if let Some(did) = oauth_resolved_did(&headers) {
+        // An atproto-OAuth token the gate already verified: the account it
+        // acts for is held to the same takedown / suspension rules (#482).
+        enforce_account_moderation(&ctx, &did).await?;
     }
 
     Ok(next.run(req).await)
+}
+
+/// Refuse a request acting for `did` when the account is taken down or
+/// suspended. Admins are exempt; a failed moderation lookup is logged and does
+/// not fail the request.
+async fn enforce_account_moderation(ctx: &AppContext, did: &str) -> PdsResult<()> {
+    // Check if this is an admin - admins bypass moderation checks
+    let is_admin = ctx
+        .admin_role_manager
+        .get_role(did)
+        .await
+        .unwrap_or(None)
+        .is_some();
+    if is_admin {
+        info!(did = %did, "admin_access_granted");
+        return Ok(());
+    }
+
+    // Check if account is taken down (ignore database errors)
+    match ctx.moderation_manager.is_taken_down(did).await {
+        Ok(true) => {
+            warn!(did = %did, "moderation_blocked: account_taken_down");
+            return Err(PdsError::AccountTakenDown(
+                "Account has been taken down due to terms of service violations".to_string(),
+            ));
+        }
+        Err(e) => {
+            // Log but don't fail the request if moderation check fails
+            warn!(did = %did, error = %e, "moderation_check_failed: is_taken_down");
+        }
+        Ok(false) => {}
+    }
+
+    // Check if account is suspended (ignore database errors)
+    match ctx.moderation_manager.is_suspended(did).await {
+        Ok(true) => {
+            warn!(did = %did, "moderation_blocked: account_suspended");
+            return Err(PdsError::AccountSuspended(
+                "Account is currently suspended".to_string(),
+            ));
+        }
+        Err(e) => {
+            // Log but don't fail the request if moderation check fails
+            warn!(did = %did, error = %e, "moderation_check_failed: is_suspended");
+        }
+        Ok(false) => {}
+    }
+    Ok(())
 }
 
 /// Request ID for tracing
@@ -882,6 +1013,40 @@ pub fn enforce_scope(auth: &UnifiedAuthContext, required_scope: &AtProtoScope) -
             // Legacy authentication types have implicit full access
             Ok(())
         }
+    }
+}
+
+/// Require that `auth` may `action` records in `collection`. An atproto-OAuth
+/// token needs a granted `repo:` permission (or `transition:generic`) naming
+/// the collection and action (#478); other OAuth tokens are held to the
+/// internal scope `internal`, and sessions have full access as before.
+pub fn enforce_repo_permission(
+    auth: &UnifiedAuthContext,
+    collection: &str,
+    action: crate::oauth::atproto::scope::RepoAction,
+    internal: &AtProtoScope,
+) -> PdsResult<()> {
+    match auth.granted_scopes() {
+        Some(scopes) if scopes.allows_repo(collection, action) => Ok(()),
+        Some(_) => Err(PdsError::Authorization(format!(
+            "this OAuth token was not granted permission to {} records in {collection}",
+            action.as_str()
+        ))),
+        None => enforce_scope(auth, internal),
+    }
+}
+
+/// Require that `auth` may upload a blob of type `mime`. An atproto-OAuth
+/// token needs a granted `blob:` permission accepting the type (or
+/// `transition:generic`) (#478); other callers as [`enforce_scope`] with
+/// blob upload.
+pub fn enforce_blob_permission(auth: &UnifiedAuthContext, mime: &str) -> PdsResult<()> {
+    match auth.granted_scopes() {
+        Some(scopes) if scopes.allows_blob(mime) => Ok(()),
+        Some(_) => Err(PdsError::Authorization(format!(
+            "this OAuth token was not granted permission to upload {mime} files"
+        ))),
+        None => enforce_scope(auth, &AtProtoScope::BlobUpload),
     }
 }
 
@@ -1463,11 +1628,15 @@ mod epsilon_oauth_gate_tests {
         let ath = crate::federation::dpop::compute_ath(&bearer);
         let proof = dpop_proof(&sk, &jwk, &htu, &ath);
 
-        let (rdid, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+        let resolved = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
             .await
             .expect("resolve");
-        assert_eq!(rdid, did);
-        assert_eq!(rscope, "atproto:repo.* atproto:blob.upload"); // ε.4 scope-α
+        assert_eq!(resolved.did, did);
+        assert_eq!(
+            resolved.internal_scope,
+            "atproto:repo.* atproto:blob.upload"
+        ); // ε.4 scope-α
+        assert_eq!(resolved.granted_scope, "atproto transition:generic");
     }
 
     #[test]
@@ -1479,6 +1648,7 @@ mod epsilon_oauth_gate_tests {
         let generic = UnifiedAuthContext::OAuth {
             did: "did:web:x.example.com".to_string(),
             scope: to_internal_scope("atproto transition:generic"),
+            granted: None,
         };
         // transition:generic admits the repo-write family + blob upload…
         assert!(enforce_scope(&generic, &AtProtoScope::RepoCreate).is_ok());
@@ -1491,6 +1661,7 @@ mod epsilon_oauth_gate_tests {
         let base = UnifiedAuthContext::OAuth {
             did: "did:web:y.example.com".to_string(),
             scope: to_internal_scope("atproto"),
+            granted: None,
         };
         assert!(enforce_scope(&base, &AtProtoScope::RepoCreate).is_err());
         assert!(enforce_scope(&base, &AtProtoScope::BlobUpload).is_err());
@@ -1507,10 +1678,10 @@ mod epsilon_oauth_gate_tests {
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
         let proof = dpop_proof(&sk, &jwk, &htu, &ath);
-        let (_did, rscope) = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+        let resolved = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
             .await
             .expect("resolve");
-        assert_eq!(rscope, "");
+        assert_eq!(resolved.internal_scope, "");
     }
 
     #[tokio::test]
@@ -1563,5 +1734,204 @@ mod epsilon_oauth_gate_tests {
         let proof = dpop_proof(&sk, &jwk, &htu, &ath);
         let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.unwrap_err();
         assert!(matches!(err, PdsError::Authorization(_)));
+    }
+}
+
+#[cfg(test)]
+mod oauth_permission_tests {
+    //! #478: what an atproto-OAuth token may do follows its granted scopes.
+    use super::*;
+    use crate::oauth::atproto::scope::{AccountAction, AccountAttr, RepoAction};
+    use axum::extract::FromRequestParts;
+
+    const DID: &str = "did:web:perm.example.com";
+    const APPVIEW: &str = "did:web:api.bsky.app#bsky_appview";
+
+    async fn ctx() -> AppContext {
+        crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await
+    }
+
+    async fn account_auth(ctx: &AppContext, granted: &str) -> AccountAuth {
+        let mut req = axum::http::Request::builder().body(()).unwrap();
+        *req.headers_mut() = oauth_gate_headers(DID, granted);
+        let (mut parts, _) = req.into_parts();
+        AccountAuth::from_request_parts(&mut parts, ctx)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn permission_checks_apply_only_to_oauth_tokens() {
+        let email =
+            |s: &AtprotoScopeSet| s.allows_account(AccountAttr::Email, AccountAction::Manage);
+        // Sessions (no gate headers) are unaffected.
+        assert!(require_oauth_permission(&HeaderMap::new(), email, "x").is_ok());
+        assert!(refuse_oauth(&HeaderMap::new(), "x").is_ok());
+
+        let generic = oauth_gate_headers(DID, "atproto transition:generic");
+        assert!(matches!(
+            require_oauth_permission(&generic, email, "manage email"),
+            Err(PdsError::Authorization(_))
+        ));
+        assert!(matches!(
+            refuse_oauth(&generic, "App passwords"),
+            Err(PdsError::Authorization(_))
+        ));
+        let granted = oauth_gate_headers(DID, "atproto account:email?action=manage");
+        assert!(require_oauth_permission(&granted, email, "manage email").is_ok());
+    }
+
+    #[tokio::test]
+    async fn resolvers_carry_the_granted_scopes() {
+        let ctx = ctx().await;
+        let headers = oauth_gate_headers(DID, "atproto transition:email");
+        for auth in [
+            require_auth_unified(State(ctx.clone()), headers.clone())
+                .await
+                .unwrap(),
+            require_auth_forwarded(State(ctx.clone()), headers.clone())
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(auth.did(), DID);
+            let granted = auth.granted_scopes().expect("atproto-OAuth scopes");
+            assert_eq!(granted.to_canonical_string(), "atproto transition:email");
+        }
+        let auth = account_auth(&ctx, "atproto transition:email").await;
+        assert_eq!(auth.did, DID);
+        assert!(auth.oauth_scopes.is_some());
+    }
+
+    #[tokio::test]
+    async fn rpc_calls_need_a_covering_grant() {
+        let ctx = ctx().await;
+        let base = account_auth(&ctx, "atproto").await;
+        assert!(base
+            .require_rpc("app.bsky.feed.getTimeline", APPVIEW)
+            .is_err());
+
+        let generic = account_auth(&ctx, "atproto transition:generic").await;
+        assert!(generic
+            .require_rpc("app.bsky.feed.getTimeline", APPVIEW)
+            .is_ok());
+        assert!(generic
+            .require_rpc(
+                "chat.bsky.convo.listConvos",
+                "did:web:api.bsky.chat#bsky_chat"
+            )
+            .is_err());
+
+        let chat = account_auth(&ctx, "atproto transition:chat.bsky").await;
+        assert!(chat
+            .require_rpc(
+                "chat.bsky.convo.listConvos",
+                "did:web:api.bsky.chat#bsky_chat"
+            )
+            .is_ok());
+
+        let one = account_auth(
+            &ctx,
+            "atproto rpc:app.bsky.feed.getTimeline?aud=did:web:api.bsky.app%23bsky_appview",
+        )
+        .await;
+        assert!(one
+            .require_rpc("app.bsky.feed.getTimeline", APPVIEW)
+            .is_ok());
+        assert!(one.require_rpc("app.bsky.feed.getFeed", APPVIEW).is_err());
+        assert!(one
+            .require_rpc(
+                "app.bsky.feed.getTimeline",
+                "did:web:other.example#bsky_appview"
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn repo_and_blob_writes_follow_the_grant() {
+        let ctx = ctx().await;
+        let auth = |granted: &str| {
+            let headers = oauth_gate_headers(DID, granted);
+            let ctx = ctx.clone();
+            async move { require_auth_unified(State(ctx), headers).await.unwrap() }
+        };
+        let post = "app.bsky.feed.post";
+
+        let generic = auth("atproto transition:generic").await;
+        for action in [RepoAction::Create, RepoAction::Update, RepoAction::Delete] {
+            assert!(
+                enforce_repo_permission(&generic, post, action, &AtProtoScope::RepoAll).is_ok()
+            );
+        }
+        assert!(enforce_blob_permission(&generic, "video/mp4").is_ok());
+
+        let granular = auth("atproto repo:app.bsky.feed.post?action=create blob:image/*").await;
+        assert!(enforce_repo_permission(
+            &granular,
+            post,
+            RepoAction::Create,
+            &AtProtoScope::RepoCreate
+        )
+        .is_ok());
+        assert!(enforce_repo_permission(
+            &granular,
+            post,
+            RepoAction::Delete,
+            &AtProtoScope::RepoDelete
+        )
+        .is_err());
+        assert!(enforce_repo_permission(
+            &granular,
+            "app.bsky.feed.like",
+            RepoAction::Create,
+            &AtProtoScope::RepoCreate
+        )
+        .is_err());
+        assert!(enforce_blob_permission(&granular, "image/png").is_ok());
+        assert!(enforce_blob_permission(&granular, "video/mp4").is_err());
+
+        let base = auth("atproto").await;
+        assert!(enforce_repo_permission(
+            &base,
+            post,
+            RepoAction::Create,
+            &AtProtoScope::RepoCreate
+        )
+        .is_err());
+        assert!(enforce_blob_permission(&base, "image/png").is_err());
+    }
+
+    /// #482: a taken-down account cannot act through an OAuth client either.
+    #[tokio::test]
+    async fn moderation_applies_to_oauth_requests() {
+        let ctx = ctx().await;
+        let account = ctx
+            .account_manager
+            .create_account(
+                "moderated.localhost".to_string(),
+                None,
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(enforce_account_moderation(&ctx, &account.did).await.is_ok());
+
+        ctx.moderation_manager
+            .apply_action(crate::admin::moderation::ApplyActionParams {
+                did: &account.did,
+                action: crate::admin::moderation::ModerationAction::Takedown,
+                reason: "test",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            enforce_account_moderation(&ctx, &account.did).await,
+            Err(PdsError::AccountTakenDown(_))
+        ));
     }
 }

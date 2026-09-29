@@ -4,7 +4,6 @@ use crate::{
     blob_store::BlobUploadResponse,
     context::AppContext,
     error::{PdsError, PdsResult},
-    oauth::AtProtoScope,
 };
 use axum::{
     body::Bytes,
@@ -36,9 +35,6 @@ async fn upload_blob(
     // Require authentication (OAuth, local, or cross-PDS) - Phase 6
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
 
-    // Enforce OAuth scope if using OAuth authentication
-    middleware::enforce_scope(&auth, &AtProtoScope::BlobUpload)?;
-
     let auth_did = auth.did();
 
     // Get Content-Type from header
@@ -46,6 +42,16 @@ async fn upload_blob(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
+
+    // Enforce OAuth scope if using OAuth authentication; an atproto-OAuth
+    // token must accept the declared type, as the reference PDS checks.
+    let declared = mime_type
+        .as_deref()
+        .and_then(|m| m.split(';').next())
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .unwrap_or("application/octet-stream");
+    middleware::enforce_blob_permission(&auth, declared)?;
 
     // Convert Bytes to Vec<u8>
     let data = body.to_vec();

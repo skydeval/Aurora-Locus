@@ -148,7 +148,20 @@ async fn import_repo(
     body: Body,
 ) -> Result<axum::response::Response, PdsError> {
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers.clone()).await?;
-    middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?;
+    match auth.granted_scopes() {
+        // An atproto-OAuth client needs account:repo?action=manage, as the
+        // reference PDS requires; transition:generic does not include it (#478).
+        Some(scopes) => {
+            use crate::oauth::atproto::scope::{AccountAction, AccountAttr};
+            if !scopes.allows_account(AccountAttr::Repo, AccountAction::Manage) {
+                return Err(PdsError::Authorization(
+                    "this OAuth token was not granted permission to import a repository"
+                        .to_string(),
+                ));
+            }
+        }
+        None => middleware::enforce_scope(&auth, &AtProtoScope::RepoAll)?,
+    }
     let importing_did = auth.did().to_string();
 
     // §9.6.3.9 unified forensic-rejection emit. Inner body returns
