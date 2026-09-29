@@ -11,11 +11,13 @@
 //! session.
 //!
 //! Approve mints a single-use authorization code (its hash stored; the raw
-//! code travels only in the redirect) and 302s to the client's redirect URI.
-//! Deny tombstones the request and 302s with `error=access_denied`.
+//! code travels only in the response) and sends the browser back to the
+//! client's redirect URI; deny tombstones the request and sends
+//! `error=access_denied`. Both carry `state` and `iss` and honour the
+//! request's `response_mode` ([`super::response`]).
 
 use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Form;
 use chrono::Utc;
@@ -23,6 +25,7 @@ use serde::Deserialize;
 
 use super::browser_session::BrowserSessionContext;
 use super::request_store::{self, AtprotoAuthorizationRequest};
+use super::response::respond_to_client;
 use crate::context::AppContext;
 
 /// The consent form body: the correlation key + the session CSRF token.
@@ -53,12 +56,18 @@ pub async fn approve(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
 
-    // 302 to the client with the code (+ echoed state).
+    // Back to the client with the code (+ echoed state and iss), where its
+    // response_mode says (#483).
     let mut pairs: Vec<(&str, &str)> = vec![("code", &code)];
     if let Some(state) = request.state.as_deref() {
         pairs.push(("state", state));
     }
-    redirect_to_client(&request.redirect_uri, &pairs)
+    respond_to_client(
+        &request.redirect_uri,
+        request.response_mode(),
+        &ctx.service_url(),
+        &pairs,
+    )
 }
 
 /// `POST /oauth/atproto/consent/deny`
@@ -79,12 +88,21 @@ pub async fn deny(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
     }
 
-    // 302 to the client with the OAuth access_denied error (+ echoed state).
-    let mut pairs: Vec<(&str, &str)> = vec![("error", "access_denied")];
+    // Back to the client with the OAuth access_denied error (+ echoed state
+    // and iss), where its response_mode says (#483).
+    let mut pairs: Vec<(&str, &str)> = vec![
+        ("error", "access_denied"),
+        ("error_description", "The account holder denied the request"),
+    ];
     if let Some(state) = request.state.as_deref() {
         pairs.push(("state", state));
     }
-    redirect_to_client(&request.redirect_uri, &pairs)
+    respond_to_client(
+        &request.redirect_uri,
+        request.response_mode(),
+        &ctx.service_url(),
+        &pairs,
+    )
 }
 
 /// The shared gate for both consent decisions: CSRF + request lookup +
@@ -127,38 +145,6 @@ async fn precheck(
     Ok(request)
 }
 
-/// 302 to the client's redirect URI with the given query pairs appended,
-/// preserving any query already present on the registered redirect URI.
-///
-/// `pub(super)` so the authorize handler's first-party admin auto-approve
-/// (chainlink #439) issues its code through the exact same redirect path.
-pub(super) fn redirect_to_client(redirect_uri: &str, pairs: &[(&str, &str)]) -> Response {
-    let location = match url::Url::parse(redirect_uri) {
-        Ok(mut url) => {
-            url.query_pairs_mut().extend_pairs(pairs.iter().copied());
-            url.to_string()
-        }
-        // The redirect_uri was verified against client metadata upstream, so
-        // this branch is defensive; fall back to manual composition.
-        Err(_) => {
-            let sep = if redirect_uri.contains('?') { '&' } else { '?' };
-            let query: String = pairs
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{}={}",
-                        k,
-                        url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>()
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("&");
-            format!("{redirect_uri}{sep}{query}")
-        }
-    };
-    (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
-}
-
 fn fail(status: StatusCode, msg: &str) -> Response {
     (status, msg.to_string()).into_response()
 }
@@ -166,6 +152,7 @@ fn fail(status: StatusCode, msg: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header;
     use crate::oauth::atproto::browser_session::{self, BrowserSession};
     use crate::oauth::atproto::request_store::AtprotoAuthorizationRequest;
     use chrono::Duration;
@@ -197,8 +184,22 @@ mod tests {
             denied_at: None,
             created_at: now.to_rfc3339(),
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
+            response_mode: None,
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
+    }
+
+    /// Seed a request that asked for `mode`.
+    async fn seed_request_with_mode(ctx: &AppContext, request_id: &str, did: &str, mode: &str) {
+        seed_request(ctx, request_id, Some(did)).await;
+        sqlx::query(
+            "UPDATE atproto_authorization_request SET response_mode = $1 WHERE request_id = $2",
+        )
+        .bind(mode)
+        .bind(request_id)
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
     }
 
     fn session_ctx(session: BrowserSession) -> BrowserSessionContext {
@@ -261,6 +262,10 @@ mod tests {
         assert!(location.starts_with("https://app.example.com/cb?"));
         assert!(location.contains("code="));
         assert!(location.contains("state=st-1"));
+        // RFC 9207: the issuer rides along (#483).
+        let iss: String =
+            url::form_urlencoded::byte_serialize(ctx.service_url().as_bytes()).collect();
+        assert!(location.ends_with(&format!("&iss={iss}")), "{location}");
 
         // The code's hash was persisted (single-use machinery armed).
         let row = request_store::get_by_request_id(&ctx.account_db, "req-c")
@@ -319,5 +324,62 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(row.is_denied());
+    }
+
+    /// #483: a browser client asking for `fragment` gets the code, state and
+    /// iss in the fragment, and nothing in the query.
+    #[tokio::test]
+    async fn approve_honours_fragment_mode() {
+        let ctx = ctx().await;
+        let session = seed_session(&ctx, "did:web:alice.example.com").await;
+        seed_request_with_mode(&ctx, "req-f", "did:web:alice.example.com", "fragment").await;
+        let csrf = session.csrf_token.clone();
+        let resp = approve(
+            session_ctx(session),
+            State(ctx.clone()),
+            Form(ConsentForm {
+                request_id: "req-f".to_string(),
+                csrf_token: csrf,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let location = resp.headers()[header::LOCATION].to_str().unwrap();
+        let url = url::Url::parse(location).unwrap();
+        assert_eq!(url.query(), None, "{location}");
+        let params: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(url.fragment().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+        assert!(params.contains_key("code"));
+        assert_eq!(params["state"], "st-1");
+        assert_eq!(params["iss"], ctx.service_url());
+    }
+
+    #[tokio::test]
+    async fn deny_honours_fragment_mode_and_carries_iss() {
+        let ctx = ctx().await;
+        let session = seed_session(&ctx, "did:web:alice.example.com").await;
+        seed_request_with_mode(&ctx, "req-g", "did:web:alice.example.com", "fragment").await;
+        let csrf = session.csrf_token.clone();
+        let resp = deny(
+            session_ctx(session),
+            State(ctx.clone()),
+            Form(ConsentForm {
+                request_id: "req-g".to_string(),
+                csrf_token: csrf,
+            }),
+        )
+        .await;
+        let location = resp.headers()[header::LOCATION].to_str().unwrap();
+        let url = url::Url::parse(location).unwrap();
+        assert_eq!(url.query(), None);
+        let params: std::collections::HashMap<String, String> =
+            url::form_urlencoded::parse(url.fragment().unwrap().as_bytes())
+                .into_owned()
+                .collect();
+        assert_eq!(params["error"], "access_denied");
+        assert_eq!(params["state"], "st-1");
+        assert_eq!(params["iss"], ctx.service_url());
     }
 }

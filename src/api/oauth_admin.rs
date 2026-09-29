@@ -818,6 +818,15 @@ async fn handle_oauth_callback(
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     tracing::info!("Handling OAuth callback");
 
+    // RFC 9207: our AS puts `iss` on every authorization response (#483), so a
+    // response without it, or naming another issuer, is not one it sent — a
+    // mix-up or forged callback. Checked before anything else is trusted.
+    let expected_iss = ctx.service_url();
+    if params.iss.as_deref() != Some(expected_iss.as_str()) {
+        tracing::warn!(got = ?params.iss, expected = %expected_iss, "OAuth callback iss mismatch");
+        return Err((StatusCode::BAD_REQUEST, "OAuth issuer mismatch".to_string()));
+    }
+
     if let Some(error) = params.error {
         let description = params
             .error_description
@@ -852,20 +861,6 @@ async fn handle_oauth_callback(
             "Invalid or expired state parameter".to_string(),
         )
     })?;
-
-    // RFC 9207 (defense in depth): the admin flow only ever targets our own AS,
-    // but if the AS echoed an `iss`, it must match the issuer we push to. A
-    // mismatch signals a mix-up attempt.
-    let expected_iss = ctx.service_url();
-    if let Some(iss) = params.iss.as_deref() {
-        if iss != expected_iss {
-            tracing::warn!(got = %iss, expected = %expected_iss, "OAuth callback iss mismatch");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "OAuth issuer mismatch".to_string(),
-            ));
-        }
-    }
 
     // Exchange the code with the Aurora-owned client (fresh ephemeral DPoP key).
     // The AS binds the issued token to that key, but the admin flow uses the
@@ -2029,6 +2024,31 @@ mod tests {
         serde_json::from_str::<String>(rest[..end].trim()).expect("value is a JSON string")
     }
 
+    /// #483: a callback without our issuer's `iss` (RFC 9207) is refused
+    /// before the code or state is looked at.
+    #[tokio::test]
+    async fn callback_requires_our_iss() {
+        let ctx = build_test_context(None, true, None).await;
+        for iss in [None, Some("https://evil.example.com".to_string())] {
+            let err = handle_oauth_callback(
+                State(ctx.clone()),
+                axum::Extension(OAuthStateStore::new()),
+                axum::http::HeaderMap::new(),
+                axum::extract::Query(OAuthCallbackParams {
+                    code: Some("c".to_string()),
+                    state: Some("s".to_string()),
+                    iss: iss.clone(),
+                    error: None,
+                    error_description: None,
+                }),
+            )
+            .await
+            .expect_err("callback without our iss must fail");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST);
+            assert_eq!(err.1, "OAuth issuer mismatch", "iss {iss:?}");
+        }
+    }
+
     #[tokio::test]
     async fn callback_completes_loopback_exchange_and_mints_validatable_session() {
         use crate::oauth::atproto::request_store::{self, AtprotoAuthorizationRequest};
@@ -2089,6 +2109,7 @@ mod tests {
                 denied_at: None,
                 created_at: now.to_rfc3339(),
                 expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
+                response_mode: None,
             },
         )
         .await
@@ -2119,7 +2140,7 @@ mod tests {
             axum::extract::Query(OAuthCallbackParams {
                 code: Some(code.to_string()),
                 state: Some(state.to_string()),
-                iss: None,
+                iss: Some(ctx.service_url()),
                 error: None,
                 error_description: None,
             }),

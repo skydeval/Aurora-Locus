@@ -10,6 +10,7 @@
 
 use serde::Deserialize;
 
+use super::response::ResponseMode;
 use super::scope::{AtprotoScope, ScopeParseError, ScopeSet};
 
 /// Raw authorization parameters as received on the wire. Every field is
@@ -28,6 +29,9 @@ pub struct RawAuthParams {
     pub code_challenge_method: Option<String>,
     /// authorize-only: reference a previously-pushed (PAR) request.
     pub request_uri: Option<String>,
+    /// Where the authorization response goes: `query` (default), `fragment`
+    /// or `form_post` (#483).
+    pub response_mode: Option<String>,
 }
 
 /// A validated authorization request's parameters. Constructed only via
@@ -40,6 +44,7 @@ pub struct ValidatedParams {
     pub scope: ScopeSet,
     pub state: Option<String>,
     pub code_challenge: String,
+    pub response_mode: ResponseMode,
 }
 
 /// Why a set of authorization parameters was rejected. Each variant maps to an
@@ -54,6 +59,8 @@ pub enum AuthParamError {
     UnsupportedChallengeMethod(String),
     /// `scope` failed to parse against the atproto vocabulary.
     InvalidScope(ScopeParseError),
+    /// `response_mode` was not one this server supports.
+    UnsupportedResponseMode(String),
 }
 
 impl AuthParamError {
@@ -64,6 +71,7 @@ impl AuthParamError {
             AuthParamError::UnsupportedResponseType(_) => "unsupported_response_type",
             AuthParamError::UnsupportedChallengeMethod(_) => "invalid_request",
             AuthParamError::InvalidScope(_) => "invalid_scope",
+            AuthParamError::UnsupportedResponseMode(_) => "invalid_request",
         }
     }
 
@@ -78,6 +86,9 @@ impl AuthParamError {
                 format!("unsupported code_challenge_method '{m}' (only 'S256' is supported)")
             }
             AuthParamError::InvalidScope(e) => e.to_string(),
+            AuthParamError::UnsupportedResponseMode(m) => {
+                format!("unsupported response_mode '{m}' (query, fragment or form_post)")
+            }
         }
     }
 }
@@ -123,12 +134,19 @@ pub fn validate(raw: &RawAuthParams) -> Result<ValidatedParams, AuthParamError> 
     let scope_str = require(&raw.scope, "scope")?;
     let scope = AtprotoScope::parse_set(scope_str).map_err(AuthParamError::InvalidScope)?;
 
+    let response_mode = match raw.response_mode.as_deref().filter(|m| !m.is_empty()) {
+        None => ResponseMode::Query,
+        Some(m) => ResponseMode::parse(m)
+            .ok_or_else(|| AuthParamError::UnsupportedResponseMode(m.to_string()))?,
+    };
+
     Ok(ValidatedParams {
         client_id,
         redirect_uri,
         scope,
         state: raw.state.clone(),
         code_challenge,
+        response_mode,
     })
 }
 
@@ -146,7 +164,24 @@ mod tests {
             code_challenge: Some("abc123".to_string()),
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
+            response_mode: None,
         }
+    }
+
+    #[test]
+    fn response_mode_defaults_to_query_and_rejects_unknown() {
+        assert_eq!(
+            validate(&good()).unwrap().response_mode,
+            ResponseMode::Query
+        );
+        let mut raw = good();
+        raw.response_mode = Some("fragment".to_string());
+        assert_eq!(
+            validate(&raw).unwrap().response_mode,
+            ResponseMode::Fragment
+        );
+        raw.response_mode = Some("web_message".to_string());
+        assert_eq!(validate(&raw).unwrap_err().oauth_code(), "invalid_request");
     }
 
     #[test]

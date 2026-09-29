@@ -167,6 +167,8 @@ impl AdminOAuthClient {
             ("state", state),
             ("code_challenge", code_challenge),
             ("code_challenge_method", "S256"),
+            // The callback is a server route reading its query string.
+            ("response_mode", "query"),
         ];
         let json = self.post_form_with_dpop(&url, &form).await?;
         serde_json::from_value(json).map_err(|e| OAuthClientError::Parse(e.to_string()))
@@ -446,6 +448,7 @@ mod tests {
         assert_eq!(f["state"], "state-123");
         assert_eq!(f["code_challenge"], "challenge-abc");
         assert_eq!(f["code_challenge_method"], "S256");
+        assert_eq!(f["response_mode"], "query");
     }
 
     #[test]

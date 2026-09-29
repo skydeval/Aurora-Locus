@@ -25,6 +25,7 @@ pub mod metadata;
 pub mod par;
 pub mod params;
 pub mod request_store;
+pub mod response;
 pub mod scope;
 pub mod signin;
 pub mod token;

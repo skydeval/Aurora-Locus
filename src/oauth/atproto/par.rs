@@ -97,6 +97,7 @@ async fn par_inner(
         denied_at: None,
         created_at: now.to_rfc3339(),
         expires_at: (now + Duration::seconds(PAR_TTL_SECS)).to_rfc3339(),
+        response_mode: Some(validated.response_mode.as_str().to_string()),
     };
     request_store::insert(&ctx.account_db, &req)
         .await
@@ -147,6 +148,7 @@ mod tests {
             code_challenge: Some("chal".to_string()),
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
+            response_mode: None,
         }
     }
 
@@ -279,6 +281,8 @@ mod tests {
         headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu).parse().unwrap());
         let mut params = form(&client_id, redirect_uri);
         params.scope = Some(SCOPE.to_string());
+        // Browser clients on the reference libraries ask for fragment (#483).
+        params.response_mode = Some("fragment".to_string());
 
         let resp = par(State(ctx.clone()), headers, Form(params)).await;
         let status = resp.status();
@@ -294,5 +298,6 @@ mod tests {
         .unwrap()
         .expect("pushed request stored");
         assert_eq!(stored.scope, SCOPE);
+        assert_eq!(stored.response_mode.as_deref(), Some("fragment"));
     }
 }

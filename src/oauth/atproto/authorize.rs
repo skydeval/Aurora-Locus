@@ -21,6 +21,7 @@ use super::client_metadata::ClientMetadata;
 use super::html::html_escape;
 use super::params::{self, RawAuthParams};
 use super::request_store::{self, AtprotoAuthorizationRequest};
+use super::response::{respond_to_client, ResponseMode};
 use crate::context::AppContext;
 
 /// Consent-window lifetime: how long the resource owner has to approve/deny
@@ -51,6 +52,7 @@ struct Resolved {
     scope: String,
     state: Option<String>,
     code_challenge: String,
+    response_mode: ResponseMode,
 }
 
 async fn authorize_inner(
@@ -120,6 +122,7 @@ async fn authorize_inner(
                 denied_at: None,
                 created_at: now.to_rfc3339(),
                 expires_at: consent_expiry,
+                response_mode: Some(resolved.response_mode.as_str().to_string()),
             };
             request_store::insert(&ctx.account_db, &req)
                 .await
@@ -142,6 +145,7 @@ async fn authorize_inner(
             ctx,
             &request_id,
             &resolved.redirect_uri,
+            resolved.response_mode,
             resolved.state.as_deref(),
         )
         .await);
@@ -183,8 +187,10 @@ async fn resolve_request(
                 "The pushed authorization request has expired; please restart.",
             ));
         }
+        let response_mode = row.response_mode();
         Ok(Resolved {
             existing_request_id: Some(row.request_id),
+            response_mode,
             client_id: row.client_id,
             redirect_uri: row.redirect_uri,
             scope: row.scope,
@@ -202,6 +208,7 @@ async fn resolve_request(
             scope: validated.scope.to_canonical_string(),
             state: validated.state,
             code_challenge: validated.code_challenge,
+            response_mode: validated.response_mode,
         })
     }
 }
@@ -262,6 +269,7 @@ async fn auto_approve(
     ctx: &AppContext,
     request_id: &str,
     redirect_uri: &str,
+    response_mode: ResponseMode,
     state: Option<&str>,
 ) -> Response {
     let code = super::opaque_token();
@@ -273,7 +281,7 @@ async fn auto_approve(
     if let Some(s) = state {
         pairs.push(("state", s));
     }
-    super::consent::redirect_to_client(redirect_uri, &pairs)
+    respond_to_client(redirect_uri, response_mode, &ctx.service_url(), &pairs)
 }
 
 /// Render the HTML consent screen. Every interpolated value is HTML-escaped.
@@ -388,6 +396,7 @@ mod tests {
             code_challenge: Some("chal".to_string()),
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
+            response_mode: None,
         }
     }
 

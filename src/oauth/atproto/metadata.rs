@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 
+use super::response::ResponseMode;
 use super::scope::AtprotoScope;
 use crate::context::AppContext;
 use crate::error::PdsError;
@@ -26,6 +27,8 @@ pub async fn authorization_server_metadata(
 ) -> Result<Response, PdsError> {
     let issuer = ctx.service_url();
     let scopes_supported: Vec<&str> = AtprotoScope::all().iter().map(|s| s.as_str()).collect();
+    let response_modes_supported: Vec<&str> =
+        ResponseMode::all().iter().map(|m| m.as_str()).collect();
 
     let body = serde_json::json!({
         "issuer": issuer,
@@ -34,6 +37,9 @@ pub async fn authorization_server_metadata(
         "pushed_authorization_request_endpoint": format!("{issuer}/oauth/atproto/par"),
         "require_pushed_authorization_requests": true,
         "response_types_supported": ["code"],
+        "response_modes_supported": response_modes_supported,
+        // RFC 9207: every authorization response carries `iss` (#483).
+        "authorization_response_iss_parameter_supported": true,
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
@@ -103,6 +109,12 @@ mod tests {
         // The atproto base scope is advertised.
         let scopes = doc["scopes_supported"].as_array().unwrap();
         assert!(scopes.iter().any(|s| s == "atproto"));
+        // Response modes and the RFC 9207 `iss` parameter (#483).
+        assert_eq!(
+            doc["response_modes_supported"],
+            serde_json::json!(["query", "fragment", "form_post"])
+        );
+        assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
         // The four static scopes, as bsky.social advertises them (#478).
         assert_eq!(
             doc["scopes_supported"],

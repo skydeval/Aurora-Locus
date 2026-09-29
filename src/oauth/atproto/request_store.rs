@@ -38,11 +38,14 @@ pub struct AtprotoAuthorizationRequest {
     pub denied_at: Option<String>,
     pub created_at: String,
     pub expires_at: String,
+    /// The `response_mode` the client asked for (`query`, `fragment`,
+    /// `form_post`); `None` means `query` (#483).
+    pub response_mode: Option<String>,
 }
 
 const COLUMNS: &str = "request_id, request_uri, client_id, redirect_uri, scope, state, \
      code_challenge, code_challenge_method, did, code_hash, code_used_at, denied_at, \
-     created_at, expires_at";
+     created_at, expires_at, response_mode";
 
 impl AtprotoAuthorizationRequest {
     /// True iff `now` is at or past `expires_at`. A malformed timestamp is
@@ -64,6 +67,11 @@ impl AtprotoAuthorizationRequest {
     pub fn is_denied(&self) -> bool {
         self.denied_at.is_some()
     }
+
+    /// Where the authorization response goes back to the client.
+    pub fn response_mode(&self) -> super::response::ResponseMode {
+        super::response::ResponseMode::from_stored(self.response_mode.as_deref())
+    }
 }
 
 /// Insert a fresh authorization request.
@@ -73,9 +81,9 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
         INSERT INTO atproto_authorization_request (
             request_id, request_uri, client_id, redirect_uri, scope, state,
             code_challenge, code_challenge_method, did, code_hash, code_used_at,
-            denied_at, created_at, expires_at
+            denied_at, created_at, expires_at, response_mode
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         "#,
     )
     .bind(&req.request_id)
@@ -92,6 +100,7 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
     .bind(&req.denied_at)
     .bind(&req.created_at)
     .bind(&req.expires_at)
+    .bind(&req.response_mode)
     .execute(db)
     .await
     .map_err(PdsError::Database)?;
@@ -230,6 +239,7 @@ mod tests {
             denied_at: None,
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
+            response_mode: None,
         }
     }
 

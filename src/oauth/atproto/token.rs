@@ -442,6 +442,7 @@ mod tests {
             denied_at: None,
             created_at: now.to_rfc3339(),
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
+            response_mode: None,
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
         // The holder is an account here (atproto_device.did references actor).
