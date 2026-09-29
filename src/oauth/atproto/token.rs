@@ -125,8 +125,12 @@ async fn authorization_code_grant(
         return Err(invalid_grant());
     }
 
-    // 5. Mint + persist the token pair (shared `token` table, β.1 hash).
-    let issued = issue_tokens(ctx, did, client_id, &request.scope, &thumbprint)
+    // 5. The proof key becomes (or already is) one of the holder's devices, so
+    //    the resource gate admits it and the holder can revoke it (#477).
+    let device_id = ensure_client_device(ctx, headers, did, client_id).await?;
+
+    // 6. Mint + persist the token pair (shared `token` table, β.1 hash).
+    let issued = issue_tokens(ctx, did, client_id, &request.scope, &thumbprint, &device_id)
         .await
         .map_err(server_error)?;
 
@@ -188,6 +192,50 @@ async fn refresh_token_grant(
     Ok(json_ok(&body))
 }
 
+/// Register the (already verified) DPoP proof's key as a device of `did`,
+/// named after the client, and return its id. A key that is active for another
+/// account is refused.
+async fn ensure_client_device(
+    ctx: &AppContext,
+    headers: &HeaderMap,
+    did: &str,
+    client_id: &str,
+) -> Result<String, Response> {
+    let proof = headers
+        .get("DPoP")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            oauth_error_json(
+                StatusCode::UNAUTHORIZED,
+                "invalid_dpop_proof",
+                "DPoP proof required",
+            )
+        })?;
+    let jwk = crate::federation::dpop::dpop_proof_public_jwk(proof).map_err(|e| {
+        oauth_error_json(
+            StatusCode::UNAUTHORIZED,
+            "invalid_dpop_proof",
+            &e.to_string(),
+        )
+    })?;
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    match ctx
+        .atproto_device_manager
+        .ensure_device(did, &jwk.to_string(), Some(client_id), user_agent)
+        .await
+    {
+        Ok(device) => Ok(device.device_id),
+        Err(crate::error::PdsError::Conflict(_)) => Err(oauth_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_dpop_proof",
+            "this DPoP key is already in use by another account",
+        )),
+        Err(e) => Err(server_error(e)),
+    }
+}
+
 /// The minted token pair.
 struct IssuedTokens {
     access_token: String,
@@ -211,6 +259,7 @@ async fn issue_tokens(
     client_id: &str,
     scope: &str,
     thumbprint: &str,
+    device_id: &str,
 ) -> Result<IssuedTokens, crate::error::PdsError> {
     let access_token = format!("at_{}", super::opaque_token());
     let refresh_token = format!("rt_{}", super::opaque_token());
@@ -237,7 +286,7 @@ async fn issue_tokens(
     .bind(now.to_rfc3339())
     .bind(expires_at.to_rfc3339())
     .bind(thumbprint)
-    .bind(Option::<String>::None)
+    .bind(device_id)
     .bind(&access_token_hash)
     .execute(&ctx.account_db)
     .await
@@ -343,7 +392,8 @@ mod tests {
             htm: "POST".to_string(),
             htu: htu.to_string(),
             iat: Utc::now().timestamp(),
-            exp: Utc::now().timestamp() + 60,
+            // Third-party clients send RFC 9449 proofs: no exp.
+            exp: None,
             ath: None,
         };
         let pem = signing_key.to_pkcs8_pem(Default::default()).unwrap().to_string();
@@ -394,6 +444,17 @@ mod tests {
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
+        // The holder is an account here (atproto_device.did references actor).
+        sqlx::query(
+            "INSERT INTO actor (did, handle, created_at) VALUES ($1, $2, $3) \
+             ON CONFLICT (did) DO NOTHING",
+        )
+        .bind("did:web:alice.example.com")
+        .bind("alice.example.com")
+        .bind(now.to_rfc3339())
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
     }
 
     fn token_form(grant_type: &str) -> TokenForm {
@@ -498,6 +559,24 @@ mod tests {
         assert_eq!(validated.did, "did:web:alice.example.com");
         assert_eq!(validated.scope, "atproto transition:generic");
         assert!(validated.dpop_thumbprint.is_some());
+
+        // #477: the client's proof key is now a device of the holder, so the
+        // resource gate admits it, and the token records which device.
+        let jkt = validated.dpop_thumbprint.clone().unwrap();
+        let device = ctx
+            .atproto_device_manager
+            .get_device_by_jkt("did:web:alice.example.com", &jkt)
+            .await
+            .unwrap()
+            .expect("proof key registered as a device");
+        assert_eq!(
+            device.device_name.as_deref(),
+            Some("https://app.example.com/cm.json")
+        );
+        assert_eq!(
+            validated.device_id.as_deref(),
+            Some(device.device_id.as_str())
+        );
 
         // Single-use: re-redeeming the same code now fails (code_used_at set).
         let mut form2 = token_form("authorization_code");

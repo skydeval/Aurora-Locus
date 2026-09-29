@@ -167,4 +167,99 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["error"], "invalid_client");
     }
+
+    // ---- a client that sends RFC 9449 proofs (no exp) ----
+
+    fn fresh_keypair_jwk() -> (p256::ecdsa::SigningKey, crate::federation::dpop::Jwk) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let point = sk.verifying_key().to_encoded_point(false);
+        let jwk = crate::federation::dpop::Jwk {
+            kty: "EC".to_string(),
+            crv: "P-256".to_string(),
+            x: URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            y: URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        };
+        (sk, jwk)
+    }
+
+    /// A proof shaped as third-party clients send it: jti, htm, htu, iat, and
+    /// no exp.
+    fn rfc_9449_proof(
+        sk: &p256::ecdsa::SigningKey,
+        jwk: &crate::federation::dpop::Jwk,
+        htu: &str,
+    ) -> String {
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        use p256::pkcs8::EncodePrivateKey;
+        let claims = serde_json::json!({
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "htm": "POST",
+            "htu": htu,
+            "iat": Utc::now().timestamp(),
+        });
+        let pem = sk.to_pkcs8_pem(Default::default()).unwrap().to_string();
+        let key = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
+        let mut header = Header::new(Algorithm::ES256);
+        header.typ = Some("dpop+jwt".to_string());
+        header.jwk = Some(serde_json::from_value(serde_json::to_value(jwk).unwrap()).unwrap());
+        encode(&header, &claims, &key).unwrap()
+    }
+
+    /// Serve one client-metadata document on loopback http (allowed in debug
+    /// builds) and return its client_id.
+    async fn serve_client_metadata(redirect_uri: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_id = format!(
+            "http://127.0.0.1:{}/client-metadata.json",
+            listener.local_addr().unwrap().port()
+        );
+        let body = serde_json::json!({
+            "client_id": client_id,
+            "redirect_uris": [redirect_uri],
+            "dpop_bound_access_tokens": true,
+        })
+        .to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        client_id
+    }
+
+    #[tokio::test]
+    async fn par_accepts_a_dpop_proof_without_exp() {
+        let ctx = ctx().await;
+        let redirect_uri = "https://app.example.com/cb";
+        let client_id = serve_client_metadata(redirect_uri).await;
+        let (sk, jwk) = fresh_keypair_jwk();
+        let htu = format!("{}/oauth/atproto/par", ctx.service_url());
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu).parse().unwrap());
+
+        let resp = par(
+            State(ctx.clone()),
+            headers,
+            Form(form(&client_id, redirect_uri)),
+        )
+        .await;
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::CREATED, "PAR response: {doc}");
+        assert!(doc["request_uri"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:ietf:params:oauth:request_uri:"));
+    }
 }

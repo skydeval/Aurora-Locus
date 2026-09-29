@@ -10,7 +10,10 @@
 //!
 //! DPoP Proof JWT Format:
 //! - Header: typ="dpop+jwt", alg=ES256, jwk={client's public key}
-//! - Claims: jti (nonce), htm (HTTP method), htu (HTTP URI), iat, exp
+//! - Claims: jti (nonce), htm (HTTP method), htu (HTTP URI), iat; `ath` on
+//!   resource requests. RFC 9449 §4.2 defines no `exp`: freshness comes from
+//!   `iat` (see [`DPOP_MAX_AGE_SECS`]). An `exp`, if a client sends one, is
+//!   honoured but never required (#477).
 //!
 //! References:
 //! - https://datatracker.ietf.org/doc/html/rfc9449
@@ -26,6 +29,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// How old a DPoP proof's `iat` may be (seconds) and still be accepted; also
+/// how long its `jti` is remembered for replay detection, so a proof cannot be
+/// replayed while it would still be accepted (#477).
+pub const DPOP_MAX_AGE_SECS: i64 = 300;
+
+/// How far in the future a proof's `iat` may be (seconds): client clock skew.
+pub const DPOP_MAX_FUTURE_SKEW_SECS: i64 = 60;
 
 /// DPoP proof JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +56,10 @@ pub struct DPopClaims {
     /// Issued at (Unix timestamp)
     pub iat: i64,
 
-    /// Expiration (Unix timestamp) - typically <60s
-    pub exp: i64,
+    /// Optional expiration (Unix timestamp). Not part of RFC 9449 and not sent
+    /// by atproto OAuth clients; when present, a past value is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<i64>,
 
     /// Access-token hash (RFC 9449 §4.3) — `base64url(SHA-256(access_token))`.
     /// Required on resource-request DPoP proofs to bind the proof to
@@ -184,8 +197,9 @@ impl DPopNonceStore {
         &self,
         jti: &str,
         jkt: &str,
-        exp: i64,
+        keep_until: i64,
     ) -> PdsResult<bool> {
+        let exp = keep_until;
         let now = Utc::now().timestamp();
         if exp <= now {
             return Ok(false);
@@ -313,10 +327,14 @@ impl DPopVerifier {
 
         let decoding_key = jwk_to_decoding_key(&jwk_json)?;
 
-        // Verify JWT signature
+        // Verify the signature only: RFC 9449 proofs carry no `exp`, so none of
+        // jsonwebtoken's registered-claim checks apply (it requires `exp` by
+        // default). Freshness is checked from `iat` below (#477).
         let mut validation = Validation::new(Algorithm::ES256);
-        validation.validate_exp = true;
-        validation.leeway = 0; // Strict expiration
+        validation.validate_exp = false;
+        validation.validate_nbf = false;
+        validation.validate_aud = false;
+        validation.required_spec_claims = std::collections::HashSet::new();
 
         let token_data =
             decode::<DPopClaims>(dpop_proof, &decoding_key, &validation).map_err(|e| {
@@ -331,6 +349,26 @@ impl DPopVerifier {
 
         let claims = token_data.claims;
 
+        // Freshness from `iat` (RFC 9449 §11.1): not older than the acceptance
+        // window, not beyond client clock skew into the future.
+        let now = Utc::now().timestamp();
+        if claims.iat > now + DPOP_MAX_FUTURE_SKEW_SECS {
+            warn!(
+                "DPoP proof iat {} is in the future (now {})",
+                claims.iat, now
+            );
+            return Err(PdsError::Authentication(
+                "DPoP proof issued in the future".to_string(),
+            ));
+        }
+        if claims.iat < now - DPOP_MAX_AGE_SECS {
+            warn!("DPoP proof iat {} is too old (now {})", claims.iat, now);
+            return Err(PdsError::Authentication("DPoP proof too old".to_string()));
+        }
+        if claims.exp.is_some_and(|exp| exp <= now) {
+            return Err(PdsError::Authentication("DPoP proof expired".to_string()));
+        }
+
         // Validate HTTP method
         if claims.htm.to_uppercase() != http_method.to_uppercase() {
             warn!(
@@ -342,9 +380,13 @@ impl DPopVerifier {
             ));
         }
 
-        // Validate HTTP URI (without query params)
-        let expected_uri = http_uri.split('?').next().unwrap_or(http_uri);
-        let proof_uri = claims.htu.split('?').next().unwrap_or(&claims.htu);
+        // Validate HTTP URI (RFC 9449 §4.3: without query and fragment)
+        let strip = |u: &str| -> String {
+            let u = u.split('#').next().unwrap_or(u);
+            u.split('?').next().unwrap_or(u).to_string()
+        };
+        let expected_uri = strip(http_uri);
+        let proof_uri = strip(&claims.htu);
 
         if proof_uri != expected_uri {
             warn!(
@@ -369,9 +411,10 @@ impl DPopVerifier {
         // dpop_jti_replay table atomically; in
         // SingleInstanceInmemory mode it uses the in-memory
         // map. See `DPopNonceStore::check_and_record_jti`.
+        // Remember the jti for as long as the proof could still be accepted.
         if !self
             .nonce_store
-            .check_and_record_jti(&claims.jti, &thumbprint, claims.exp)
+            .check_and_record_jti(&claims.jti, &thumbprint, claims.iat + DPOP_MAX_AGE_SECS)
             .await?
         {
             warn!("DPoP proof jti replay or expired: {}", claims.jti);
@@ -410,6 +453,32 @@ impl DPopVerifier {
 
         Ok(thumbprint)
     }
+}
+
+/// The public key a DPoP proof carries in its header, as the RFC 7638
+/// members only (`crv`, `kty`, `x`, `y`). Its thumbprint is what
+/// [`DPopVerifier::verify_dpop_proof`] returns. Call it after verifying the
+/// proof: it reads the header and checks nothing else.
+pub fn dpop_proof_public_jwk(dpop_proof: &str) -> PdsResult<Value> {
+    let header = decode_header(dpop_proof)
+        .map_err(|_| PdsError::Authentication("Invalid DPoP proof format".to_string()))?;
+    let jwk = header
+        .jwk
+        .ok_or_else(|| PdsError::Authentication("DPoP proof missing JWK".to_string()))?;
+    let full = serde_json::to_value(&jwk)
+        .map_err(|e| PdsError::Internal(format!("Failed to serialize JWK: {}", e)))?;
+    let member = |name: &str| -> PdsResult<Value> {
+        full.get(name)
+            .filter(|v| v.is_string())
+            .cloned()
+            .ok_or_else(|| PdsError::Authentication(format!("DPoP JWK missing {name}")))
+    };
+    Ok(serde_json::json!({
+        "crv": member("crv")?,
+        "kty": member("kty")?,
+        "x": member("x")?,
+        "y": member("y")?,
+    }))
 }
 
 /// Convert JWK to DecodingKey
@@ -591,7 +660,7 @@ mod tests {
             htm: "POST".to_string(),
             htu: "https://pds.example.com/xrpc/com.atproto.repo.createRecord".to_string(),
             iat: Utc::now().timestamp(),
-            exp: Utc::now().timestamp() + 60,
+            exp: Some(Utc::now().timestamp() + 60),
             ath: None,
         };
 
@@ -610,7 +679,7 @@ mod tests {
             htm: "POST".to_string(),
             htu: "https://pds/x".to_string(),
             iat: 0,
-            exp: 60,
+            exp: Some(60),
             ath: Some("EXPECTED_ATH_VALUE".to_string()),
         };
         let json = serde_json::to_string(&claims).unwrap();
@@ -629,7 +698,7 @@ mod tests {
             htm: "POST".to_string(),
             htu: "https://pds/oauth/token".to_string(),
             iat: 0,
-            exp: 60,
+            exp: Some(60),
             ath: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
@@ -936,7 +1005,9 @@ mod tests {
             htm: "POST".to_string(),
             htu: "https://pds.example.com/xrpc/com.atproto.repo.createRecord".to_string(),
             iat: Utc::now().timestamp(),
-            exp: Utc::now().timestamp() + 60,
+            // RFC 9449 proofs carry no `exp`; this is what third-party
+            // clients send.
+            exp: None,
             ath,
         }
     }
@@ -1049,5 +1120,151 @@ mod tests {
             .await
             .expect_err("replay must be rejected");
         assert!(format!("{}", err).contains("replay"), "got: {}", err);
+    }
+
+    const RESOURCE_URL: &str = "https://pds.example.com/xrpc/com.atproto.repo.createRecord";
+
+    /// Sign `claims` with a fresh key and verify the proof for
+    /// `POST RESOURCE_URL`, without an access-token binding.
+    async fn verify_fresh(claims: &DPopClaims) -> PdsResult<String> {
+        let verifier = DPopVerifier::new(Arc::new(DPopNonceStore::new()));
+        let (signing_key, jwk) = fresh_keypair_jwk();
+        let proof = make_signed_dpop_proof(&signing_key, &jwk, claims);
+        verifier
+            .verify_dpop_proof(&proof, "POST", RESOURCE_URL, None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_accepts_proof_without_exp() {
+        let claims = fresh_claims(None);
+        assert!(claims.exp.is_none());
+        let proof_json = serde_json::to_value(&claims).unwrap();
+        assert!(proof_json.get("exp").is_none(), "no exp on the wire");
+        verify_fresh(&claims)
+            .await
+            .expect("a proof without exp and a fresh iat verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_accepts_proof_with_exp() {
+        // Our own admin OAuth client sends exp; it must keep verifying.
+        let mut claims = fresh_claims(None);
+        claims.exp = Some(Utc::now().timestamp() + 60);
+        verify_fresh(&claims)
+            .await
+            .expect("a proof with a future exp verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_rejects_past_exp() {
+        let mut claims = fresh_claims(None);
+        claims.exp = Some(Utc::now().timestamp() - 1);
+        let err = verify_fresh(&claims).await.expect_err("expired exp");
+        assert!(format!("{err}").contains("expired"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_rejects_old_iat() {
+        let mut claims = fresh_claims(None);
+        claims.iat = Utc::now().timestamp() - DPOP_MAX_AGE_SECS - 5;
+        let err = verify_fresh(&claims).await.expect_err("stale proof");
+        assert!(format!("{err}").contains("too old"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_accepts_iat_inside_max_age() {
+        let mut claims = fresh_claims(None);
+        claims.iat = Utc::now().timestamp() - DPOP_MAX_AGE_SECS + 30;
+        verify_fresh(&claims)
+            .await
+            .expect("a proof inside the max age verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_rejects_future_iat() {
+        let mut claims = fresh_claims(None);
+        claims.iat = Utc::now().timestamp() + DPOP_MAX_FUTURE_SKEW_SECS + 30;
+        let err = verify_fresh(&claims).await.expect_err("future proof");
+        assert!(format!("{err}").contains("future"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_tolerates_small_clock_skew() {
+        let mut claims = fresh_claims(None);
+        claims.iat = Utc::now().timestamp() + DPOP_MAX_FUTURE_SKEW_SECS - 30;
+        verify_fresh(&claims)
+            .await
+            .expect("a proof a little ahead of our clock verifies");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_ignores_query_and_fragment_in_htu() {
+        let verifier = DPopVerifier::new(Arc::new(DPopNonceStore::new()));
+        let (signing_key, jwk) = fresh_keypair_jwk();
+        let mut claims = fresh_claims(None);
+        claims.htm = "GET".to_string();
+        claims.htu = "https://pds.example.com/xrpc/app.bsky.actor.getPreferences".to_string();
+        let proof = make_signed_dpop_proof(&signing_key, &jwk, &claims);
+        verifier
+            .verify_dpop_proof(
+                &proof,
+                "GET",
+                "https://pds.example.com/xrpc/app.bsky.actor.getPreferences?x=1#f",
+                None,
+            )
+            .await
+            .expect("query and fragment are not part of htu");
+    }
+
+    #[tokio::test]
+    async fn verify_dpop_proof_rejects_wrong_method_and_uri() {
+        let verifier = DPopVerifier::new(Arc::new(DPopNonceStore::new()));
+        let (signing_key, jwk) = fresh_keypair_jwk();
+        let proof = make_signed_dpop_proof(&signing_key, &jwk, &fresh_claims(None));
+        assert!(verifier
+            .verify_dpop_proof(&proof, "GET", RESOURCE_URL, None)
+            .await
+            .is_err());
+        let proof = make_signed_dpop_proof(&signing_key, &jwk, &fresh_claims(None));
+        assert!(verifier
+            .verify_dpop_proof(&proof, "POST", "https://pds.example.com/oauth/token", None)
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn dpop_proof_public_jwk_returns_the_signing_key() {
+        let (signing_key, jwk) = fresh_keypair_jwk();
+        let proof = make_signed_dpop_proof(&signing_key, &jwk, &fresh_claims(None));
+        let public = dpop_proof_public_jwk(&proof).unwrap();
+        assert_eq!(public, serde_json::to_value(&jwk).unwrap());
+        assert!(dpop_proof_public_jwk("not-a-jwt").is_err());
+    }
+
+    /// The example proof in RFC 9449 section 4.1: its header key and claim
+    /// set (no `exp`) parse, and the key's thumbprint matches the `jkt` the
+    /// RFC shows bound to tokens issued for it (section 6.1).
+    #[test]
+    fn rfc_9449_example_proof_parses_and_thumbprints() {
+        let claims: DPopClaims = serde_json::from_str(
+            r#"{"jti":"-BwC3ESc6acc2lTc","htm":"POST","htu":"https://server.example.com/token","iat":1562262616}"#,
+        )
+        .expect("RFC 9449 claims parse without exp");
+        assert_eq!(claims.exp, None);
+        assert_eq!(claims.ath, None);
+        assert_eq!(claims.iat, 1562262616);
+
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "x": "l8tFrhx-34tV3hRICRDY9zCkDlpBhF42UQUfWVAWBFs",
+            "y": "9VE4jf_Ok_o64zbTTlcuNJajHmt6v9TDVrU0CdvGRDA",
+            "crv": "P-256"
+        });
+        assert!(jwk_to_decoding_key(&jwk).is_ok());
+        assert_eq!(
+            compute_jwk_thumbprint(&jwk).unwrap(),
+            "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
+        );
     }
 }

@@ -103,6 +103,40 @@ impl AtprotoDeviceManager {
         Ok(row)
     }
 
+    /// The active device for `did` holding `dpop_public_key`, registering it
+    /// if there is none. This is how a third-party OAuth client's key enters
+    /// the registry: the client proves the key at the token endpoint when it
+    /// redeems a code the holder consented to, and from then on the key is a
+    /// device the holder can see and revoke (revoking also revokes its
+    /// tokens). A key already active for another holder is a `Conflict`.
+    pub async fn ensure_device(
+        &self,
+        did: &str,
+        dpop_public_key: &str,
+        device_name: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> PdsResult<AtprotoDeviceRow> {
+        let jwk: serde_json::Value = serde_json::from_str(dpop_public_key).map_err(|e| {
+            PdsError::Validation(format!("dpop_public_key is not valid JWK JSON: {e}"))
+        })?;
+        let jkt = crate::federation::dpop::compute_jwk_thumbprint(&jwk)?;
+        if let Some(existing) = self.get_device_by_jkt(did, &jkt).await? {
+            return Ok(existing);
+        }
+        match self
+            .register_device(did, dpop_public_key, device_name, user_agent)
+            .await
+        {
+            Ok(row) => Ok(row),
+            // A concurrent redemption with the same key may have registered it
+            // between the lookup and the insert.
+            Err(e) => match self.get_device_by_jkt(did, &jkt).await? {
+                Some(existing) => Ok(existing),
+                None => Err(e),
+            },
+        }
+    }
+
     /// List a holder's active (non-revoked) devices, most-recently-seen first.
     pub async fn list_devices(&self, did: &str) -> PdsResult<Vec<AtprotoDeviceRow>> {
         let sql = format!(
@@ -343,5 +377,44 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(revoked, 1, "token bound to the revoked device must be revoked");
+    }
+
+    #[tokio::test]
+    async fn ensure_device_registers_once_and_refuses_another_holders_key() {
+        let ctx = ctx().await;
+        let mgr = AtprotoDeviceManager::new(ctx.account_db.clone());
+        let (alice, bob) = (
+            "did:web:ensure-a.example.com",
+            "did:web:ensure-b.example.com",
+        );
+        seed_actor(&ctx.account_db, alice).await;
+        seed_actor(&ctx.account_db, bob).await;
+
+        let first = mgr
+            .ensure_device(alice, &jwk("ensureKey"), Some("https://app/cm.json"), None)
+            .await
+            .unwrap();
+        assert_eq!(first.device_name.as_deref(), Some("https://app/cm.json"));
+        // Same holder, same key: the existing device, not a second row.
+        let again = mgr
+            .ensure_device(alice, &jwk("ensureKey"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(again.device_id, first.device_id);
+        assert_eq!(mgr.list_devices(alice).await.unwrap().len(), 1);
+
+        // Another holder cannot claim a key that is active for alice.
+        assert!(matches!(
+            mgr.ensure_device(bob, &jwk("ensureKey"), None, None).await,
+            Err(PdsError::Conflict(_))
+        ));
+
+        // Once revoked, a new redemption registers the key afresh.
+        mgr.revoke_device(alice, &first.device_id).await.unwrap();
+        let fresh = mgr
+            .ensure_device(alice, &jwk("ensureKey"), None, None)
+            .await
+            .unwrap();
+        assert_ne!(fresh.device_id, first.device_id);
     }
 }

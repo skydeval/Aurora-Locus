@@ -1406,7 +1406,8 @@ mod epsilon_oauth_gate_tests {
             htm: "POST".to_string(),
             htu: htu.to_string(),
             iat: chrono::Utc::now().timestamp(),
-            exp: chrono::Utc::now().timestamp() + 120,
+            // Third-party clients send RFC 9449 proofs: no exp.
+            exp: None,
             ath: Some(ath.to_string()),
         };
         let pem = sk.to_pkcs8_pem(Default::default()).unwrap().to_string();
