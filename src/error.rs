@@ -168,6 +168,15 @@ pub enum PdsError {
     #[error("Could not find repo for DID: {0}")]
     RepoNotFound(String),
 
+    /// `com.atproto.repo.getRecord` for a record that does not exist in a
+    /// repository that does (#489). It is the one error the method's lexicon
+    /// declares, and the name clients use to tell "this record is absent"
+    /// from every other failure, so it must not be the generic `NotFound`.
+    /// Carries the record's AT-URI. Mapped to HTTP 400, as the reference PDS
+    /// answers.
+    #[error("Could not locate record: {0}")]
+    RecordNotFound(String),
+
     /// Arc 14 §7.3.5 — sync-namespace handler called against a
     /// takendown repo (and the caller is not admin/self). Mapped
     /// to HTTP 400 to match bsky-PDS `InvalidRequestError` default.
@@ -635,6 +644,7 @@ impl PartialEq for PdsError {
                 PdsError::RateLimitExceeded { retry_after: b },
             ) => a == b,
             (PdsError::NotFound(a), PdsError::NotFound(b)) => a == b,
+            (PdsError::RecordNotFound(a), PdsError::RecordNotFound(b)) => a == b,
             (PdsError::Conflict(a), PdsError::Conflict(b)) => a == b,
             (PdsError::Internal(a), PdsError::Internal(b)) => a == b,
             (PdsError::AtProto(a), PdsError::AtProto(b)) => a == b,
@@ -913,6 +923,11 @@ impl IntoResponse for PdsError {
             // Case A; just extend allowed `error` values).
             PdsError::RepoNotFound(_) => {
                 (StatusCode::NOT_FOUND, "RepoNotFound", self.to_string())
+            }
+            // #489: the lexicon-declared getRecord miss; 400 like the
+            // reference PDS (an InvalidRequest-class error with its own name).
+            PdsError::RecordNotFound(_) => {
+                (StatusCode::BAD_REQUEST, "RecordNotFound", self.to_string())
             }
             PdsError::RepoTakendown(_) => {
                 (StatusCode::BAD_REQUEST, "RepoTakendown", self.to_string())
@@ -1222,6 +1237,36 @@ mod tests {
 
         assert_eq!(body.error, "BlobNotFound");
         assert_eq!(body.message, "Could not find blob: bafkreigh2akiscaildc");
+    }
+
+    /// #489 — `PdsError::RecordNotFound` is the lexicon-declared getRecord
+    /// miss: HTTP 400 `{"error": "RecordNotFound", "message": "Could not
+    /// locate record: <uri>"}`, as the reference PDS answers. The generic
+    /// `NotFound` and `RepoNotFound` stay 404 under their own names, so a
+    /// missing record never reads as a missing repository or route.
+    #[tokio::test]
+    async fn record_not_found_maps_to_http_400_with_its_own_name() {
+        let uri = "at://did:plc:abc/app.bsky.actor.profile/self";
+        let resp = PdsError::RecordNotFound(uri.to_string()).into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body.error, "RecordNotFound");
+        assert_eq!(body.message, format!("Could not locate record: {uri}"));
+
+        for (err, name) in [
+            (PdsError::NotFound("x".to_string()), "NotFound"),
+            (
+                PdsError::RepoNotFound("did:plc:abc".to_string()),
+                "RepoNotFound",
+            ),
+        ] {
+            let resp = err.into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body.error, name);
+        }
     }
 
     /// Arc 16e §9.5.3.5 + §9.5.5.10 — `PdsError::InvalidCid` maps to

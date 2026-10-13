@@ -710,7 +710,13 @@ async fn get_record(
 
     // Get the record
     let uri = format!("at://{}/{}/{}", did, query.collection, query.rkey);
-    let record = repo_mgr.get_record(&uri).await?;
+    let record = match repo_mgr.get_record(&uri).await {
+        // The store has no repository for this DID. That is `RepoNotFound`,
+        // never a record miss: consumers treat a record miss as "this record
+        // was deleted", which a missing repository must not read as (#489).
+        Err(PdsError::NotFound(_)) => return Err(PdsError::RepoNotFound(did.clone())),
+        other => other?,
+    };
 
     match record {
         Some(value) => {
@@ -782,9 +788,27 @@ async fn get_record(
                 labels,
             }))
         }
-        None => Err(PdsError::NotFound(format!("Record not found: {}", uri))),
+        None => Err(record_miss_error(&query.collection, uri)),
     }
 }
+
+/// The error for a `getRecord` miss in a repository that exists (#489).
+///
+/// A public record is `RecordNotFound` (HTTP 400): the one error the lexicon
+/// declares for the method, and the name clients use to tell "absent" from
+/// any other failure. Records in the private-tier namespace keep the generic
+/// `NotFound` (404) they have always answered with; that path is deliberately
+/// left as it was.
+fn record_miss_error(collection: &str, uri: String) -> PdsError {
+    if collection.starts_with(PRIVATE_TIER_NSID_PREFIX) {
+        PdsError::NotFound(format!("Record not found: {}", uri))
+    } else {
+        PdsError::RecordNotFound(uri)
+    }
+}
+
+/// Collections under this prefix are private-tier (kryphocron) records.
+const PRIVATE_TIER_NSID_PREFIX: &str = "tools.kryphocron.";
 
 /// List records in a collection
 async fn list_records(
@@ -1101,6 +1125,63 @@ async fn list_missing_blobs(
         .collect();
 
     Ok(Json(ListMissingBlobsResponse { blobs, cursor }))
+}
+
+#[cfg(test)]
+mod get_record_miss_tests {
+    //! #489: what `getRecord` answers when there is nothing to return.
+    use super::*;
+
+    const DID: &str = "did:plc:getrecordmiss00000000000";
+
+    async fn ctx_with_repo() -> AppContext {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        ctx.actor_store.create(DID).await.expect("create repo");
+        ctx
+    }
+
+    /// Call the handler anonymously and return its error.
+    async fn miss(ctx: &AppContext, repo: &str, collection: &str) -> PdsError {
+        let query: GetRecordQuery = serde_json::from_value(serde_json::json!({
+            "repo": repo,
+            "collection": collection,
+            "rkey": "self",
+        }))
+        .unwrap();
+        match get_record(State(ctx.clone()), HeaderMap::new(), Query(query)).await {
+            Ok(_) => panic!("expected a miss for {repo}/{collection}"),
+            Err(e) => e,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_public_record_is_record_not_found() {
+        let ctx = ctx_with_repo().await;
+        let err = miss(&ctx, DID, "app.bsky.actor.profile").await;
+        assert_eq!(
+            err,
+            PdsError::RecordNotFound(format!("at://{DID}/app.bsky.actor.profile/self"))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_repository_is_repo_not_found_not_a_record_miss() {
+        let ctx = ctx_with_repo().await;
+        let absent = "did:plc:nosuchrepo0000000000000000";
+        let err = miss(&ctx, absent, "app.bsky.actor.profile").await;
+        assert!(
+            matches!(&err, PdsError::RepoNotFound(did) if did == absent),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_private_tier_record_keeps_the_generic_not_found() {
+        let ctx = ctx_with_repo().await;
+        let err = miss(&ctx, DID, "tools.kryphocron.feed.postPrivate").await;
+        assert!(matches!(err, PdsError::NotFound(_)), "got {err:?}");
+    }
 }
 
 #[cfg(test)]
