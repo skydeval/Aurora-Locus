@@ -71,6 +71,33 @@ pub async fn assert_repo_availability(
     Ok(())
 }
 
+/// Refuse a read of a repository that is not active (#491): everything
+/// [`assert_repo_availability`] refuses, plus an account under an active
+/// moderation suspension.
+///
+/// The suspension check is separate because an operator's Suspend action is
+/// recorded in `account_moderation`, not in the actor row's `suspended_at`
+/// column that `assert_repo_availability` reads; on its own that check lets a
+/// suspended account through. A failed suspension lookup fails the request
+/// rather than serving the repository.
+///
+/// The repository's own account and admins may still read (`is_admin_or_self`),
+/// as in the reference PDS. The refusal is `RepoNotFound`, `RepoTakendown`,
+/// `RepoDeactivated`, `RepoSuspended` or `RepoDesynchronized`; it is never a
+/// record-level "not found", which consumers read as "this record was
+/// deleted".
+pub async fn assert_repo_readable(
+    ctx: &crate::context::AppContext,
+    did: &str,
+    is_admin_or_self: bool,
+) -> PdsResult<()> {
+    assert_repo_availability(&ctx.account_manager, did, is_admin_or_self).await?;
+    if !is_admin_or_self && ctx.moderation_manager.is_suspended(did).await? {
+        return Err(PdsError::RepoSuspended(did.to_string()));
+    }
+    Ok(())
+}
+
 /// Arc 15 §8.3.2 — derive emit-side account status from an account
 /// row. Matches bsky-PDS's `formatAccountStatus` body. Used by the
 /// account-lifecycle handlers (deactivate / reactivate / takedown)

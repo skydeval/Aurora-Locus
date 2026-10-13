@@ -701,6 +701,13 @@ async fn get_record(
     // Get the DID (could be handle resolution in the future)
     let did = &query.repo;
 
+    // A repository that is taken down, suspended or deactivated is not served
+    // (#491), to anyone but its own account and admins. This runs before any
+    // read, so neither a public record nor a private post in either form
+    // leaves a non-active repository.
+    let reader_did = optional_reader(&ctx, &headers).await;
+    assert_readable_by(&ctx, did, reader_did.as_deref()).await?;
+
     // Create repository manager
     let repo_mgr = RepositoryManager::with_validation_mode(
         did.clone(),
@@ -742,12 +749,9 @@ async fn get_record(
             // the at-rest layer only. Other NSIDs (public records, audience/
             // block/mute structural records) pass through untouched.
             if query.collection == crate::api::kryphocron_endpoints::NSID_POST_PRIVATE {
-                // Optional reader auth: a valid session identifies the reader;
-                // no/invalid credentials -> anonymous (treated as non-member).
-                let reader_did = middleware::require_auth_unified(State(ctx.clone()), headers)
-                    .await
-                    .ok()
-                    .map(|auth| auth.did().to_string());
+                // Optional reader auth (resolved above): a valid session
+                // identifies the reader; no/invalid credentials -> anonymous
+                // (treated as non-member).
                 if matches!(
                     crate::kryphocron_content::authorize_private_read(
                         &ctx,
@@ -792,6 +796,36 @@ async fn get_record(
     }
 }
 
+/// The account a read request is made as, if it carries valid credentials.
+/// Reads are public, so missing or invalid credentials mean an anonymous
+/// reader, not an error.
+async fn optional_reader(ctx: &AppContext, headers: &HeaderMap) -> Option<String> {
+    if !headers.contains_key(axum::http::header::AUTHORIZATION) {
+        return None;
+    }
+    middleware::require_auth_unified(State(ctx.clone()), headers.clone())
+        .await
+        .ok()
+        .map(|auth| auth.did().to_string())
+}
+
+/// Refuse a read of `repo_did` unless the repository is active, or the reader
+/// is its own account or an admin (#491). See
+/// [`crate::api::sync_helpers::assert_repo_readable`] for what is refused and
+/// with which error.
+async fn assert_readable_by(
+    ctx: &AppContext,
+    repo_did: &str,
+    reader_did: Option<&str>,
+) -> PdsResult<()> {
+    let is_admin_or_self = match reader_did {
+        Some(reader) if reader == repo_did => true,
+        Some(reader) => matches!(ctx.admin_role_manager.get_role(reader).await, Ok(Some(_))),
+        None => false,
+    };
+    crate::api::sync_helpers::assert_repo_readable(ctx, repo_did, is_admin_or_self).await
+}
+
 /// The error for a `getRecord` miss in a repository that exists (#489).
 ///
 /// A public record is `RecordNotFound` (HTTP 400): the one error the lexicon
@@ -813,10 +847,15 @@ const PRIVATE_TIER_NSID_PREFIX: &str = "tools.kryphocron.";
 /// List records in a collection
 async fn list_records(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(query): Query<ListRecordsQuery>,
 ) -> PdsResult<Json<ListRecordsResponse>> {
     // Get the DID
     let did = &query.repo;
+
+    // Not served for a repository that is not active (#491).
+    let reader_did = optional_reader(&ctx, &headers).await;
+    assert_readable_by(&ctx, did, reader_did.as_deref()).await?;
 
     // Create repository manager
     let repo_mgr = RepositoryManager::with_validation_mode(
@@ -886,10 +925,15 @@ async fn list_records(
 /// Describe a repository
 async fn describe_repo(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(query): Query<DescribeRepoQuery>,
 ) -> PdsResult<Json<DescribeRepoResponse>> {
     // Get the DID
     let did = &query.repo;
+
+    // Not served for a repository that is not active (#491).
+    let reader_did = optional_reader(&ctx, &headers).await;
+    assert_readable_by(&ctx, did, reader_did.as_deref()).await?;
 
     // Create repository manager
     let repo_mgr = RepositoryManager::with_validation_mode(
@@ -1130,15 +1174,48 @@ async fn list_missing_blobs(
 #[cfg(test)]
 mod get_record_miss_tests {
     //! #489: what `getRecord` answers when there is nothing to return.
+    //! #491: and that a repository which is not active is not read at all.
     use super::*;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
 
-    const DID: &str = "did:plc:getrecordmiss00000000000";
+    const PROFILE: &str = "app.bsky.actor.profile";
+    const PRIVATE_POST: &str = "tools.kryphocron.feed.postPrivate";
 
-    async fn ctx_with_repo() -> AppContext {
+    /// A context with one account (and its repository); returns its DID.
+    async fn ctx_with_repo() -> (AppContext, String) {
         let ctx =
             crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
-        ctx.actor_store.create(DID).await.expect("create repo");
-        ctx
+        let account = ctx
+            .account_manager
+            .create_account(
+                "getrecord.localhost".to_string(),
+                None,
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create account");
+        ctx.actor_store
+            .create(&account.did)
+            .await
+            .expect("create repo");
+        (ctx, account.did)
+    }
+
+    async fn moderate(ctx: &AppContext, did: &str, action: ModerationAction) {
+        ctx.moderation_manager
+            .apply_action(ApplyActionParams {
+                did,
+                action,
+                reason: "test",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            })
+            .await
+            .expect("apply moderation action");
     }
 
     /// Call the handler anonymously and return its error.
@@ -1157,19 +1234,19 @@ mod get_record_miss_tests {
 
     #[tokio::test]
     async fn missing_public_record_is_record_not_found() {
-        let ctx = ctx_with_repo().await;
-        let err = miss(&ctx, DID, "app.bsky.actor.profile").await;
+        let (ctx, did) = ctx_with_repo().await;
+        let err = miss(&ctx, &did, PROFILE).await;
         assert_eq!(
             err,
-            PdsError::RecordNotFound(format!("at://{DID}/app.bsky.actor.profile/self"))
+            PdsError::RecordNotFound(format!("at://{did}/{PROFILE}/self"))
         );
     }
 
     #[tokio::test]
     async fn missing_repository_is_repo_not_found_not_a_record_miss() {
-        let ctx = ctx_with_repo().await;
+        let (ctx, _did) = ctx_with_repo().await;
         let absent = "did:plc:nosuchrepo0000000000000000";
-        let err = miss(&ctx, absent, "app.bsky.actor.profile").await;
+        let err = miss(&ctx, absent, PROFILE).await;
         assert!(
             matches!(&err, PdsError::RepoNotFound(did) if did == absent),
             "got {err:?}"
@@ -1178,9 +1255,125 @@ mod get_record_miss_tests {
 
     #[tokio::test]
     async fn missing_private_tier_record_keeps_the_generic_not_found() {
-        let ctx = ctx_with_repo().await;
-        let err = miss(&ctx, DID, "tools.kryphocron.feed.postPrivate").await;
+        let (ctx, did) = ctx_with_repo().await;
+        let err = miss(&ctx, &did, PRIVATE_POST).await;
         assert!(matches!(err, PdsError::NotFound(_)), "got {err:?}");
+    }
+
+    /// #491: a deactivated repository is refused for both tiers, and served
+    /// again once reactivated. The refusal is never a record-level miss.
+    #[tokio::test]
+    async fn deactivated_repository_is_refused_then_served_again() {
+        let (ctx, did) = ctx_with_repo().await;
+        ctx.account_manager.deactivate_account(&did).await.unwrap();
+        for collection in [PROFILE, PRIVATE_POST] {
+            let err = miss(&ctx, &did, collection).await;
+            assert!(
+                matches!(&err, PdsError::RepoDeactivated(d) if d == &did),
+                "{collection}: got {err:?}"
+            );
+        }
+
+        ctx.account_manager.reactivate_account(&did).await.unwrap();
+        // Active again: back to the ordinary answers (nothing was written, so
+        // these are the per-tier misses).
+        assert!(matches!(
+            miss(&ctx, &did, PROFILE).await,
+            PdsError::RecordNotFound(_)
+        ));
+        assert!(matches!(
+            miss(&ctx, &did, PRIVATE_POST).await,
+            PdsError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn taken_down_repository_is_refused() {
+        let (ctx, did) = ctx_with_repo().await;
+        moderate(&ctx, &did, ModerationAction::Takedown).await;
+        for collection in [PROFILE, PRIVATE_POST] {
+            let err = miss(&ctx, &did, collection).await;
+            assert!(
+                matches!(&err, PdsError::RepoTakendown(d) if d == &did),
+                "{collection}: got {err:?}"
+            );
+        }
+    }
+
+    /// A Suspend action lives in `account_moderation`, not on the actor row,
+    /// so it needs its own check.
+    #[tokio::test]
+    async fn suspended_repository_is_refused() {
+        let (ctx, did) = ctx_with_repo().await;
+        moderate(&ctx, &did, ModerationAction::Suspend).await;
+        for collection in [PROFILE, PRIVATE_POST] {
+            let err = miss(&ctx, &did, collection).await;
+            assert!(
+                matches!(&err, PdsError::RepoSuspended(d) if d == &did),
+                "{collection}: got {err:?}"
+            );
+        }
+    }
+
+    /// Who may still read a repository that is not active: its own account
+    /// and admins, as in the reference PDS. An audience member (any other
+    /// account) and an anonymous reader may not.
+    #[tokio::test]
+    async fn only_the_owner_and_admins_read_a_non_active_repository() {
+        let (ctx, did) = ctx_with_repo().await;
+        ctx.account_manager.deactivate_account(&did).await.unwrap();
+
+        assert!(assert_readable_by(&ctx, &did, Some(&did)).await.is_ok());
+        let other = "did:plc:audiencemember00000000000";
+        assert!(matches!(
+            assert_readable_by(&ctx, &did, Some(other)).await,
+            Err(PdsError::RepoDeactivated(_))
+        ));
+        assert!(matches!(
+            assert_readable_by(&ctx, &did, None).await,
+            Err(PdsError::RepoDeactivated(_))
+        ));
+
+        let admin = "did:plc:adminreader000000000000000";
+        ctx.admin_role_manager
+            .grant_role(admin, crate::admin::roles::Role::Admin, "system", None)
+            .await
+            .unwrap();
+        assert!(assert_readable_by(&ctx, &did, Some(admin)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_records_and_describe_repo_refuse_a_non_active_repository() {
+        let (ctx, did) = ctx_with_repo().await;
+        ctx.account_manager.deactivate_account(&did).await.unwrap();
+
+        let list: ListRecordsQuery =
+            serde_json::from_value(serde_json::json!({"repo": did, "collection": PROFILE}))
+                .unwrap();
+        match list_records(State(ctx.clone()), HeaderMap::new(), Query(list)).await {
+            Err(PdsError::RepoDeactivated(_)) => {}
+            Err(e) => panic!("listRecords: got {e:?}"),
+            Ok(_) => panic!("listRecords served a deactivated repository"),
+        }
+
+        let describe: DescribeRepoQuery =
+            serde_json::from_value(serde_json::json!({"repo": did})).unwrap();
+        match describe_repo(State(ctx.clone()), HeaderMap::new(), Query(describe)).await {
+            Err(PdsError::RepoDeactivated(_)) => {}
+            Err(e) => panic!("describeRepo: got {e:?}"),
+            Ok(_) => panic!("describeRepo served a deactivated repository"),
+        }
+
+        // A repository this PDS does not host is RepoNotFound on both.
+        let absent: ListRecordsQuery = serde_json::from_value(
+            serde_json::json!({"repo": "did:plc:nosuchrepo0000000000000000", "collection": PROFILE}),
+        )
+        .unwrap();
+        match list_records(State(ctx.clone()), HeaderMap::new(), Query(absent)).await {
+            Err(PdsError::RepoNotFound(_)) => {}
+            Err(e) => panic!("listRecords absent: got {e:?}"),
+            Ok(_) => panic!("listRecords served an absent repository"),
+        }
     }
 }
 

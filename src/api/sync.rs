@@ -10,7 +10,7 @@
 
 use crate::{
     actor_store::car,
-    api::sync_helpers::{assert_repo_availability, get_repo_status},
+    api::sync_helpers::{assert_repo_readable, get_repo_status},
     context::AppContext,
     error::{PdsError, PdsResult},
 };
@@ -155,7 +155,7 @@ pub async fn get_repo(
     Query(params): Query<GetRepoParams>,
 ) -> PdsResult<Response> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     // Export repository as CAR
     let car_bytes =
@@ -182,7 +182,7 @@ pub async fn get_latest_commit(
     Query(params): Query<GetLatestCommitParams>,
 ) -> PdsResult<Json<LatestCommitResponse>> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     // Get the repository root CID (latest commit)
     let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
@@ -205,7 +205,7 @@ pub async fn get_blocks(
     Query(params): Query<GetBlocksParams>,
 ) -> PdsResult<Response> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     // Fetch the requested blocks
     let block_data = ctx
@@ -251,7 +251,7 @@ pub async fn get_blob(
     Query(params): Query<GetBlobParams>,
 ) -> PdsResult<Response> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     // Get blob from blob store
     let (data, mime_type) = ctx
@@ -289,7 +289,7 @@ pub async fn list_blobs(
     Query(params): Query<ListBlobsParams>,
 ) -> PdsResult<Json<ListBlobsResponse>> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     let limit = params.limit.unwrap_or(100).min(1000);
 
@@ -407,7 +407,7 @@ pub async fn get_record(
     Query(params): Query<GetRecordParams>,
 ) -> PdsResult<Response> {
     let is_admin_or_self = false;
-    assert_repo_availability(&ctx.account_manager, &params.did, is_admin_or_self).await?;
+    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
 
     // Export record as CAR
     let car_bytes = car::export_record_to_car(
