@@ -67,9 +67,10 @@ pub async fn oauth_protected_resource(
 /// Answers by the request's `Host` (the hostname being verified):
 /// - the service host (`PDS_HOSTNAME`, or the host of `PDS_SERVICE_PUBLIC_URL`)
 ///   → the server's own DID (did:web service resolution, federation discovery);
-/// - a host strictly under a service handle domain → the DID of the active
-///   local account holding that handle (ATProto HTTPS handle verification),
-///   or 404 `User not found` when there is none or it is deactivated/taken down;
+/// - a host strictly under a service handle domain → the DID of the local
+///   account holding that handle (ATProto HTTPS handle verification),
+///   including a deactivated one (#494: its handle is still its own), or 404
+///   `User not found` when there is none or it is taken down;
 /// - any other host → 404.
 ///
 /// Only the plain `Host` header (or HTTP/2 `:authority`) is read.
@@ -100,7 +101,7 @@ pub async fn atproto_did(
         return plain_text(StatusCode::NOT_FOUND, "User not found");
     }
 
-    match ctx.account_manager.get_active_did_by_handle(&host).await? {
+    match ctx.account_manager.get_resolvable_did_by_handle(&host).await? {
         Some(did) => plain_text(StatusCode::OK, &did),
         None => plain_text(StatusCode::NOT_FOUND, "User not found"),
     }
@@ -582,7 +583,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn atproto_did_taken_down_or_deactivated_account_is_404() {
+    async fn atproto_did_taken_down_is_404_and_deactivated_still_resolves() {
         let ctx = handle_ctx().await;
         seed_actor(&ctx, "did:plc:gone", "gone.nearhorizon.app").await;
         seed_actor(&ctx, "did:plc:asleep", "asleep.nearhorizon.app").await;
@@ -598,14 +599,17 @@ mod tests {
             .execute(&ctx.account_db)
             .await
             .unwrap();
-        for host in ["gone.nearhorizon.app", "asleep.nearhorizon.app"] {
-            let got = get_atproto_did(&ctx, Some(host)).await;
-            assert_eq!(
-                got,
-                (StatusCode::NOT_FOUND, "User not found".to_string()),
-                "{host}"
-            );
-        }
+        // Taken down: indistinguishable from no such account.
+        assert_eq!(
+            get_atproto_did(&ctx, Some("gone.nearhorizon.app")).await,
+            (StatusCode::NOT_FOUND, "User not found".to_string())
+        );
+        // #494: deactivated is temporary; the handle still resolves, so a
+        // client can find the account and show that it is deactivated.
+        assert_eq!(
+            get_atproto_did(&ctx, Some("asleep.nearhorizon.app")).await,
+            (StatusCode::OK, "did:plc:asleep".to_string())
+        );
     }
 
     #[tokio::test]

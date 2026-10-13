@@ -5237,6 +5237,18 @@ async fn suspend_account(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Announce the suspension (#494), as takedown and deactivation are
+    // announced: relays and AppViews learn an account's status from `#account`
+    // events, and without one they keep showing the account as active.
+    // Restoring the account emits the matching `active: true` event.
+    ctx.sequencer
+        .sequence_account(crate::sequencer::events::AccountEvent::from_status(
+            req.did.clone(),
+            crate::sequencer::events::AccountStatus::Suspended,
+        ))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
     Ok(Json(serde_json::json!({
         "success": true,
         "moderation_id": record.id,

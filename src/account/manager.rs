@@ -1055,28 +1055,33 @@ impl AccountManager {
         }))
     }
 
-    /// The DID of the *active* local actor holding `handle`, for public handle
+    /// The DID of the local actor holding `handle`, for public handle
     /// resolution (`/.well-known/atproto-did` and `resolveHandle`'s local-first
     /// step). `None` when no local actor has the handle, or when that actor is
-    /// deactivated or taken down — the same AD-1 gate the did:web serve route
-    /// applies, so a hidden account is indistinguishable from an absent one.
+    /// taken down (a taken-down account is indistinguishable from an absent
+    /// one).
+    ///
+    /// A **deactivated** account still resolves (#494). Deactivation is
+    /// temporary and reversible, the handle still belongs to the account, and
+    /// a client can only show "this account is deactivated" if it can first
+    /// find the account; hiding the handle made clients report a handle
+    /// error instead. The account's state is carried by its `#account` events
+    /// and session status, not by making its handle disappear.
     ///
     /// Actor-table only (the by-handle counterpart of `get_actor_serve_state`):
     /// `get_account_by_handle`'s `account` join is unsuitable here because an
     /// actor with no `account` row fails to decode its `invites_disabled`.
     /// `handle` is lowercased before lookup (handles are stored lowercase).
-    pub async fn get_active_did_by_handle(&self, handle: &str) -> PdsResult<Option<String>> {
+    pub async fn get_resolvable_did_by_handle(&self, handle: &str) -> PdsResult<Option<String>> {
         use sqlx::Row as _;
-        let row =
-            sqlx::query("SELECT did, deactivated_at, takedown_ref FROM actor WHERE handle = $1")
-                .bind(handle.to_ascii_lowercase())
-                .fetch_optional(&self.db)
-                .await
-                .map_err(PdsError::Database)?;
+        let row = sqlx::query("SELECT did, takedown_ref FROM actor WHERE handle = $1")
+            .bind(handle.to_ascii_lowercase())
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
         Ok(row.and_then(|r| {
-            let hidden = r.get::<Option<String>, _>("deactivated_at").is_some()
-                || r.get::<Option<String>, _>("takedown_ref").is_some();
-            (!hidden).then(|| r.get::<String, _>("did"))
+            let taken_down = r.get::<Option<String>, _>("takedown_ref").is_some();
+            (!taken_down).then(|| r.get::<String, _>("did"))
         }))
     }
 

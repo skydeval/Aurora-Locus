@@ -40,11 +40,12 @@ pub async fn resolve_handle(
 
     // Local accounts first (matches the reference PDS): a handle this PDS
     // hosts resolves from the actor table with no network round-trip. A
-    // deactivated or taken-down local account is treated as absent here and
-    // falls through to external resolution, like any unknown handle.
+    // deactivated account still resolves (#494); a taken-down local account
+    // is treated as absent here and falls through to external resolution,
+    // like any unknown handle.
     if let Some(did) = ctx
         .account_manager
-        .get_active_did_by_handle(&params.handle)
+        .get_resolvable_did_by_handle(&params.handle)
         .await?
     {
         return Ok(Json(ResolveHandleResponse { did }));
@@ -1226,6 +1227,22 @@ mod tests {
         // rather than the hidden local DID.
         assert!(call(&ctx, "gone.nearhorizon.app").await.is_err());
         assert_eq!(mock.resolve_handle_calls(), 1);
+    }
+
+    /// #494: a deactivated local account's handle still resolves, locally.
+    #[tokio::test]
+    async fn resolve_handle_deactivated_local_account_still_resolves() {
+        let (ctx, mock) = ctx_with_mock().await;
+        seed_actor(&ctx, "did:plc:asleep", "asleep.nearhorizon.app").await;
+        sqlx::query("UPDATE actor SET deactivated_at = $1 WHERE did = $2")
+            .bind("2026-02-01T00:00:00Z")
+            .bind("did:plc:asleep")
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let did = call(&ctx, "asleep.nearhorizon.app").await.unwrap();
+        assert_eq!(did, "did:plc:asleep");
+        assert_eq!(mock.resolve_handle_calls(), 0);
     }
 
     // ── prepare_handle_change: shared handle-change pre-checks (#456) ──
