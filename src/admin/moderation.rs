@@ -539,6 +539,14 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        // A takedown also revokes the account's OAuth logins (#492).
+        sqlx::query(
+            "CREATE TABLE token (token_id TEXT PRIMARY KEY, did TEXT, \
+             revoked INTEGER NOT NULL DEFAULT 0, revoked_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -636,6 +644,14 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        // A takedown also revokes the account's OAuth logins (#492).
+        sqlx::query(
+            "CREATE TABLE token (token_id TEXT PRIMARY KEY, did TEXT, \
+             revoked INTEGER NOT NULL DEFAULT 0, revoked_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -717,6 +733,14 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        // A takedown also revokes the account's OAuth logins (#492).
+        sqlx::query(
+            "CREATE TABLE token (token_id TEXT PRIMARY KEY, did TEXT, \
+             revoked INTEGER NOT NULL DEFAULT 0, revoked_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
 
         // Create minimal account manager for tests
         let config = create_test_config();
@@ -816,6 +840,14 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
+        // A takedown also revokes the account's OAuth logins (#492).
+        sqlx::query(
+            "CREATE TABLE token (token_id TEXT PRIMARY KEY, did TEXT, \
+             revoked INTEGER NOT NULL DEFAULT 0, revoked_at TEXT)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO actor (did, handle) VALUES ('did:plc:victim', 'v.test')",
         )

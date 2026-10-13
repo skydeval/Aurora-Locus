@@ -792,7 +792,14 @@ async fn get_record(
                 labels,
             }))
         }
-        None => Err(record_miss_error(&query.collection, uri)),
+        // A record that does not exist in a repository that does, in any
+        // collection, is `RecordNotFound` (HTTP 400): the one error the
+        // lexicon declares for the method, and the name consumers use to tell
+        // "absent" from any other failure (#489). Private-tier collections
+        // answer the same way (#493): an existing private record is served to
+        // any caller (decoded or encoded), so a different answer for a
+        // missing one would hide nothing.
+        None => Err(PdsError::RecordNotFound(uri)),
     }
 }
 
@@ -826,23 +833,6 @@ async fn assert_readable_by(
     crate::api::sync_helpers::assert_repo_readable(ctx, repo_did, is_admin_or_self).await
 }
 
-/// The error for a `getRecord` miss in a repository that exists (#489).
-///
-/// A public record is `RecordNotFound` (HTTP 400): the one error the lexicon
-/// declares for the method, and the name clients use to tell "absent" from
-/// any other failure. Records in the private-tier namespace keep the generic
-/// `NotFound` (404) they have always answered with; that path is deliberately
-/// left as it was.
-fn record_miss_error(collection: &str, uri: String) -> PdsError {
-    if collection.starts_with(PRIVATE_TIER_NSID_PREFIX) {
-        PdsError::NotFound(format!("Record not found: {}", uri))
-    } else {
-        PdsError::RecordNotFound(uri)
-    }
-}
-
-/// Collections under this prefix are private-tier (kryphocron) records.
-const PRIVATE_TIER_NSID_PREFIX: &str = "tools.kryphocron.";
 
 /// List records in a collection
 async fn list_records(
@@ -1253,11 +1243,42 @@ mod get_record_miss_tests {
         );
     }
 
+    /// #493: a missing private-tier record is the same `RecordNotFound` as a
+    /// public one, in each private collection a consumer keeps a copy of.
     #[tokio::test]
-    async fn missing_private_tier_record_keeps_the_generic_not_found() {
+    async fn missing_private_tier_record_is_record_not_found() {
         let (ctx, did) = ctx_with_repo().await;
-        let err = miss(&ctx, &did, PRIVATE_POST).await;
-        assert!(matches!(err, PdsError::NotFound(_)), "got {err:?}");
+        for collection in [
+            PRIVATE_POST,
+            "tools.kryphocron.policy.audience",
+            "tools.kryphocron.graph.block",
+        ] {
+            let err = miss(&ctx, &did, collection).await;
+            assert_eq!(
+                err,
+                PdsError::RecordNotFound(format!("at://{did}/{collection}/self")),
+                "{collection}"
+            );
+        }
+    }
+
+    /// #493: `com.atproto.sync.getRecord` reads through the same store and
+    /// answers a miss with the error its lexicon declares.
+    #[tokio::test]
+    async fn sync_get_record_miss_is_record_not_found() {
+        let (ctx, did) = ctx_with_repo().await;
+        let err = crate::actor_store::car::export_record_to_car(
+            &ctx.actor_store,
+            &did,
+            PROFILE,
+            "self",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PdsError::RecordNotFound(format!("at://{did}/{PROFILE}/self"))
+        );
     }
 
     /// #491: a deactivated repository is refused for both tiers, and served
@@ -1275,16 +1296,14 @@ mod get_record_miss_tests {
         }
 
         ctx.account_manager.reactivate_account(&did).await.unwrap();
-        // Active again: back to the ordinary answers (nothing was written, so
-        // these are the per-tier misses).
-        assert!(matches!(
-            miss(&ctx, &did, PROFILE).await,
-            PdsError::RecordNotFound(_)
-        ));
-        assert!(matches!(
-            miss(&ctx, &did, PRIVATE_POST).await,
-            PdsError::NotFound(_)
-        ));
+        // Active again: back to the ordinary answer (nothing was written, so
+        // that is a record miss in both tiers).
+        for collection in [PROFILE, PRIVATE_POST] {
+            assert!(matches!(
+                miss(&ctx, &did, collection).await,
+                PdsError::RecordNotFound(_)
+            ));
+        }
     }
 
     #[tokio::test]

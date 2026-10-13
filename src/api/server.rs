@@ -355,6 +355,10 @@ async fn create_session(
         .await
     {
         Ok(result) => result,
+        // The password was right but the account is taken down: say so, and
+        // do not fall through to the app-password path (which would turn it
+        // into a generic "invalid password") (#492).
+        Err(err @ PdsError::AccountTakenDown(_)) => return Err(err),
         Err(err) => {
             if !matches!(
                 err,
@@ -418,6 +422,9 @@ async fn create_session(
         // no-op by design, matching the password-login handler.
     }
 
+    // A deactivated account logs in like any other; the response says it is
+    // not active, and the client shows its reactivate screen (#492).
+    let (active, status) = session_status(&account);
     Ok(Json(SessionResponse {
         did: account.did,
         handle: account.handle.unwrap_or_default(),
@@ -425,7 +432,21 @@ async fn create_session(
         refresh_jwt: session.refresh_token,
         email: account.email,
         email_confirmed: Some(account.email_confirmed_at.is_some()),
+        active,
+        status,
     }))
+}
+
+/// The `active` / `status` pair a session document reports for `account`
+/// (#492): `(true, None)` for an active account, otherwise `false` and
+/// `takendown` / `deactivated` / `suspended` / `desynchronized`.
+fn session_status(account: &crate::db::account::ActorAccount) -> (bool, Option<String>) {
+    crate::api::sync_helpers::get_repo_status(
+        account.takedown_ref.is_some(),
+        account.deactivated_at.as_ref(),
+        account.suspended_at.as_ref(),
+        account.desynchronized_at.as_ref(),
+    )
 }
 
 /// Get session info endpoint
@@ -470,6 +491,7 @@ async fn get_session(
 
     // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
+    let (active, status) = session_status(&account);
 
     Ok(Json(hide_email_unless_granted(
         &unified,
@@ -479,6 +501,8 @@ async fn get_session(
             email: account.email,
             email_confirmed: Some(account.email_confirmed_at.is_some()),
             role,
+            active,
+            status,
         },
     )))
 }
@@ -566,6 +590,7 @@ async fn refresh_session(
 
     // Get account info
     let account = ctx.account_manager.get_account(&session.did).await?;
+    let (active, status) = session_status(&account);
 
     Ok(Json(SessionResponse {
         did: account.did.clone(),
@@ -574,6 +599,8 @@ async fn refresh_session(
         refresh_jwt: session.refresh_token,
         email: account.email,
         email_confirmed: Some(account.email_confirmed_at.is_some()),
+        active,
+        status,
     }))
 }
 
@@ -1744,20 +1771,17 @@ struct ActivateAccountRequest {
 
 /// Activate (reactivate) account endpoint.
 ///
-/// Two auth paths (chainlink #82 — documented Aurora divergence from
-/// atproto spec):
+/// Two auth paths:
 ///
-/// 1. **JWT path (spec)**: bearer token in `authorization` header.
-///    Used when the caller still holds a valid pre-deactivation
-///    session (rare — `deactivate_account` invalidates sessions).
-///    Body may be empty or `{}`.
+/// 1. **Session path (spec)**: bearer token in `authorization` header.
+///    The normal way back (#492): a deactivated account keeps its
+///    sessions and can log in, its session reports `active: false`, and
+///    the client's reactivate screen calls this. Body may be empty or
+///    `{}`.
 ///
-/// 2. **Credentials path (Aurora recovery)**: empty/missing
-///    `authorization` header + body `{handle, password}`. Required
-///    because `AccountManager::deactivate_account` deletes every
-///    session+refresh_token row for the DID, and `login`
-///    short-circuits on `deactivated_at != NULL`. Without this
-///    path, deactivation would be a one-way trapdoor.
+/// 2. **Credentials path (Aurora addition, chainlink #82)**:
+///    empty/missing `authorization` header + body `{handle, password}`.
+///    Kept as a second way back in for a caller with no session.
 async fn activate_account(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -2225,6 +2249,103 @@ mod create_session_ip_binding_tests {
                 "{identifier}"
             );
         }
+    }
+
+    async fn log_in(
+        ctx: &AppContext,
+        identifier: &str,
+        password: &str,
+    ) -> PdsResult<SessionResponse> {
+        create_session(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateSessionRequest {
+                identifier: identifier.to_string(),
+                password: password.to_string(),
+            }),
+        )
+        .await
+        .map(|Json(session)| session)
+    }
+
+    /// #492: a deactivated account logs in, is told it is not active, keeps
+    /// the sessions it had, and reads as active again once reactivated.
+    #[tokio::test]
+    async fn deactivated_account_logs_in_and_reports_its_status() {
+        let ctx = create_test_context_with(|_| {}).await;
+        let did = "did:plc:deactlogin000000000000000";
+        seed_password_account(&ctx, did, "deact.test", "right-password").await;
+
+        let before = log_in(&ctx, "deact.test", "right-password").await.unwrap();
+        assert!(before.active && before.status.is_none());
+
+        ctx.account_manager.deactivate_account(did).await.unwrap();
+
+        // The session from before the deactivation is still valid.
+        ctx.account_manager
+            .validate_access_token(&before.access_jwt)
+            .await
+            .expect("deactivation keeps existing sessions");
+
+        let during = log_in(&ctx, "deact.test", "right-password").await.unwrap();
+        assert!(!during.active);
+        assert_eq!(during.status.as_deref(), Some("deactivated"));
+        let wire = serde_json::to_value(&during).unwrap();
+        assert_eq!(wire["active"], false);
+        assert_eq!(wire["status"], "deactivated");
+
+        ctx.account_manager.reactivate_account(did).await.unwrap();
+        let after = log_in(&ctx, "deact.test", "right-password").await.unwrap();
+        assert!(after.active && after.status.is_none());
+    }
+
+    /// #492: a taken-down account cannot log in. It is told why only with the
+    /// right password; a wrong one gets the same generic answer as anyone.
+    #[tokio::test]
+    async fn taken_down_account_cannot_log_in() {
+        let ctx = create_test_context_with(|_| {}).await;
+        let did = "did:plc:takendownlogin0000000000";
+        seed_password_account(&ctx, did, "down.test", "right-password").await;
+        let session = log_in(&ctx, "down.test", "right-password").await.unwrap();
+
+        // An OAuth login for the account, to check it is revoked too.
+        let bearer = "at_takendownoauthlogin0000000001";
+        sqlx::query(
+            "INSERT INTO token (token_id, did, client_id, scope, created_at, updated_at, \
+             expires_at, access_token_hash) VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)",
+        )
+        .bind("tok-takedown")
+        .bind(did)
+        .bind("https://app.example.com/cm.json")
+        .bind("atproto transition:generic")
+        .bind("2026-01-01T00:00:00Z")
+        .bind("2099-01-01T00:00:00Z")
+        .bind(crate::oauth::access_token_hash(bearer))
+        .execute(&ctx.account_db)
+        .await
+        .unwrap();
+        assert!(crate::auth::validate_oauth_token(&ctx, bearer).await.is_ok());
+
+        ctx.account_manager
+            .takedown_account(did, "test-ref")
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            log_in(&ctx, "down.test", "right-password").await,
+            Err(PdsError::AccountTakenDown(_))
+        ));
+        assert_eq!(
+            log_in(&ctx, "down.test", "wrong-password").await.unwrap_err(),
+            PdsError::Authentication("Invalid identifier or password".to_string())
+        );
+        // Its password session and its OAuth login are both gone.
+        assert!(ctx
+            .account_manager
+            .validate_access_token(&session.access_jwt)
+            .await
+            .is_err());
+        assert!(crate::auth::validate_oauth_token(&ctx, bearer).await.is_err());
     }
 
     // #442 Gate 1 regression: the standard `com.atproto.server.createSession` login

@@ -305,8 +305,9 @@ impl AccountManager {
     /// Verify a local account's password WITHOUT minting a session.
     ///
     /// The credential-checking half of [`AccountManager::login`]: resolve the
-    /// identifier, reject deactivated/taken-down accounts, and verify the argon2
-    /// hash — all under a fixed 350ms floor so response time cannot distinguish
+    /// identifier, verify the argon2 hash, and refuse a taken-down account (a
+    /// deactivated one may log in, #492) — all under a fixed 350ms floor so
+    /// response time cannot distinguish
     /// an unknown identifier from a wrong password (username-oracle resistance).
     /// Used by the AS browser sign-in (chainlink #439), which needs the password
     /// check but mints a *browser* session rather than an account session.
@@ -322,18 +323,6 @@ impl AccountManager {
             // Find account by handle or email.
             let account = self.get_account_by_identifier(identifier).await?;
 
-            // Reject deactivated or taken-down accounts.
-            if account.deactivated_at.is_some() {
-                return Err(PdsError::Authorization(
-                    "Account is deactivated".to_string(),
-                ));
-            }
-            if account.takedown_ref.is_some() {
-                return Err(PdsError::Authorization(
-                    "Account has been taken down".to_string(),
-                ));
-            }
-
             // Verify password exists (must have local account).
             let password_hash = account.password_hash.as_ref().ok_or_else(|| {
                 PdsError::Authentication("No local account credentials".to_string())
@@ -343,6 +332,17 @@ impl AccountManager {
                 .map_err(|e| PdsError::Internal(format!("Password verification failed: {}", e)))?;
             if !valid {
                 return Err(PdsError::Authentication("Invalid credentials".to_string()));
+            }
+
+            // A taken-down account cannot log in (#492). Checked after the
+            // password so the answer is only given to someone who holds it. A
+            // deactivated account CAN log in: its session reports
+            // `active: false` and is limited to reactivating, migrating or
+            // deleting the account.
+            if account.takedown_ref.is_some() {
+                return Err(PdsError::AccountTakenDown(
+                    "Account has been taken down".to_string(),
+                ));
             }
 
             Ok(account)
@@ -2526,16 +2526,11 @@ impl AccountManager {
             .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
-        sqlx::query("DELETE FROM session WHERE did = $1")
-            .bind(did)
-            .execute(&mut **tx)
-            .await
-            .map_err(PdsError::Database)?;
-        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
-            .bind(did)
-            .execute(&mut **tx)
-            .await
-            .map_err(PdsError::Database)?;
+        // The account's sessions and OAuth logins are deliberately kept
+        // (#492). A deactivated account stays logged in so its client can
+        // show the reactivate screen; what it may do while deactivated is
+        // limited per request (`check_account_moderation`), not by logging
+        // it out.
         tracing::info!("Account temporarily deactivated for DID: {}", did);
         Ok(())
     }
@@ -2617,6 +2612,18 @@ impl AccountManager {
             .execute(&mut **tx)
             .await
             .map_err(PdsError::Database)?;
+
+        // Revoke the account's OAuth logins too (#492): they are sessions in
+        // all but name, and survived a takedown until now. (`revoked = TRUE`
+        // is the dual-dialect literal.)
+        sqlx::query(
+            "UPDATE token SET revoked = TRUE, revoked_at = $1 WHERE did = $2 AND NOT revoked",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(did)
+        .execute(&mut **tx)
+        .await
+        .map_err(PdsError::Database)?;
 
         tracing::info!(
             "Account taken down: DID={}, takedown_ref={}, sessions and tokens revoked",
@@ -2830,19 +2837,6 @@ impl AccountManager {
             // Find account
             let account = self.get_account_by_identifier(identifier).await?;
 
-            // Check if account is deactivated or taken down
-            if account.deactivated_at.is_some() {
-                return Err(PdsError::Authorization(
-                    "Account is deactivated".to_string(),
-                ));
-            }
-
-            if account.takedown_ref.is_some() {
-                return Err(PdsError::Authorization(
-                    "Account has been taken down".to_string(),
-                ));
-            }
-
             // Find matching app password by trying to verify against all user's app passwords
             let rows = sqlx::query("SELECT name, password_hash FROM app_password WHERE did = $1")
                 .bind(&account.did)
@@ -2863,6 +2857,15 @@ impl AccountManager {
 
             let app_password_name = matched_name
                 .ok_or_else(|| PdsError::Authentication("Invalid app password".to_string()))?;
+
+            // As in `verify_password`: a taken-down account cannot log in, and
+            // is only told so once the credential matched; a deactivated
+            // account can (#492).
+            if account.takedown_ref.is_some() {
+                return Err(PdsError::AccountTakenDown(
+                    "Account has been taken down".to_string(),
+                ));
+            }
 
             // Create session with app_password_name
             let session = self

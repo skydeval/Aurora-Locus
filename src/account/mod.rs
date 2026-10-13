@@ -52,6 +52,19 @@ pub struct SessionResponse {
     pub refresh_jwt: String,
     pub email: Option<String>,
     pub email_confirmed: Option<bool>,
+    /// `false` when the account is not active (#492). A deactivated account
+    /// may still log in; clients read this to show their reactivate screen.
+    #[serde(default = "default_active")]
+    pub active: bool,
+    /// Why the account is not active (`deactivated`, `takendown`,
+    /// `suspended`, `desynchronized`); omitted when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// `active` defaults to `true` when a session document does not carry it.
+fn default_active() -> bool {
+    true
 }
 
 /// Session info (for getSession)
@@ -75,6 +88,13 @@ pub struct SessionInfo {
     /// keeps the standard atproto session shape unchanged for non-operators.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// `false` when the account is not active (#492); see
+    /// [`SessionResponse::active`].
+    #[serde(default = "default_active")]
+    pub active: bool,
+    /// Why the account is not active; omitted when it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
 }
 
 /// Validated session from bearer token
@@ -149,6 +169,8 @@ mod session_info_tests {
             email: None,
             email_confirmed: Some(false),
             role: Some("superadmin".to_string()),
+            active: true,
+            status: None,
         };
         let v = serde_json::to_value(&s).expect("serialize");
         assert_eq!(v["role"], serde_json::json!("superadmin"));
@@ -162,6 +184,8 @@ mod session_info_tests {
             email: None,
             email_confirmed: Some(false),
             role: None,
+            active: true,
+            status: None,
         };
         let v = serde_json::to_value(&s).expect("serialize");
         assert!(
@@ -169,5 +193,31 @@ mod session_info_tests {
             "role must be omitted (not null) for regular accounts so the standard \
              session shape is unchanged",
         );
+        // #492: an active account says so and carries no status.
+        assert_eq!(v["active"], serde_json::json!(true));
+        assert!(v.get("status").is_none());
+    }
+
+    /// #492: a deactivated account's session reports it, which is what
+    /// clients use to show the reactivate screen.
+    #[test]
+    fn inactive_status_is_reported() {
+        let s = SessionInfo {
+            did: "did:plc:user".to_string(),
+            handle: "user.localhost".to_string(),
+            email: None,
+            email_confirmed: None,
+            role: None,
+            active: false,
+            status: Some("deactivated".to_string()),
+        };
+        let v = serde_json::to_value(&s).expect("serialize");
+        assert_eq!(v["active"], serde_json::json!(false));
+        assert_eq!(v["status"], serde_json::json!("deactivated"));
+        // A session document without the fields reads as active.
+        let parsed: SessionInfo =
+            serde_json::from_value(serde_json::json!({"did": "did:plc:x", "handle": "x.test"}))
+                .unwrap();
+        assert!(parsed.active && parsed.status.is_none());
     }
 }

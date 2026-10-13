@@ -574,6 +574,7 @@ pub async fn check_account_moderation(
     next: Next,
 ) -> Result<Response, PdsError> {
     let headers = req.headers().clone();
+    let path = req.uri().path().to_string();
 
     // Only check moderation for authenticated requests
     if let Some(token) = extract_bearer_token(&headers) {
@@ -583,31 +584,117 @@ pub async fn check_account_moderation(
             .validate_access_token_with_ip(&token, current_ip)
             .await
         {
-            enforce_account_moderation(&ctx, &session.did).await?;
+            enforce_account_moderation(&ctx, &session.did, &path).await?;
 
             // Add session to request extensions for downstream use
             req.extensions_mut().insert(session);
         }
     } else if let Some(did) = oauth_resolved_did(&headers) {
         // An atproto-OAuth token the gate already verified: the account it
-        // acts for is held to the same takedown / suspension rules (#482).
-        enforce_account_moderation(&ctx, &did).await?;
+        // acts for is held to the same rules (#482, #492).
+        enforce_account_moderation(&ctx, &did, &path).await?;
     }
 
     Ok(next.run(req).await)
 }
 
-/// Refuse a request acting for `did` when the account is taken down or
-/// suspended. Admins are exempt; a failed moderation lookup is logged and does
-/// not fail the request.
-async fn enforce_account_moderation(ctx: &AppContext, did: &str) -> PdsResult<()> {
-    // Check if this is an admin - admins bypass moderation checks
+/// The XRPC methods a deactivated account may still call (#492), besides the
+/// `com.atproto.sync.*` reads. A deactivated account can log in; what it can
+/// do is come back, leave, or finish migrating in (an account that is being
+/// migrated here is deactivated until its repository has arrived). Everything
+/// else answers `AccountDeactivated`, which is what makes a client show its
+/// reactivate screen instead of a working interface.
+const DEACTIVATED_ACCOUNT_METHODS: &[&str] = &[
+    // Its session.
+    "com.atproto.server.getSession",
+    "com.atproto.server.refreshSession",
+    "com.atproto.server.deleteSession",
+    // Come back, or leave.
+    "com.atproto.server.activateAccount",
+    "com.atproto.server.deactivateAccount",
+    "com.atproto.server.checkAccountStatus",
+    "com.atproto.server.requestAccountDelete",
+    "com.atproto.server.deleteAccount",
+    // Migrating in.
+    "com.atproto.repo.importRepo",
+    "com.atproto.repo.uploadBlob",
+    "com.atproto.repo.listMissingBlobs",
+    "app.bsky.actor.getPreferences",
+    "app.bsky.actor.putPreferences",
+    "com.atproto.identity.getRecommendedDidCredentials",
+    "com.atproto.identity.requestPlcOperationSignature",
+    "com.atproto.identity.signPlcOperation",
+    "com.atproto.identity.submitPlcOperation",
+    "com.atproto.server.getServiceAuth",
+    // Reading its own repository (each handler limits a non-active
+    // repository to its own account and admins).
+    "com.atproto.repo.getRecord",
+    "com.atproto.repo.listRecords",
+    "com.atproto.repo.describeRepo",
+    // Public methods a client calls with its token attached; they need no
+    // account at all, so the account's state does not matter to them.
+    "com.atproto.server.describeServer",
+    "com.atproto.server.createSession",
+    "com.atproto.server.requestPasswordReset",
+    "com.atproto.server.resetPassword",
+    "com.atproto.server.confirmEmail",
+    "com.atproto.identity.resolveHandle",
+];
+
+/// May a deactivated account make this request? Anything that is not an XRPC
+/// call (static pages, health checks) is not an account action and passes.
+fn deactivated_account_may_call(path: &str) -> bool {
+    match path.strip_prefix("/xrpc/") {
+        Some(method) => {
+            method.starts_with("com.atproto.sync.") || DEACTIVATED_ACCOUNT_METHODS.contains(&method)
+        }
+        None => true,
+    }
+}
+
+/// Refuse a request acting for `did` when the account's state does not allow
+/// it:
+///
+/// - **taken down** (the account's own takedown flag, or an active takedown in
+///   the moderation record) or **suspended**: everything, with
+///   `AccountTakedown` / `AccountSuspended`. Admins are exempt so they can
+///   review moderated accounts.
+/// - **deactivated**: everything outside [`DEACTIVATED_ACCOUNT_METHODS`], with
+///   `AccountDeactivated` (#492). This is the account's own state rather than a
+///   moderation decision, so it applies to admins as well.
+///
+/// A failed lookup is logged and does not fail the request.
+async fn enforce_account_moderation(ctx: &AppContext, did: &str, path: &str) -> PdsResult<()> {
     let is_admin = ctx
         .admin_role_manager
         .get_role(did)
         .await
         .unwrap_or(None)
         .is_some();
+
+    // The account row is the source of truth for takedown and deactivation.
+    let state = match ctx.account_manager.get_actor_serve_state(did).await {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(did = %did, error = %e, "moderation_check_failed: account state");
+            None
+        }
+    };
+    let (taken_down, deactivated) = state
+        .map(|s| (s.taken_down, s.deactivated))
+        .unwrap_or((false, false));
+
+    if taken_down && !is_admin {
+        warn!(did = %did, "moderation_blocked: account_taken_down");
+        return Err(PdsError::AccountTakenDown(
+            "Account has been taken down due to terms of service violations".to_string(),
+        ));
+    }
+    if deactivated && !deactivated_account_may_call(path) {
+        return Err(PdsError::AccountDeactivated(did.to_string()));
+    }
+
+    // Admins bypass the moderation-record checks below.
     if is_admin {
         info!(did = %did, "admin_access_granted");
         return Ok(());
@@ -1915,7 +2002,9 @@ mod oauth_permission_tests {
             )
             .await
             .unwrap();
-        assert!(enforce_account_moderation(&ctx, &account.did).await.is_ok());
+        assert!(enforce_account_moderation(&ctx, &account.did, WRITE)
+            .await
+            .is_ok());
 
         ctx.moderation_manager
             .apply_action(crate::admin::moderation::ApplyActionParams {
@@ -1929,8 +2018,125 @@ mod oauth_permission_tests {
             })
             .await
             .unwrap();
+        // Refused everywhere, including what a deactivated account may call.
+        for path in [WRITE, GET_SESSION, ACTIVATE] {
+            assert!(
+                matches!(
+                    enforce_account_moderation(&ctx, &account.did, path).await,
+                    Err(PdsError::AccountTakenDown(_))
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    const WRITE: &str = "/xrpc/com.atproto.repo.createRecord";
+    const GET_SESSION: &str = "/xrpc/com.atproto.server.getSession";
+    const ACTIVATE: &str = "/xrpc/com.atproto.server.activateAccount";
+
+    async fn account(ctx: &AppContext, handle: &str) -> String {
+        ctx.account_manager
+            .create_account(
+                handle.to_string(),
+                None,
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .did
+    }
+
+    /// #492: a deactivated account keeps its login but may only come back,
+    /// leave, or finish migrating in.
+    #[tokio::test]
+    async fn deactivated_account_is_limited_to_the_reactivation_set() {
+        let ctx = ctx().await;
+        let did = account(&ctx, "deactivated.localhost").await;
+        ctx.account_manager.deactivate_account(&did).await.unwrap();
+
+        for allowed in [
+            GET_SESSION,
+            ACTIVATE,
+            "/xrpc/com.atproto.server.refreshSession",
+            "/xrpc/com.atproto.server.checkAccountStatus",
+            "/xrpc/com.atproto.server.deleteAccount",
+            "/xrpc/com.atproto.repo.importRepo",
+            "/xrpc/com.atproto.repo.uploadBlob",
+            "/xrpc/app.bsky.actor.putPreferences",
+            "/xrpc/com.atproto.identity.submitPlcOperation",
+            "/xrpc/com.atproto.sync.getRepo",
+            "/xrpc/com.atproto.repo.getRecord",
+            "/xrpc/com.atproto.server.describeServer",
+            "/health/ready",
+        ] {
+            assert!(
+                enforce_account_moderation(&ctx, &did, allowed).await.is_ok(),
+                "{allowed} should stay open"
+            );
+        }
+        for refused in [
+            WRITE,
+            "/xrpc/com.atproto.repo.putRecord",
+            "/xrpc/com.atproto.repo.deleteRecord",
+            "/xrpc/com.atproto.repo.applyWrites",
+            "/xrpc/app.bsky.feed.getTimeline",
+            "/xrpc/chat.bsky.convo.listConvos",
+            "/xrpc/com.atproto.identity.updateHandle",
+            "/xrpc/com.atproto.server.createAppPassword",
+            "/xrpc/com.atproto.server.updateEmail",
+        ] {
+            assert_eq!(
+                enforce_account_moderation(&ctx, &did, refused).await,
+                Err(PdsError::AccountDeactivated(did.clone())),
+                "{refused} should be refused"
+            );
+        }
+
+        // Reactivated: everything is open again.
+        ctx.account_manager.reactivate_account(&did).await.unwrap();
+        assert!(enforce_account_moderation(&ctx, &did, WRITE).await.is_ok());
+    }
+
+    /// Deactivation is the account's own state, so it limits an admin too;
+    /// a takedown does not (admins review moderated accounts).
+    #[tokio::test]
+    async fn deactivation_applies_to_admins_and_takedown_does_not() {
+        let ctx = ctx().await;
+        let did = account(&ctx, "adminacct.localhost").await;
+        ctx.admin_role_manager
+            .grant_role(&did, crate::admin::roles::Role::Admin, "system", None)
+            .await
+            .unwrap();
+
+        ctx.account_manager.deactivate_account(&did).await.unwrap();
         assert!(matches!(
-            enforce_account_moderation(&ctx, &account.did).await,
+            enforce_account_moderation(&ctx, &did, WRITE).await,
+            Err(PdsError::AccountDeactivated(_))
+        ));
+        assert!(enforce_account_moderation(&ctx, &did, ACTIVATE).await.is_ok());
+        ctx.account_manager.reactivate_account(&did).await.unwrap();
+
+        ctx.account_manager
+            .takedown_account(&did, "test-ref")
+            .await
+            .unwrap();
+        assert!(enforce_account_moderation(&ctx, &did, WRITE).await.is_ok());
+    }
+
+    /// The account row's own takedown flag is enough: no moderation record
+    /// is needed for the request to be refused.
+    #[tokio::test]
+    async fn takedown_flag_alone_refuses_requests() {
+        let ctx = ctx().await;
+        let did = account(&ctx, "flagged.localhost").await;
+        ctx.account_manager
+            .takedown_account(&did, "test-ref")
+            .await
+            .unwrap();
+        assert!(matches!(
+            enforce_account_moderation(&ctx, &did, GET_SESSION).await,
             Err(PdsError::AccountTakenDown(_))
         ));
     }
