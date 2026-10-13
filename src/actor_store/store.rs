@@ -1,6 +1,11 @@
 /// Actor Store Manager - Handles per-user repository databases
 use crate::{
-    actor_store::{get_actor_location, models::*, ActorLocation},
+    actor_store::{
+        get_actor_location,
+        models::*,
+        subject_index::{self, SubjectProbe},
+        ActorLocation,
+    },
     crypto::Secp256k1KeyPair,
     error::{PdsError, PdsResult},
     read_after_write::{LocalRecords, RecordDescript},
@@ -127,6 +132,10 @@ impl ActorStore {
         // `Repo::load`, which would try to dereference a block that
         // doesn't exist in the blockstore.
 
+        // The subject index must be in the file before the pool is handed
+        // out: a write through a pool without its triggers is not queued.
+        subject_index::ensure_installed(&pool).await?;
+
         // Add to cache
         {
             let mut cache = self.db_cache.write().await;
@@ -165,6 +174,10 @@ impl ActorStore {
         )
         .await
         .map_err(PdsError::Database)?;
+
+        // As in `create`: never cache or return a pool on a file that has
+        // not got the subject index. A failed install fails the open.
+        subject_index::ensure_installed(&pool).await?;
 
         // Add to cache
         {
@@ -339,6 +352,23 @@ impl ActorStore {
             .collect();
 
         Ok(records)
+    }
+
+    /// Whether the repository of `did` holds records naming given subjects:
+    /// one answer per probe, in order. Answers come from the subject index
+    /// ([`crate::actor_store::subject_index`]), so the cost does not depend
+    /// on the size of the collection.
+    ///
+    /// # Errors
+    ///
+    /// A store error. An error is never an answer.
+    pub async fn subject_facts(
+        &self,
+        did: &str,
+        probes: &[SubjectProbe<'_>],
+    ) -> PdsResult<Vec<bool>> {
+        let pool = self.open_db(did).await?;
+        subject_index::subject_facts(&pool, probes).await
     }
 
     /// Get all distinct collections for a DID
