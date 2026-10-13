@@ -161,6 +161,13 @@ pub enum PdsError {
     #[error("Account suspended: {0}")]
     AccountSuspended(String),
 
+    /// A request made as a deactivated account, to an endpoint a deactivated
+    /// account may not use (#492). The account can still log in and
+    /// reactivate; clients show their reactivate screen on this error name.
+    /// Mapped to HTTP 401 `AccountDeactivated`.
+    #[error("Account is deactivated: {0}")]
+    AccountDeactivated(String),
+
     /// Arc 14 §7.3.5 — sync-namespace handler called against a DID
     /// with no actor row. Distinct from the generic `NotFound` so
     /// the wire-emitted `error` name is `"RepoNotFound"` per spec.
@@ -651,6 +658,7 @@ impl PartialEq for PdsError {
             (PdsError::Jwt(a), PdsError::Jwt(b)) => a == b,
             (PdsError::AccountTakenDown(a), PdsError::AccountTakenDown(b)) => a == b,
             (PdsError::AccountSuspended(a), PdsError::AccountSuspended(b)) => a == b,
+            (PdsError::AccountDeactivated(a), PdsError::AccountDeactivated(b)) => a == b,
             (PdsError::NotLeader(a), PdsError::NotLeader(b)) => a == b,
             (
                 PdsError::SubjectVariantMismatch { expected: ae, got: ag },
@@ -889,6 +897,11 @@ impl IntoResponse for PdsError {
             PdsError::AccountSuspended(_) => {
                 (StatusCode::FORBIDDEN, "AccountSuspended", self.to_string())
             }
+            PdsError::AccountDeactivated(_) => (
+                StatusCode::UNAUTHORIZED,
+                "AccountDeactivated",
+                self.to_string(),
+            ),
             PdsError::DidTombstoned(_) => (
                 StatusCode::BAD_REQUEST,
                 "DidTombstoned",

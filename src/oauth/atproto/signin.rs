@@ -66,8 +66,9 @@ pub async fn submit_signin(
 
     // Verify the account credential (account.password_hash) via the same
     // timing-attack-mitigated path the password admin login uses. Any failure —
-    // unknown identifier, wrong password, deactivated/taken-down, no local
-    // credential — collapses to one uniform message (no existence oracle).
+    // unknown identifier, wrong password, taken-down, no local credential —
+    // collapses to one uniform message (no existence oracle). A deactivated
+    // account signs in like any other (#492).
     let account = match ctx.account_manager.verify_password(identifier, password).await {
         Ok(account) => account,
         Err(_) => return page(StatusCode::UNAUTHORIZED, &return_to, Some("Invalid handle or password.")),
