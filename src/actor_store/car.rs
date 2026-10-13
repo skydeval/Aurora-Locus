@@ -88,7 +88,9 @@ pub async fn export_record_to_car(
     let record = store
         .get_record(did, &uri)
         .await?
-        .ok_or_else(|| PdsError::NotFound(format!("Record not found: {}", uri)))?;
+        // `RecordNotFound` is the error `com.atproto.sync.getRecord`'s lexicon
+        // declares for this (#493); it was the generic `NotFound`.
+        .ok_or_else(|| PdsError::RecordNotFound(uri.clone()))?;
 
     // Validate that the recorded CID is well-formed even though we don't pass
     // it to the CAR encoder directly — corrupt metadata is worth surfacing
