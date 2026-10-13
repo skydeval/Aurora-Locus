@@ -1,0 +1,70 @@
+# Deploy image build (fork-only).
+#
+# Builds the production image from the `skydeval/deploy` branch on a
+# self-hosted runner and pushes it to the GitHub container registry, so the
+# deployment host pulls a ready image instead of compiling the PDS itself.
+#
+# This file lives only on `skydeval/deploy`. That branch is the code to deploy
+# plus this pipeline commit, and is never the source of a pull request. The
+# job is also pinned to the fork, so it does nothing anywhere else.
+#
+# Tags pushed for every build:
+#   ghcr.io/skydeval/aurora-locus:<commit sha>   (immutable; use to roll back)
+#   ghcr.io/skydeval/aurora-locus:deploy         (the latest build)
+
+name: Image
+
+on:
+  push:
+    branches: [skydeval/deploy]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# One build at a time; a newer push supersedes a build still in progress.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/skydeval/aurora-locus
+
+jobs:
+  build:
+    name: Build and push
+    if: github.repository == 'skydeval/Aurora-Locus'
+    runs-on: [self-hosted, aurora-image]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # Keep registry credentials out of the runner account's own Docker
+        # config: use a per-job config directory for this and later steps.
+        run: |
+          export DOCKER_CONFIG="$RUNNER_TEMP/docker-config"
+          mkdir -p "$DOCKER_CONFIG"
+          echo "DOCKER_CONFIG=$DOCKER_CONFIG" >> "$GITHUB_ENV"
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        run: |
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            -t "$IMAGE:${{ github.sha }}" \
+            -t "$IMAGE:deploy" \
+            .
+
+      - name: Push
+        run: |
+          docker push "$IMAGE:${{ github.sha }}"
+          docker push "$IMAGE:deploy"
+
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io

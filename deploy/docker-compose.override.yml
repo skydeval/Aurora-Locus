@@ -1,0 +1,20 @@
+# Deployment-host override: run the image built by .github/workflows/image.yml
+# instead of building on the host.
+#
+# Copy this file next to docker-compose.yml on the host as
+# `docker-compose.override.yml` (Compose loads it automatically). Then a deploy
+# is:
+#
+#   docker compose pull aurora-locus
+#   docker compose up -d aurora-locus
+#
+# AURORA_IMAGE_TAG picks the build: `deploy` (the default) is the latest one;
+# set it to a commit sha to pin or roll back, e.g.
+#
+#   AURORA_IMAGE_TAG=<sha> docker compose up -d aurora-locus
+
+services:
+  aurora-locus:
+    image: ghcr.io/skydeval/aurora-locus:${AURORA_IMAGE_TAG:-deploy}
+    # Never fall back to compiling on the host.
+    build: !reset null
