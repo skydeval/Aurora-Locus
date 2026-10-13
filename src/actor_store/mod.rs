@@ -9,6 +9,7 @@ pub mod orphan_reconcile;
 pub mod repo_storage;
 pub mod repository;
 pub mod store;
+pub mod subject_index;
 pub mod transaction;
 
 // Re-export commonly used types (allow unused for now as they're part of the public API)
