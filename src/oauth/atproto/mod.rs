@@ -12,6 +12,7 @@
 //! discovery), and the parallel [`scope`] vocabulary. URL-based client trust
 //! is resolved by the β.4 [`client_metadata`] fetcher.
 
+pub mod account_choice;
 pub mod authorize;
 pub mod browser_session;
 pub mod client_metadata;
@@ -67,6 +68,12 @@ pub fn routes() -> Router<AppContext> {
         // whoami — resolves the current session (exercises the validation
         // extractor; reused by β.3's authorize/consent handlers).
         .route("/oauth/atproto/session", get(login::whoami))
+        // Account choice mid-authorization (#502): sign in as the requested
+        // account, cancel, or sign out. CSRF-checked POST.
+        .route(
+            "/oauth/atproto/session/choose",
+            post(account_choice::choose),
+        )
         // β.3 provider surface.
         .route("/oauth/atproto/authorize", get(authorize::authorize))
         .route(

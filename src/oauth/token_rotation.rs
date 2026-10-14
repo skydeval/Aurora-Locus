@@ -140,7 +140,8 @@ impl TokenRotationManager {
 
         // Step 7: Calculate new expiration (access token: 1 hour, refresh: 90 days)
         let now = Utc::now();
-        let _access_expires = now + Duration::hours(1); // TODO: store access token expiration
+        // The access token's lifetime runs from `updated_at`, set below;
+        // validation enforces it (#502).
         let refresh_expires = now + Duration::days(90);
 
         // Step 8: Update token record with new tokens. The new bearer is
@@ -149,14 +150,14 @@ impl TokenRotationManager {
         // bearer's hash is overwritten, so the prior bearer no longer
         // validates.
         let new_access_token_hash = crate::oauth::access_token_hash(&new_access_token);
-        sqlx::query(
+        let updated = sqlx::query(
             r#"
             UPDATE token
             SET current_refresh_token = $1,
                 updated_at = $2,
                 expires_at = $3,
                 access_token_hash = $4
-            WHERE token_id = $5
+            WHERE token_id = $5 AND NOT revoked
             "#,
         )
         .bind(&new_refresh_token)
@@ -165,7 +166,13 @@ impl TokenRotationManager {
         .bind(&new_access_token_hash)
         .bind(&token_record.token_id)
         .execute(&self.db)
-        .await?;
+        .await?
+        .rows_affected();
+        // Revoked between the lookup and here: the new tokens were never
+        // stored, so do not hand them out as if they were.
+        if updated == 0 {
+            return Err(PdsError::Authentication("Refresh token revoked".to_string()));
+        }
 
         debug!(
             "✓ Token rotated successfully for account: {}",
@@ -177,7 +184,7 @@ impl TokenRotationManager {
             access_token: new_access_token,
             refresh_token: new_refresh_token,
             token_type: "Bearer".to_string(),
-            expires_in: 3600, // 1 hour in seconds
+            expires_in: crate::oauth::ACCESS_TOKEN_TTL_SECS,
             scope: token_record.scope,
         })
     }
@@ -260,7 +267,7 @@ impl TokenRotationManager {
             r#"
             SELECT token_id, did, client_id, scope, expires_at, created_at, updated_at
             FROM token
-            WHERE current_refresh_token = $1
+            WHERE current_refresh_token = $1 AND NOT revoked
             "#,
         )
         .bind(refresh_token)
@@ -356,6 +363,82 @@ struct TokenRecord {
     created_at: DateTime<Utc>,
     #[allow(dead_code)] // Stored in DB for audit trail
     updated_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod revocation_and_lifetime_tests {
+    //! #502: a revoked grant is not refreshed, and an access token stops
+    //! working when its advertised lifetime is over.
+    use super::*;
+    use crate::context::AppContext;
+
+    async fn ctx_with_token(updated_at: chrono::DateTime<Utc>, revoked: bool) -> (AppContext, String, String) {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let account = ctx
+            .account_manager
+            .create_account("tokens.localhost".to_string(), None, "password123".to_string(), None, None)
+            .await
+            .expect("create account");
+        let refresh = "rt_revocationtest".to_string();
+        let access = "at_lifetimetest".to_string();
+        sqlx::query(
+            "INSERT INTO token (token_id, did, client_id, current_refresh_token, scope,
+                                created_at, updated_at, expires_at, access_token_hash, revoked)
+             VALUES ($1, $2, $3, $4, 'atproto', $5, $6, $7, $8, $9)",
+        )
+        .bind("tok-1")
+        .bind(&account.did)
+        .bind("https://app.example.com/cm.json")
+        .bind(&refresh)
+        .bind(updated_at.to_rfc3339())
+        .bind(updated_at.to_rfc3339())
+        .bind((Utc::now() + Duration::days(90)).to_rfc3339())
+        .bind(crate::oauth::access_token_hash(&access))
+        .bind(revoked)
+        .execute(&ctx.account_db)
+        .await
+        .expect("insert token");
+        (ctx, refresh, access)
+    }
+
+    #[tokio::test]
+    async fn a_revoked_grant_is_not_refreshed() {
+        let (ctx, refresh, _) = ctx_with_token(Utc::now(), true).await;
+        let manager = TokenRotationManager::new(ctx.account_db.clone());
+        let result = manager
+            .rotate_token(&refresh, "https://app.example.com/cm.json")
+            .await;
+        assert!(result.is_err(), "revoked grant was refreshed");
+    }
+
+    #[tokio::test]
+    async fn a_live_grant_is_refreshed() {
+        let (ctx, refresh, _) = ctx_with_token(Utc::now(), false).await;
+        let manager = TokenRotationManager::new(ctx.account_db.clone());
+        manager
+            .rotate_token(&refresh, "https://app.example.com/cm.json")
+            .await
+            .expect("live grant refreshes");
+    }
+
+    #[tokio::test]
+    async fn an_access_token_ends_after_its_lifetime() {
+        let fresh = ctx_with_token(Utc::now(), false).await;
+        crate::auth::validate_oauth_token(&fresh.0, &fresh.2)
+            .await
+            .expect("fresh token is valid");
+
+        let stale = ctx_with_token(
+            Utc::now() - Duration::seconds(crate::oauth::ACCESS_TOKEN_TTL_SECS + 60),
+            false,
+        )
+        .await;
+        let err = crate::auth::validate_oauth_token(&stale.0, &stale.2)
+            .await
+            .expect_err("an access token older than its lifetime is refused");
+        assert!(matches!(err, PdsError::Authentication(_)), "{err:?}");
+    }
 }
 
 #[cfg(test)]

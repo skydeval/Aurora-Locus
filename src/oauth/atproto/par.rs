@@ -98,6 +98,7 @@ async fn par_inner(
         created_at: now.to_rfc3339(),
         expires_at: (now + Duration::seconds(PAR_TTL_SECS)).to_rfc3339(),
         response_mode: Some(validated.response_mode.as_str().to_string()),
+        login_hint: validated.login_hint.clone(),
     };
     request_store::insert(&ctx.account_db, &req)
         .await
@@ -149,6 +150,7 @@ mod tests {
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
             response_mode: None,
+            login_hint: None,
         }
     }
 

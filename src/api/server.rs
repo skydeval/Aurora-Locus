@@ -2294,7 +2294,7 @@ mod create_session_ip_binding_tests {
         .bind(did)
         .bind("https://app.example.com/cm.json")
         .bind("atproto transition:generic")
-        .bind("2026-01-01T00:00:00Z")
+        .bind(chrono::Utc::now().to_rfc3339())
         .bind("2099-01-01T00:00:00Z")
         .bind(crate::oauth::access_token_hash(bearer))
         .execute(&ctx.account_db)

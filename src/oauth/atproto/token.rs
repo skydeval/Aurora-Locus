@@ -155,8 +155,13 @@ async fn refresh_token_grant(
     // 2. Proof-of-possession: the presented DPoP key must match the key the
     //    token was bound to at issuance. Look up the row's thumbprint directly;
     //    a mismatch is a stolen-refresh-token signal → reject before rotating.
-    let row =
-        sqlx::query("SELECT did, dpop_thumbprint FROM token WHERE current_refresh_token = $1")
+    //    A revoked grant cannot be refreshed (#502): revocation in the holder's
+    //    connected apps, or of a device, or at takedown, must end the grant,
+    //    not leave its refresh token able to mint a new access token.
+    let row = sqlx::query(
+        "SELECT did, dpop_thumbprint FROM token \
+         WHERE current_refresh_token = $1 AND NOT revoked",
+    )
             .bind(refresh_token)
             .fetch_optional(&ctx.account_db)
             .await
@@ -245,8 +250,9 @@ struct IssuedTokens {
     refresh_token: String,
 }
 
-/// Access-token lifetime advertised to the client (`expires_in`).
-const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
+/// Access-token lifetime advertised to the client (`expires_in`), and enforced
+/// by access-token validation.
+const ACCESS_TOKEN_TTL_SECS: i64 = crate::oauth::ACCESS_TOKEN_TTL_SECS;
 /// Refresh-token lifetime — also the `token.expires_at` column value. NOTE:
 /// the shared `token` schema has a single `expires_at` column that
 /// `validate_oauth_token` reads as the bearer's validity AND the rotation path
@@ -450,6 +456,7 @@ mod tests {
             created_at: now.to_rfc3339(),
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
             response_mode: None,
+            login_hint: None,
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
         // The holder is an account here (atproto_device.did references actor).
