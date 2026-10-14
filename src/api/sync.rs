@@ -10,14 +10,13 @@
 
 use crate::{
     actor_store::car,
-    api::sync_helpers::{assert_repo_readable, get_repo_status},
     context::AppContext,
     error::{PdsError, PdsResult},
 };
 use axum::{
     body::Body,
     extract::{Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
@@ -152,14 +151,20 @@ pub struct GetRecordParams {
 /// `is_admin_or_self` is `false` for unauthenticated callers.
 pub async fn get_repo(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetRepoParams>,
 ) -> PdsResult<Response> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
     // Export repository as CAR
     let car_bytes =
-        car::export_repo_to_car(&ctx.actor_store, &params.did, params.since.as_deref()).await?;
+        car::export_repo_to_car(&ctx.actor_store, &params.did, params.since.as_deref())
+            .await
+            .map_err(repo_not_found(&params.did))?;
 
     // Return CAR file as application/vnd.ipld.car
     Ok(Response::builder()
@@ -179,13 +184,21 @@ pub async fn get_repo(
 /// §7.4 Step 7: federation-public, no auth required.
 pub async fn get_latest_commit(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetLatestCommitParams>,
 ) -> PdsResult<Json<LatestCommitResponse>> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
     // Get the repository root CID (latest commit)
-    let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
+    let repo_root = ctx
+        .actor_store
+        .get_repo_root(&params.did)
+        .await
+        .map_err(repo_not_found(&params.did))?;
 
     Ok(Json(LatestCommitResponse {
         cid: repo_root.cid,
@@ -202,10 +215,14 @@ pub async fn get_latest_commit(
 /// removed for parity).
 pub async fn get_blocks(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetBlocksParams>,
 ) -> PdsResult<Response> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
     // Fetch the requested blocks
     let block_data = ctx
@@ -222,14 +239,18 @@ pub async fn get_blocks(
             .filter(|cid| !found_cids.contains(&cid.as_str()))
             .map(|s| s.as_str())
             .collect();
-        return Err(PdsError::NotFound(format!(
+        return Err(PdsError::BlockNotFound(format!(
             "Could not find cids: {:?}",
             missing
         )));
     }
 
     // Get repo root for CAR header
-    let repo_root = ctx.actor_store.get_repo_root(&params.did).await?;
+    let repo_root = ctx
+        .actor_store
+        .get_repo_root(&params.did)
+        .await
+        .map_err(repo_not_found(&params.did))?;
 
     // Convert blocks to CAR
     let car_bytes = car::blocks_to_car(block_data, Some(&repo_root.cid)).await?;
@@ -248,17 +269,32 @@ pub async fn get_blocks(
 /// federation-public, no auth required.
 pub async fn get_blob(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetBlobParams>,
 ) -> PdsResult<Response> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
-    // Get blob from blob store
+    // The blob must be this account's (#499): uploaded by it, or used by
+    // one of its records. Fetching by CID alone served any blob on the PDS,
+    // a taken-down account's included, under any active account's name.
+    if !ctx
+        .blob_store
+        .owners(&params.cid)
+        .await?
+        .iter()
+        .any(|owner| owner == &params.did)
+    {
+        return Err(PdsError::BlobNotFound(params.cid.clone()));
+    }
     let (data, mime_type) = ctx
         .blob_store
         .get(&params.cid)
         .await?
-        .ok_or_else(|| PdsError::NotFound("Blob not found".to_string()))?;
+        .ok_or_else(|| PdsError::BlobNotFound(params.cid.clone()))?;
 
     // Return blob with security headers (matching Bluesky pattern)
     Ok((
@@ -286,10 +322,14 @@ pub async fn get_blob(
 /// federation-public, no auth required.
 pub async fn list_blobs(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<ListBlobsParams>,
 ) -> PdsResult<Json<ListBlobsResponse>> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
     let limit = params.limit.unwrap_or(100).min(1000);
 
@@ -329,31 +369,36 @@ pub async fn list_repos(
         .list_accounts(params.cursor.as_deref(), limit)
         .await?;
 
+    // Status reads the moderation record too (#499), for the whole page at
+    // once.
+    let dids: Vec<String> = accounts.iter().map(|a| a.did.clone()).collect();
+    let moderation = ctx.moderation_manager.active_flags_for(&dids).await?;
+
     // Build repository info for each account
     let mut repos = Vec::new();
     for account in &accounts {
         // Get the repository root for this DID
         if let Ok(repo_root) = ctx.actor_store.get_repo_root(&account.did).await {
-            let (active, status) = get_repo_status(
-                account.takedown_ref.is_some(),
-                account.deactivated_at.as_ref(),
-                account.suspended_at.as_ref(),
-                account.desynchronized_at.as_ref(),
+            let state = crate::api::account_state::state_of(
+                account,
+                moderation.get(&account.did).copied().unwrap_or_default(),
             );
 
             repos.push(RepoInfo {
                 did: account.did.clone(),
                 head: repo_root.cid,
                 rev: repo_root.rev,
-                active,
-                status,
+                active: state.active,
+                status: state.status_str().map(str::to_string),
             });
         }
     }
 
-    // Determine next cursor
-    let cursor = if repos.len() as i64 == limit {
-        // There may be more results, return the last DID as cursor
+    // The cursor follows the accounts read, not the repositories returned
+    // (#499): an account without a repository root is skipped, and counting
+    // only what was kept ended the listing early at any page with such an
+    // account, so relays never saw the accounts after it.
+    let cursor = if accounts.len() as i64 == limit {
         accounts.last().map(|a| a.did.clone())
     } else {
         None
@@ -371,14 +416,18 @@ pub async fn get_repo_status_endpoint(
 ) -> PdsResult<Json<GetRepoStatusResponse>> {
     // No auth required - this is public info about repo availability
 
-    let account = ctx.account_manager.get_account(&params.did).await?;
+    // An account not hosted here is `RepoNotFound`, as the lexicon declares
+    // (#499); it was a generic `NotFound`.
+    let account = match ctx.account_manager.get_account(&params.did).await {
+        Ok(account) => account,
+        Err(PdsError::NotFound(_)) => return Err(PdsError::RepoNotFound(params.did.clone())),
+        Err(e) => return Err(e),
+    };
 
-    let (active, status) = get_repo_status(
-        account.takedown_ref.is_some(),
-        account.deactivated_at.as_ref(),
-        account.suspended_at.as_ref(),
-        account.desynchronized_at.as_ref(),
-    );
+    // One status for every surface (#499): this read the account row only,
+    // so a suspended account was reported active.
+    let state = crate::api::account_state::state_for(&ctx, &account).await?;
+    let (active, status) = (state.active, state.status_str().map(str::to_string));
 
     let rev = if active {
         ctx.actor_store
@@ -404,10 +453,14 @@ pub async fn get_repo_status_endpoint(
 /// federation-public, no auth required.
 pub async fn get_record(
     State(ctx): State<AppContext>,
+    headers: HeaderMap,
     Query(params): Query<GetRecordParams>,
 ) -> PdsResult<Response> {
-    let is_admin_or_self = false;
-    assert_repo_readable(&ctx, &params.did, is_admin_or_self).await?;
+    // The account itself and admins read a repository that is not active,
+    // as on the reference PDS (#499); a deactivated account exports its
+    // own repository before migrating.
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
     // Export record as CAR
     let car_bytes = car::export_record_to_car(
@@ -425,6 +478,15 @@ pub async fn get_record(
         car_bytes,
     )
         .into_response())
+}
+
+/// Map the store's "no repository root" to `RepoNotFound`, the name the
+/// sync lexicons declare (#499); other errors pass through.
+fn repo_not_found(did: &str) -> impl Fn(PdsError) -> PdsError + '_ {
+    move |e| match e {
+        PdsError::NotFound(_) => PdsError::RepoNotFound(did.to_string()),
+        other => other,
+    }
 }
 
 /// Build sync API routes

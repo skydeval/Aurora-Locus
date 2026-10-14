@@ -130,8 +130,13 @@ pub enum PdsError {
     /// through `src/api/admin.rs::xrpc_blob_not_found_error` directly,
     /// bypassing this variant.
     #[error("Could not find blob: {0}")]
-    #[allow(dead_code)]
     BlobNotFound(String),
+
+    /// `com.atproto.sync.getBlocks` was asked for a block the repository does
+    /// not hold. HTTP 400 `BlockNotFound`, the name the lexicon declares
+    /// (#499).
+    #[error("{0}")]
+    BlockNotFound(String),
 
     /// Arc 16e §9.5.3.5 — record body contains a CID that is malformed
     /// (unparseable multibase / multihash) OR non-DASL-compliant (not
@@ -891,8 +896,9 @@ impl IntoResponse for PdsError {
                 "RateLimitExceeded",
                 "Rate limit exceeded".to_string(),
             ),
+            // 401, as the reference PDS answers it (#499).
             PdsError::AccountTakenDown(_) => {
-                (StatusCode::FORBIDDEN, "AccountTakedown", self.to_string())
+                (StatusCode::UNAUTHORIZED, "AccountTakedown", self.to_string())
             }
             PdsError::AccountSuspended(_) => {
                 (StatusCode::FORBIDDEN, "AccountSuspended", self.to_string())
@@ -934,8 +940,9 @@ impl IntoResponse for PdsError {
             // HTTP status code defaults verified against bsky-PDS via
             // Step 0 Sub-step 0.D recon (envelope already-correct
             // Case A; just extend allowed `error` values).
+            // 400, as the reference PDS answers it (#499).
             PdsError::RepoNotFound(_) => {
-                (StatusCode::NOT_FOUND, "RepoNotFound", self.to_string())
+                (StatusCode::BAD_REQUEST, "RepoNotFound", self.to_string())
             }
             // #489: the lexicon-declared getRecord miss; 400 like the
             // reference PDS (an InvalidRequest-class error with its own name).
@@ -966,6 +973,9 @@ impl IntoResponse for PdsError {
             // separate xrpc_blob_not_found_error helper in api/admin.rs.)
             PdsError::BlobNotFound(_) => {
                 (StatusCode::BAD_REQUEST, "BlobNotFound", self.to_string())
+            }
+            PdsError::BlockNotFound(_) => {
+                (StatusCode::BAD_REQUEST, "BlockNotFound", self.to_string())
             }
             // Arc 16e §9.5.3.5 / §9.5.5.10 — validate-phase walker rejection.
             // Typed wire code (deliberate stricter-than-bsky-PDS posture per
@@ -1267,15 +1277,28 @@ mod tests {
         assert_eq!(body.error, "RecordNotFound");
         assert_eq!(body.message, format!("Could not locate record: {uri}"));
 
-        for (err, name) in [
-            (PdsError::NotFound("x".to_string()), "NotFound"),
+        // A generic miss stays 404; the declared names are 400, as on the
+        // reference PDS (#499).
+        for (err, name, status) in [
+            (PdsError::NotFound("x".to_string()), "NotFound", StatusCode::NOT_FOUND),
             (
                 PdsError::RepoNotFound("did:plc:abc".to_string()),
                 "RepoNotFound",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                PdsError::BlockNotFound("x".to_string()),
+                "BlockNotFound",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                PdsError::AccountTakenDown("x".to_string()),
+                "AccountTakedown",
+                StatusCode::UNAUTHORIZED,
             ),
         ] {
             let resp = err.into_response();
-            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(resp.status(), status, "{name}");
             let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
             let body: XrpcErrorResponse = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(body.error, name);

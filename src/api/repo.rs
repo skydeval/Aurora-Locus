@@ -698,8 +698,7 @@ async fn get_record(
     headers: HeaderMap,
     Query(query): Query<GetRecordQuery>,
 ) -> PdsResult<Json<GetRecordResponse>> {
-    // Get the DID (could be handle resolution in the future)
-    let did = &query.repo;
+    let did = &resolve_repo(&ctx, &query.repo).await?;
 
     // A repository that is taken down, suspended or deactivated is not served
     // (#491), to anyone but its own account and admins. This runs before any
@@ -733,6 +732,14 @@ async fn get_record(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string();
+
+            // A request for a particular version (`cid`) of a record that
+            // has since changed finds nothing (#499), as on the reference
+            // PDS: a strong reference that no longer points at the current
+            // version must not be told that it does.
+            if query.cid.as_deref().is_some_and(|wanted| wanted != cid) {
+                return Err(PdsError::RecordNotFound(uri));
+            }
 
             let mut record_value = value
                 .get("value")
@@ -803,10 +810,25 @@ async fn get_record(
     }
 }
 
+/// The DID named by a read request's `repo`, which the lexicons type as an
+/// at-identifier (#499): a DID is taken as given; a handle is looked up among
+/// this PDS's accounts, by handle only (never by email), and resolves exactly
+/// when `resolveHandle` would. A handle that does not resolve here is
+/// `RepoNotFound`.
+pub(crate) async fn resolve_repo(ctx: &AppContext, repo: &str) -> PdsResult<String> {
+    if repo.starts_with("did:") {
+        return Ok(repo.to_string());
+    }
+    ctx.account_manager
+        .get_resolvable_did_by_handle(&repo.to_ascii_lowercase())
+        .await?
+        .ok_or_else(|| PdsError::RepoNotFound(repo.to_string()))
+}
+
 /// The account a read request is made as, if it carries valid credentials.
 /// Reads are public, so missing or invalid credentials mean an anonymous
 /// reader, not an error.
-async fn optional_reader(ctx: &AppContext, headers: &HeaderMap) -> Option<String> {
+pub(crate) async fn optional_reader(ctx: &AppContext, headers: &HeaderMap) -> Option<String> {
     if !headers.contains_key(axum::http::header::AUTHORIZATION) {
         return None;
     }
@@ -820,7 +842,7 @@ async fn optional_reader(ctx: &AppContext, headers: &HeaderMap) -> Option<String
 /// is its own account or an admin (#491). See
 /// [`crate::api::sync_helpers::assert_repo_readable`] for what is refused and
 /// with which error.
-async fn assert_readable_by(
+pub(crate) async fn assert_readable_by(
     ctx: &AppContext,
     repo_did: &str,
     reader_did: Option<&str>,
@@ -841,7 +863,7 @@ async fn list_records(
     Query(query): Query<ListRecordsQuery>,
 ) -> PdsResult<Json<ListRecordsResponse>> {
     // Get the DID
-    let did = &query.repo;
+    let did = &resolve_repo(&ctx, &query.repo).await?;
 
     // Not served for a repository that is not active (#491).
     let reader_did = optional_reader(&ctx, &headers).await;
@@ -919,7 +941,7 @@ async fn describe_repo(
     Query(query): Query<DescribeRepoQuery>,
 ) -> PdsResult<Json<DescribeRepoResponse>> {
     // Get the DID
-    let did = &query.repo;
+    let did = &resolve_repo(&ctx, &query.repo).await?;
 
     // Not served for a repository that is not active (#491).
     let reader_did = optional_reader(&ctx, &headers).await;
@@ -1220,6 +1242,38 @@ mod get_record_miss_tests {
             Ok(_) => panic!("expected a miss for {repo}/{collection}"),
             Err(e) => e,
         }
+    }
+
+    /// #499: a `cid` that is not the record's current one finds nothing.
+    #[tokio::test]
+    async fn a_cid_that_is_not_current_is_record_not_found() {
+        let (ctx, did) = ctx_with_repo().await;
+        crate::kryphocron_audience::test_support::seed(
+            &ctx,
+            &did,
+            PROFILE,
+            "self",
+            serde_json::json!({ "displayName": "x" }),
+        )
+        .await;
+        let current = format!("cid-{PROFILE}-self");
+        let fetch = |cid: &str| {
+            let query: GetRecordQuery = serde_json::from_value(serde_json::json!({
+                "repo": did,
+                "collection": PROFILE,
+                "rkey": "self",
+                "cid": cid,
+            }))
+            .unwrap();
+            get_record(State(ctx.clone()), HeaderMap::new(), Query(query))
+        };
+        let found = fetch(&current).await.expect("current version");
+        assert_eq!(found.0.cid, current);
+        let err = fetch("bafyolderversion").await.expect_err("stale version");
+        assert_eq!(
+            err,
+            PdsError::RecordNotFound(format!("at://{did}/{PROFILE}/self"))
+        );
     }
 
     #[tokio::test]

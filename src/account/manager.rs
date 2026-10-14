@@ -2456,6 +2456,7 @@ impl AccountManager {
             "app_password",
             "email_token",
             "plc_keys",
+            "account_pref",
             "account",
             "actor",
         ] {
@@ -2537,6 +2538,20 @@ impl AccountManager {
         // limited per request (`check_account_moderation`), not by logging
         // it out.
         tracing::info!("Account temporarily deactivated for DID: {}", did);
+        Ok(())
+    }
+
+    /// Record when a deactivated account may be deleted
+    /// (`com.atproto.server.deactivateAccount`'s `deleteAfter`). The purge
+    /// job deletes a deactivated account once this time has passed;
+    /// reactivating clears it.
+    pub async fn set_delete_after(&self, did: &str, at: DateTime<Utc>) -> PdsResult<()> {
+        sqlx::query("UPDATE actor SET delete_after = $1 WHERE did = $2")
+            .bind(at.to_rfc3339())
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
         Ok(())
     }
 

@@ -71,6 +71,39 @@ pub struct ModerationRecord {
     pub notes: Option<String>,
 }
 
+/// The moderation facts that bear on an account's status
+/// ([`ModerationManager::active_flags`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModerationFlags {
+    /// An unreversed takedown exists.
+    pub taken_down: bool,
+    /// An unreversed suspension exists that has not expired.
+    pub suspended: bool,
+}
+
+impl ModerationFlags {
+    /// The flags of a set of unreversed actions at time `now`.
+    pub fn from_actions(actions: &[ModerationRecord], now: DateTime<Utc>) -> Self {
+        Self {
+            taken_down: actions
+                .iter()
+                .any(|a| a.action == ModerationAction::Takedown),
+            suspended: actions.iter().any(|a| {
+                a.action == ModerationAction::Suspend && a.expires_at.is_none_or(|exp| exp > now)
+            }),
+        }
+    }
+}
+
+/// What [`ModerationManager::restore_account_in_tx`] lifts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lift {
+    /// Takedowns only (a takedown removed through `updateSubjectStatus`).
+    Takedowns,
+    /// Takedowns and suspensions (an operator's Restore).
+    TakedownsAndSuspensions,
+}
+
 /// Parameters for applying a moderation action
 pub struct ApplyActionParams<'a> {
     pub did: &'a str,
@@ -288,6 +321,143 @@ impl ModerationManager {
         }))
     }
 
+    /// The moderation facts behind an account's status: whether an
+    /// unreversed takedown exists, and whether an unreversed suspension that
+    /// has not expired exists. One read of the account's active actions.
+    pub async fn active_flags(&self, did: &str) -> PdsResult<ModerationFlags> {
+        let actions = self.get_active_actions(did).await?;
+        Ok(ModerationFlags::from_actions(&actions, Utc::now()))
+    }
+
+    /// [`Self::active_flags`] for many accounts in one query. An account
+    /// with no active takedown or suspension is absent from the map.
+    pub async fn active_flags_for(
+        &self,
+        dids: &[String],
+    ) -> PdsResult<std::collections::HashMap<String, ModerationFlags>> {
+        let mut flags = std::collections::HashMap::new();
+        if dids.is_empty() {
+            return Ok(flags);
+        }
+        let placeholders = (1..=dids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT did, action, expires_at FROM account_moderation
+             WHERE NOT reversed AND action IN ('takedown', 'suspend')
+               AND did IN ({placeholders})"
+        );
+        let mut query = sqlx::query(&sql);
+        for did in dids {
+            query = query.bind(did);
+        }
+        let now = Utc::now();
+        for row in query.fetch_all(&self.db).await? {
+            let did: String = row.get("did");
+            let action: String = row.get("action");
+            let expires_at = row
+                .try_get::<String, _>("expires_at")
+                .ok()
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            let entry: &mut ModerationFlags = flags.entry(did).or_default();
+            match action.as_str() {
+                "takedown" => entry.taken_down = true,
+                "suspend" if expires_at.is_none_or(|exp| exp > now) => entry.suspended = true,
+                _ => {}
+            }
+        }
+        Ok(flags)
+    }
+
+    /// Restore an account inside an existing transaction: reverse every
+    /// unreversed takedown of `did` (with [`Lift::TakedownsAndSuspensions`],
+    /// every suspension too), clear the actor row's `takedown_ref`, and record
+    /// a `restore` action for the history.
+    ///
+    /// A takedown is recorded in two places (the moderation row and the
+    /// actor's `takedown_ref`); restoring only one of them left the account
+    /// blocked while it was announced as active. Returns how many actions
+    /// were reversed.
+    pub async fn restore_account_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        restored_by: &str,
+        reason: &str,
+        lift: Lift,
+    ) -> PdsResult<u64> {
+        let reversed = Self::lift_in_tx(tx, did, restored_by, reason, lift).await?;
+        crate::account::AccountManager::activate_account_in_tx(tx, did).await?;
+        Self::apply_action_in_tx(
+            tx,
+            ApplyActionParams {
+                did,
+                action: ModerationAction::Restore,
+                reason,
+                moderated_by: restored_by,
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            },
+        )
+        .await?;
+        Ok(reversed)
+    }
+
+    /// The part of [`Self::restore_account_in_tx`] that lifts the actions:
+    /// reverse the account's unreversed takedowns (and suspensions, per
+    /// `lift`) and clear the actor row's `takedown_ref`. Records no history
+    /// row and does not require the account to exist. Returns how many
+    /// actions were reversed.
+    pub async fn lift_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        did: &str,
+        restored_by: &str,
+        reason: &str,
+        lift: Lift,
+    ) -> PdsResult<u64> {
+        let now = Utc::now();
+        let actions = match lift {
+            Lift::Takedowns => "('takedown')",
+            Lift::TakedownsAndSuspensions => "('takedown', 'suspend')",
+        };
+        let sql = format!(
+            "UPDATE account_moderation
+             SET reversed = true,
+                 reversed_at = $1,
+                 reversed_by = $2,
+                 reversal_reason = $3
+             WHERE did = $4 AND NOT reversed AND action IN {actions}"
+        );
+        let reversed = sqlx::query(&sql)
+            .bind(now.to_rfc3339())
+            .bind(restored_by)
+            .bind(reason)
+            .bind(did)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
+            .bind(did)
+            .execute(&mut **tx)
+            .await?;
+        Ok(reversed)
+    }
+
+    /// The account a moderation record names, read inside `tx`.
+    pub async fn record_did_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Any>,
+        moderation_id: i64,
+    ) -> PdsResult<Option<String>> {
+        let did: Option<String> =
+            sqlx::query_scalar("SELECT did FROM account_moderation WHERE id = $1")
+                .bind(moderation_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(did)
+    }
+
     /// Get moderation history for an account
     pub async fn get_history(&self, did: &str) -> PdsResult<Vec<ModerationRecord>> {
         let rows = sqlx::query(
@@ -307,11 +477,13 @@ impl ModerationManager {
         self.parse_moderation_records(rows).await
     }
 
-    /// Cleanup expired suspensions
-    pub async fn cleanup_expired(&self) -> PdsResult<u64> {
+    /// Mark suspensions whose time has passed as reversed, and return the
+    /// accounts they belonged to (each once), so the caller can announce
+    /// each account's status now that the suspension has ended.
+    pub async fn cleanup_expired(&self) -> PdsResult<Vec<String>> {
         let now = Utc::now();
 
-        let result = sqlx::query(
+        let mut dids: Vec<String> = sqlx::query_scalar(
             r#"
             UPDATE account_moderation
             SET reversed = true,
@@ -322,14 +494,16 @@ impl ModerationManager {
               AND NOT reversed
               AND expires_at IS NOT NULL
               AND expires_at < $2
+            RETURNING did
             "#,
         )
         .bind(now.to_rfc3339())
         .bind(now.to_rfc3339())
-        .execute(&self.db)
+        .fetch_all(&self.db)
         .await?;
-
-        Ok(result.rows_affected())
+        dids.sort();
+        dids.dedup();
+        Ok(dids)
     }
 
     /// Parse database rows into ModerationRecord objects

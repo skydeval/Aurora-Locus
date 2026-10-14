@@ -107,7 +107,7 @@ pub struct AccountEvent {
 ///   above + `Suspended`, `Desynchronized` (4).
 /// - **Enum-extended but not wire-emittable in v0.5**: `Throttled`
 ///   (no column source); `Deleted` (Arc 15 producer scope).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AccountStatus {
     Takendown,
