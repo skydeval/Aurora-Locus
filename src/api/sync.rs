@@ -216,7 +216,10 @@ pub async fn get_latest_commit(
 pub async fn get_blocks(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
-    Query(params): Query<GetBlocksParams>,
+    // `cids` repeats in the query string (`cids=a&cids=b`); the axum-extra
+    // extractor reads repeated keys into the list (#499). The plain one
+    // refused every request with "expected a sequence".
+    axum_extra::extract::Query(params): axum_extra::extract::Query<GetBlocksParams>,
 ) -> PdsResult<Response> {
     // The account itself and admins read a repository that is not active,
     // as on the reference PDS (#499); a deactivated account exports its
@@ -511,6 +514,28 @@ pub fn routes() -> Router<AppContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #499: getBlocks reads `cids` from a query string, once or repeated.
+    #[tokio::test]
+    async fn get_blocks_reads_repeated_cids_from_the_query_string() {
+        use axum::extract::FromRequestParts;
+        for (query, expected) in [
+            ("did=did:plc:test&cids=a", vec!["a"]),
+            ("did=did:plc:test&cids=a&cids=b", vec!["a", "b"]),
+        ] {
+            let (mut parts, ()) = axum::http::Request::builder()
+                .uri(format!("/xrpc/com.atproto.sync.getBlocks?{query}"))
+                .body(())
+                .unwrap()
+                .into_parts();
+            let axum_extra::extract::Query(params) =
+                axum_extra::extract::Query::<GetBlocksParams>::from_request_parts(&mut parts, &())
+                    .await
+                    .expect(query);
+            assert_eq!(params.did, "did:plc:test");
+            assert_eq!(params.cids, expected);
+        }
+    }
 
     #[test]
     fn test_get_repo_params_deserialize() {
