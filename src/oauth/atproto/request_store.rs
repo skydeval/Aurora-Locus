@@ -41,11 +41,13 @@ pub struct AtprotoAuthorizationRequest {
     /// The `response_mode` the client asked for (`query`, `fragment`,
     /// `form_post`); `None` means `query` (#483).
     pub response_mode: Option<String>,
+    /// The `login_hint` the client sent (a handle or DID), if any (#502).
+    pub login_hint: Option<String>,
 }
 
 const COLUMNS: &str = "request_id, request_uri, client_id, redirect_uri, scope, state, \
      code_challenge, code_challenge_method, did, code_hash, code_used_at, denied_at, \
-     created_at, expires_at, response_mode";
+     created_at, expires_at, response_mode, login_hint";
 
 impl AtprotoAuthorizationRequest {
     /// True iff `now` is at or past `expires_at`. A malformed timestamp is
@@ -81,9 +83,9 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
         INSERT INTO atproto_authorization_request (
             request_id, request_uri, client_id, redirect_uri, scope, state,
             code_challenge, code_challenge_method, did, code_hash, code_used_at,
-            denied_at, created_at, expires_at, response_mode
+            denied_at, created_at, expires_at, response_mode, login_hint
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         "#,
     )
     .bind(&req.request_id)
@@ -101,6 +103,7 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
     .bind(&req.created_at)
     .bind(&req.expires_at)
     .bind(&req.response_mode)
+    .bind(&req.login_hint)
     .execute(db)
     .await
     .map_err(PdsError::Database)?;
@@ -153,17 +156,55 @@ async fn fetch_one_where(
 /// window. A PAR row is minted with a short push→authorize TTL (~60s); once
 /// the holder reaches the authorize step the consent screen needs the longer
 /// (~10min) window, so binding and re-expiry happen together.
+///
+/// A request is bound to one account for its whole life (#502): the update
+/// applies only while the row is unbound or already bound to `did`. Returns
+/// `false`, leaving the row unchanged, when it is bound to another account.
 pub async fn promote_par_request(
     db: &AnyPool,
     request_id: &str,
     did: &str,
     expires_at: &str,
-) -> PdsResult<()> {
-    sqlx::query(
+) -> PdsResult<bool> {
+    let updated = sqlx::query(
         "UPDATE atproto_authorization_request SET did = $1, expires_at = $2 \
-         WHERE request_id = $3",
+         WHERE request_id = $3 AND (did IS NULL OR did = $1)",
     )
     .bind(did)
+    .bind(expires_at)
+    .bind(request_id)
+    .execute(db)
+    .await
+    .map_err(PdsError::Database)?
+    .rows_affected();
+    Ok(updated == 1)
+}
+
+/// Release a request from the account it was bound to, so another account
+/// can sign in for it ("Not you? Switch account", #502). Applies only while
+/// the request is bound to `did` and no code has been minted for it.
+pub async fn unbind(db: &AnyPool, request_id: &str, did: &str) -> PdsResult<()> {
+    sqlx::query(
+        "UPDATE atproto_authorization_request SET did = NULL \
+         WHERE request_id = $1 AND did = $2 AND code_hash IS NULL",
+    )
+    .bind(request_id)
+    .bind(did)
+    .execute(db)
+    .await
+    .map_err(PdsError::Database)?;
+    Ok(())
+}
+
+/// Give an unbound request the consent window while the resource owner signs
+/// in or chooses an account (#502). A pushed request lives about a minute;
+/// signing in from the page it leads to takes longer. Never extends a bound
+/// request or one whose code has been minted.
+pub async fn extend_unbound(db: &AnyPool, request_id: &str, expires_at: &str) -> PdsResult<()> {
+    sqlx::query(
+        "UPDATE atproto_authorization_request SET expires_at = $1 \
+         WHERE request_id = $2 AND did IS NULL AND code_hash IS NULL",
+    )
     .bind(expires_at)
     .bind(request_id)
     .execute(db)
@@ -240,6 +281,7 @@ mod tests {
             created_at: now.to_rfc3339(),
             expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
             response_mode: None,
+            login_hint: None,
         }
     }
 
@@ -276,20 +318,35 @@ mod tests {
         assert!(by_uri.did.is_none());
 
         let new_expiry = (Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
-        promote_par_request(
+        assert!(promote_par_request(
             &ctx.account_db,
             "req-par",
             "did:web:bob.example.com",
             &new_expiry,
         )
         .await
-        .unwrap();
+        .unwrap());
         let bound = get_by_request_id(&ctx.account_db, "req-par")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(bound.did.as_deref(), Some("did:web:bob.example.com"));
         assert_eq!(bound.expires_at, new_expiry);
+
+        // #502: the same account may promote again (a revisit); another may not.
+        assert!(promote_par_request(&ctx.account_db, "req-par", "did:web:bob.example.com", &new_expiry)
+            .await
+            .unwrap());
+        let later = (Utc::now() + chrono::Duration::minutes(20)).to_rfc3339();
+        assert!(!promote_par_request(&ctx.account_db, "req-par", "did:web:eve.example.com", &later)
+            .await
+            .unwrap());
+        let unchanged = get_by_request_id(&ctx.account_db, "req-par")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.did.as_deref(), Some("did:web:bob.example.com"));
+        assert_eq!(unchanged.expires_at, new_expiry);
     }
 
     #[tokio::test]

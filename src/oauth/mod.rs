@@ -34,6 +34,11 @@ pub use scope::{
     require_scope, required_scopes_for_path, AtProtoScope, ScopeSet,
 };
 
+/// How long an OAuth access token is valid after it is minted (issued or
+/// rotated), in seconds. Token responses advertise it as `expires_in`, and
+/// access-token validation enforces it (#502).
+pub const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
+
 /// SHA-256 hex digest of an OAuth bearer, used for storage and lookup.
 ///
 /// Phase β.1 / R1 F-3.1: the raw bearer is returned to the client but never

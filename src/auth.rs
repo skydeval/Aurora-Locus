@@ -1079,7 +1079,8 @@ pub async fn validate_oauth_token(
     let presented_hash = crate::oauth::access_token_hash(access_token);
     let row = sqlx::query(
         r#"
-        SELECT token_id, did, client_id, scope, dpop_thumbprint, device_id, expires_at
+        SELECT token_id, did, client_id, scope, dpop_thumbprint, device_id, expires_at,
+               updated_at
         FROM token
         WHERE access_token_hash = $1 AND NOT revoked
         "#,
@@ -1095,6 +1096,19 @@ pub async fn validate_oauth_token(
     let expires_at: chrono::DateTime<chrono::Utc> = parse_ts(&row.get::<String, _>("expires_at"))?;
 
     if expires_at < chrono::Utc::now() {
+        return Err(PdsError::Authentication(
+            "Access token has expired".to_string(),
+        ));
+    }
+
+    // `expires_at` is the refresh token's lifetime (90 days); the access token
+    // lives for `expires_in` from when it was minted, which is the row's
+    // `updated_at` (set at issue and at every rotation). Checking only
+    // `expires_at` let an access token work for 90 days (#502).
+    let minted_at = parse_ts(&row.get::<String, _>("updated_at"))?;
+    if minted_at + chrono::Duration::seconds(crate::oauth::ACCESS_TOKEN_TTL_SECS)
+        < chrono::Utc::now()
+    {
         return Err(PdsError::Authentication(
             "Access token has expired".to_string(),
         ));

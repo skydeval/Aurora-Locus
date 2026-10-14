@@ -2116,6 +2116,7 @@ mod tests {
                 created_at: now.to_rfc3339(),
                 expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
                 response_mode: None,
+                login_hint: None,
             },
         )
         .await

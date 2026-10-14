@@ -32,6 +32,10 @@ pub struct RawAuthParams {
     /// Where the authorization response goes: `query` (default), `fragment`
     /// or `form_post` (#483).
     pub response_mode: Option<String>,
+    /// The account the client wants authorized, as a handle or DID (OpenID
+    /// `login_hint`; #502). Advisory: the server signs in, or switches to,
+    /// that account; it never binds the request to another one silently.
+    pub login_hint: Option<String>,
 }
 
 /// A validated authorization request's parameters. Constructed only via
@@ -45,6 +49,8 @@ pub struct ValidatedParams {
     pub state: Option<String>,
     pub code_challenge: String,
     pub response_mode: ResponseMode,
+    /// The client's `login_hint`, trimmed; `None` when absent or blank.
+    pub login_hint: Option<String>,
 }
 
 /// Why a set of authorization parameters was rejected. Each variant maps to an
@@ -147,7 +153,20 @@ pub fn validate(raw: &RawAuthParams) -> Result<ValidatedParams, AuthParamError> 
         state: raw.state.clone(),
         code_challenge,
         response_mode,
+        login_hint: normalize_login_hint(raw.login_hint.as_deref()),
     })
+}
+
+/// The longest `login_hint` kept. A handle is at most 253 characters and a
+/// DID at most 2048; anything longer cannot name an account and is dropped.
+const MAX_LOGIN_HINT_LEN: usize = 2048;
+
+/// A `login_hint` as stored: trimmed, and `None` when absent, blank or too
+/// long to name an account.
+pub fn normalize_login_hint(hint: Option<&str>) -> Option<String> {
+    hint.map(str::trim)
+        .filter(|h| !h.is_empty() && h.len() <= MAX_LOGIN_HINT_LEN)
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -165,6 +184,7 @@ mod tests {
             code_challenge_method: Some("S256".to_string()),
             request_uri: None,
             response_mode: None,
+            login_hint: None,
         }
     }
 

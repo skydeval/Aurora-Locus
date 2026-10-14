@@ -142,6 +142,20 @@ async fn precheck(
         ));
     }
 
+    // #502: when the client asked for an account hosted here, the request must
+    // be bound to that account. Authorize never binds another, so this is the
+    // second check of the same rule, at the point the code is minted.
+    if let Some(hint) = request.login_hint.as_deref() {
+        if let Some(hinted) = super::account_choice::resolve_hint(ctx, hint).await {
+            if request.did.as_deref() != Some(hinted.as_str()) {
+                return Err(fail(
+                    StatusCode::FORBIDDEN,
+                    "this authorization is for another account",
+                ));
+            }
+        }
+    }
+
     Ok(request)
 }
 
@@ -185,6 +199,7 @@ mod tests {
             created_at: now.to_rfc3339(),
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
             response_mode: None,
+            login_hint: None,
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
     }
