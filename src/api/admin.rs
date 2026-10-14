@@ -4677,6 +4677,17 @@ async fn admin_delete_account(
     if !req.did.starts_with("did:") {
         return Err((StatusCode::BAD_REQUEST, "Invalid DID format".to_string()));
     }
+    // Only an account that exists is deleted and announced as deleted.
+    match ctx.account_manager.get_account(&req.did).await {
+        Ok(_) => {}
+        Err(PdsError::NotFound(_)) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Account not found: {}", req.did),
+            ));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
 
     // Capture the snapshot BEFORE the delete so the chain row still has
     // a meaningful snapshot of the account row that's about to disappear.
@@ -4728,6 +4739,13 @@ async fn admin_delete_account(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     tx.commit()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // #499: announce the deletion and remove the account's data, as the
+    // user's own deleteAccount does. It announced nothing and left the
+    // repository behind, so AppViews kept serving a deleted account.
+    crate::api::account_state::finish_account_deletion(&ctx, &req.did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -5136,24 +5154,8 @@ async fn takedown_account(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    // Arc 15 §8.3.6: emit Takendown #account event (Pattern B).
-    // Reverse-takedown deferred to a future cycle per §8.1.2.
-    let acc_post = ctx
-        .account_manager
-        .get_account(&req.did)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (active, status) = crate::api::sync_helpers::get_account_status(&acc_post);
-    debug_assert_eq!(
-        status,
-        Some(crate::sequencer::events::AccountStatus::Takendown)
-    );
-    ctx.sequencer
-        .sequence_account(crate::sequencer::events::AccountEvent {
-            did: req.did.clone(),
-            active,
-            status,
-        })
+    // Arc 15 §8.3.6 / #499: announce the account's status after commit.
+    crate::api::account_state::announce_account_state(&ctx, &req.did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -5184,6 +5186,17 @@ async fn suspend_account(
     use crate::admin::moderation::{ApplyActionParams, ModerationAction, ModerationManager};
 
     let expires_in = req.duration_days.map(Duration::days);
+    // #499: a suspension is recorded only for an account that exists here.
+    match ctx.account_manager.get_account(&req.did).await {
+        Ok(_) => {}
+        Err(PdsError::NotFound(_)) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Account not found: {}", req.did),
+            ));
+        }
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
     let subject = Subject::Repo {
         did: req.did.clone(),
     };
@@ -5240,12 +5253,9 @@ async fn suspend_account(
     // Announce the suspension (#494), as takedown and deactivation are
     // announced: relays and AppViews learn an account's status from `#account`
     // events, and without one they keep showing the account as active.
-    // Restoring the account emits the matching `active: true` event.
-    ctx.sequencer
-        .sequence_account(crate::sequencer::events::AccountEvent::from_status(
-            req.did.clone(),
-            crate::sequencer::events::AccountStatus::Suspended,
-        ))
+    // The announced state is read back (#499), so a suspension of an account
+    // that is already taken down announces "takendown".
+    crate::api::account_state::announce_account_state(&ctx, &req.did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -5290,6 +5300,26 @@ async fn restore_account(
         .begin()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // #499: the record must belong to the account the request names; the
+    // status is announced for that account.
+    let record_did = ModerationManager::record_did_in_tx(&mut tx, req.moderation_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Moderation record {} not found", req.moderation_id),
+            )
+        })?;
+    if record_did != req.did {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Moderation record {} belongs to another account",
+                req.moderation_id
+            ),
+        ));
+    }
     ModerationManager::reverse_action_in_tx(&mut tx, req.moderation_id, &auth.did, &req.reason)
         .await
         .map_err(|e| {
@@ -5325,19 +5355,10 @@ async fn restore_account(
     // with the takedown direction's emit. Runs post-commit on the durable
     // post-restore row state (Pattern B). restore_account only succeeds on a
     // real moderation reversal (reverse_action_in_tx errors NotFound otherwise),
-    // so there is no spurious emit on a no-op restore.
-    let acc_post = ctx
-        .account_manager
-        .get_account(&req.did)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (active, status) = crate::api::sync_helpers::get_account_status(&acc_post);
-    ctx.sequencer
-        .sequence_account(crate::sequencer::events::AccountEvent {
-            did: req.did.clone(),
-            active,
-            status,
-        })
+    // so there is no spurious emit on a no-op restore. The announced state is
+    // the account's whole state (#499): if another takedown or a suspension is
+    // still in force, that is what is announced, not "active".
+    crate::api::account_state::announce_account_state(&ctx, &record_did)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -7192,7 +7213,7 @@ async fn update_subject_status(
             if td.applied {
                 if let Some(ref acc_post) = acc_post_opt {
                     let (active, status) =
-                        crate::api::sync_helpers::get_account_status(acc_post);
+                        crate::api::account_state::state_pair(&ctx, acc_post).await;
                     if let Err(e) = ctx
                         .sequencer
                         .sequence_account(crate::sequencer::events::AccountEvent {
@@ -7217,7 +7238,7 @@ async fn update_subject_status(
                 // state after a restore.
                 if let Some(ref acc_post) = acc_post_opt {
                     let (active, status) =
-                        crate::api::sync_helpers::get_account_status(acc_post);
+                        crate::api::account_state::state_pair(&ctx, acc_post).await;
                     if let Err(e) = ctx
                         .sequencer
                         .sequence_account(crate::sequencer::events::AccountEvent {
@@ -7243,7 +7264,7 @@ async fn update_subject_status(
                 // §8.3.4 deactivate → #account Deactivated.
                 if let Some(ref acc_post) = acc_post_opt {
                     let (active, status) =
-                        crate::api::sync_helpers::get_account_status(acc_post);
+                        crate::api::account_state::state_pair(&ctx, acc_post).await;
                     if let Err(e) = ctx
                         .sequencer
                         .sequence_account(crate::sequencer::events::AccountEvent {
@@ -7265,7 +7286,7 @@ async fn update_subject_status(
                 // (account → identity → sync).
                 if let Some(ref acc_post) = acc_post_opt {
                     let (active, status) =
-                        crate::api::sync_helpers::get_account_status(acc_post);
+                        crate::api::account_state::state_pair(&ctx, acc_post).await;
                     if let Err(e) = ctx
                         .sequencer
                         .sequence_account(crate::sequencer::events::AccountEvent {
@@ -7410,9 +7431,19 @@ async fn apply_account_status_in_tx<'c>(
                 Some(&takedown_ref),
             ));
         } else {
-            crate::account::AccountManager::activate_account_in_tx(tx, did)
-                .await
-                .map_err(map_account_err(did))?;
+            // #499: lift the takedown from both places it is recorded (the
+            // moderation record and the account row), as every restore does.
+            // Clearing only the row announced the account active while its
+            // own requests were still refused.
+            crate::admin::moderation::ModerationManager::restore_account_in_tx(
+                tx,
+                did,
+                &auth.did,
+                "updateSubjectStatus: takedown removed",
+                crate::admin::moderation::Lift::Takedowns,
+            )
+            .await
+            .map_err(map_account_err(did))?;
             effects.push(render_status_effect(
                 "takedown",
                 false,

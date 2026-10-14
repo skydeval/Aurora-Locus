@@ -244,18 +244,20 @@ impl JobScheduler {
         }
     }
 
-    /// Cleanup expired suspensions (runs every 15 minutes)
+    /// End expired suspensions and announce them (every minute). The
+    /// suspension stops being enforced at its expiry; this run is what
+    /// announces it, so the interval is the most an `#account` event can
+    /// trail the expiry (#499).
     async fn expired_suspension_cleanup_job(scheduler: Arc<Self>) {
-        let mut interval = interval(Duration::from_secs(900)); // Every 15 minutes
+        let mut interval = interval(Duration::from_secs(60));
 
         loop {
             interval.tick().await;
-            info!("Running expired suspension cleanup");
 
             match tasks::cleanup_expired_suspensions(&scheduler.context).await {
                 Ok(count) => {
                     if count > 0 {
-                        info!("Cleaned up {} expired suspensions", count);
+                        info!("Ended {} expired suspensions", count);
                     }
                 }
                 Err(e) => error!("Failed to cleanup expired suspensions: {}", e),

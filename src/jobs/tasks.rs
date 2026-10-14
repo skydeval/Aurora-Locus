@@ -17,9 +17,24 @@ pub async fn cleanup_expired_sessions(ctx: &AppContext) -> PdsResult<u64> {
     Ok(sessions_deleted + refresh_tokens_deleted)
 }
 
-/// Cleanup expired suspensions
+/// End suspensions whose time has passed, and announce each affected
+/// account's status (#499): a suspension that lapsed used to end silently,
+/// so relays and AppViews kept the account suspended. Returns how many
+/// accounts were announced.
 pub async fn cleanup_expired_suspensions(ctx: &AppContext) -> PdsResult<u64> {
-    ctx.moderation_manager.cleanup_expired().await
+    let dids = ctx.moderation_manager.cleanup_expired().await?;
+    let mut announced = 0;
+    for did in &dids {
+        match crate::api::account_state::announce_account_state(ctx, did).await {
+            Ok(()) => announced += 1,
+            Err(e) => tracing::error!(
+                did = %did,
+                error = %e,
+                "expired suspension: account status not announced",
+            ),
+        }
+    }
+    Ok(announced)
 }
 
 /// Cleanup expired identity cache entries
@@ -48,7 +63,7 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
     // Find accounts marked for deletion where grace period has expired
     let rows = sqlx::query(
         r#"
-        SELECT a.did, a.handle
+        SELECT a.did
         FROM actor a
         WHERE a.deactivated_at IS NOT NULL
           AND a.delete_after IS NOT NULL
@@ -63,67 +78,23 @@ pub async fn purge_deleted_accounts(ctx: &AppContext) -> PdsResult<u64> {
 
     for row in rows {
         let did: String = row.try_get("did")?;
-        let handle: String = row.try_get("handle")?;
 
-        tracing::info!("Purging account: {} ({})", handle, did);
-
-        // Delete all blobs for this user
-        match ctx.blob_store.list_for_user(&did, 1000).await {
-            Ok(blobs) => {
-                let blob_count = blobs.len();
-                for blob in blobs {
-                    if let Err(e) = ctx.blob_store.delete(&blob.cid).await {
-                        tracing::warn!("Failed to delete blob {}: {}", blob.cid, e);
-                    }
-                }
-                tracing::info!("Deleted {} blobs for {}", blob_count, did);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to list blobs for {}: {}", did, e);
-            }
+        // #499: the same deletion as the user's own deleteAccount: every
+        // account row, then the `#account status:"deleted"` announcement,
+        // then the repository store and the blobs only this account used.
+        // The purge used to leave the actor row (so the account read as
+        // deactivated forever), keep the repository, and announce nothing.
+        ctx.account_manager.delete_account_permanent(&did).await?;
+        if let Err(e) = crate::api::account_state::finish_account_deletion(ctx, &did).await {
+            tracing::error!(
+                did = %did,
+                error = %e,
+                "purge: account rows removed but the deletion was not announced",
+            );
+            continue;
         }
-
-        // Delete actor repository data
-        // Note: ActorStore.destroy() would be used here when implemented
-        // For now, we'll log and continue
-        tracing::info!("Actor store cleanup for {} (not yet implemented)", did);
-
-        // Delete all sessions and refresh tokens
-        sqlx::query("DELETE FROM session WHERE did = $1")
-            .bind(&did)
-            .execute(&ctx.account_db)
-            .await?;
-
-        sqlx::query("DELETE FROM refresh_token WHERE did = $1")
-            .bind(&did)
-            .execute(&ctx.account_db)
-            .await?;
-
-        // Delete stored preferences (#470)
-        sqlx::query("DELETE FROM account_pref WHERE did = $1")
-            .bind(&did)
-            .execute(&ctx.account_db)
-            .await?;
-
-        // Delete all email tokens
-        sqlx::query("DELETE FROM email_token WHERE did = $1")
-            .bind(&did)
-            .execute(&ctx.account_db)
-            .await?;
-
-        // Delete account record (permanent)
-        sqlx::query("DELETE FROM account WHERE did = $1")
-            .bind(&did)
-            .execute(&ctx.account_db)
-            .await?;
-
         deleted_count += 1;
-
-        tracing::info!(
-            "Successfully purged account: {} ({}) - GDPR compliant permanent deletion",
-            handle,
-            did
-        );
+        tracing::info!(did = %did, "purged account after its deletion grace period");
     }
 
     if deleted_count > 0 {

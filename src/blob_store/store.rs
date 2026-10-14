@@ -10,6 +10,20 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 
+/// A `LIKE` pattern (escape character `\`) matching every record URI in the
+/// repository of `did`. Wildcard characters in the DID are escaped, so a
+/// percent-encoded `did:web` matches only itself.
+fn record_uri_prefix_pattern(did: &str) -> String {
+    let prefix = format!("at://{did}/");
+    format!(
+        "{}%",
+        prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    )
+}
+
 /// Parse an RFC3339 string from the database into a `DateTime<Utc>`.
 /// See chainlink #76 / Phase 3 design notes on chrono ↔ AnyPool.
 fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
@@ -839,6 +853,100 @@ impl BlobStore {
             .await
             .map_err(PdsError::Database)?;
         Ok(())
+    }
+
+    /// The accounts a blob belongs to (#499): the account that uploaded it,
+    /// and every account one of whose records uses it. Empty when the blob
+    /// is unknown. Sorted, without repeats.
+    ///
+    /// # Errors
+    ///
+    /// A database failure.
+    pub async fn owners(&self, cid: &str) -> PdsResult<Vec<String>> {
+        let mut owners: Vec<String> =
+            sqlx::query_scalar("SELECT creator_did FROM blob_metadata WHERE cid = $1")
+                .bind(cid)
+                .fetch_all(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        let record_uris: Vec<String> =
+            sqlx::query_scalar("SELECT record_uri FROM record_blob WHERE blob_cid = $1")
+                .bind(cid)
+                .fetch_all(&self.db)
+                .await
+                .map_err(PdsError::Database)?;
+        owners.extend(record_uris.iter().filter_map(|uri| {
+            uri.strip_prefix("at://")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|did| did.starts_with("did:"))
+                .map(str::to_string)
+        }));
+        owners.sort();
+        owners.dedup();
+        Ok(owners)
+    }
+
+    /// How many distinct blobs the records of `did` use, and how many of
+    /// those this PDS holds (`checkAccountStatus`'s `expectedBlobs` and
+    /// `importedBlobs`).
+    ///
+    /// # Errors
+    ///
+    /// A database failure.
+    pub async fn account_blob_counts(&self, did: &str) -> PdsResult<(i64, i64)> {
+        let pattern = record_uri_prefix_pattern(did);
+        let expected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT blob_cid) FROM record_blob WHERE record_uri LIKE $1 ESCAPE '\\'",
+        )
+        .bind(&pattern)
+        .fetch_one(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        let imported: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT rb.blob_cid) FROM record_blob rb
+             JOIN blob_metadata bm ON bm.cid = rb.blob_cid
+             WHERE rb.record_uri LIKE $1 ESCAPE '\\'",
+        )
+        .bind(&pattern)
+        .fetch_one(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok((expected, imported))
+    }
+
+    /// Remove what a deleted account leaves in the blob store (#499): the
+    /// links from its records to blobs, and every blob it uploaded that no
+    /// other account's record still uses. A blob another account's record
+    /// references is kept, since the same content is that account's too.
+    /// Returns how many blobs were removed.
+    ///
+    /// # Errors
+    ///
+    /// A database or storage failure. Blobs removed before it stay removed.
+    pub async fn delete_account_blobs(&self, did: &str) -> PdsResult<u64> {
+        let pattern = record_uri_prefix_pattern(did);
+        sqlx::query("DELETE FROM record_blob WHERE record_uri LIKE $1 ESCAPE '\\'")
+            .bind(&pattern)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+
+        let unused: Vec<String> = sqlx::query_scalar(
+            "SELECT cid FROM blob_metadata
+             WHERE creator_did = $1
+               AND NOT EXISTS (SELECT 1 FROM record_blob rb WHERE rb.blob_cid = blob_metadata.cid)",
+        )
+        .bind(did)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+
+        let mut removed = 0;
+        for cid in unused {
+            self.delete(&cid).await?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     /// List blobs for a user

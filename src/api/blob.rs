@@ -117,20 +117,45 @@ async fn upload_blob(
     Ok((StatusCode::OK, Json(BlobUploadResponse { blob: blob_ref })))
 }
 
+/// Cache policy for `/blob/:cid`. Caches must revalidate on every use (the
+/// ETag answers that with a 304), so a blob stops being served from caches
+/// once its account may no longer be read. It was cached for a year.
+const BLOB_CACHE_CONTROL: &str = "public, no-cache";
+
 /// Get a blob by CID
 ///
-/// Serves blob content with proper Content-Type, caching headers, and Range request support
+/// Serves blob content with proper Content-Type, caching headers, and Range
+/// request support. A blob is served only while one of the accounts it
+/// belongs to may be read by the caller, under the same rule as that
+/// account's records (#499): a taken-down, suspended or deactivated
+/// account's blobs are not served to others. Otherwise, and for a blob that
+/// does not exist, the answer is `BlobNotFound`.
 async fn get_blob(
     State(ctx): State<AppContext>,
     Path(cid): Path<String>,
     headers: HeaderMap,
 ) -> PdsResult<Response> {
+    let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
+    let mut readable = false;
+    for owner in ctx.blob_store.owners(&cid).await? {
+        if crate::api::repo::assert_readable_by(&ctx, &owner, reader.as_deref())
+            .await
+            .is_ok()
+        {
+            readable = true;
+            break;
+        }
+    }
+    if !readable {
+        return Err(PdsError::BlobNotFound(cid));
+    }
+
     // Get blob from store
     let blob_data = ctx
         .blob_store
         .get(&cid)
         .await?
-        .ok_or_else(|| PdsError::NotFound(format!("Blob not found: {}", cid)))?;
+        .ok_or_else(|| PdsError::BlobNotFound(cid.clone()))?;
 
     let (data, mime_type) = blob_data;
     let total_size = data.len();
@@ -145,7 +170,7 @@ async fn get_blob(
                 return Ok(Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, etag)
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
                     .body(axum::body::Body::empty())
                     .unwrap());
             }
@@ -170,7 +195,7 @@ async fn get_blob(
                         format!("bytes {}-{}/{}", start, end, total_size),
                     )
                     .header(header::ETAG, etag)
-                    .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+                    .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
                     .header(header::ACCEPT_RANGES, "bytes")
                     .body(axum::body::Body::from(partial_data))
                     .unwrap());
@@ -184,7 +209,7 @@ async fn get_blob(
         .header(header::CONTENT_TYPE, mime_type)
         .header(header::CONTENT_LENGTH, total_size.to_string())
         .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
+        .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
         .header(header::ACCEPT_RANGES, "bytes")
         .body(axum::body::Body::from(data))
         .unwrap())

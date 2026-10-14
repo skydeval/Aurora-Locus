@@ -565,12 +565,50 @@ enum DeferredAction {
 struct DispatchEffects {
     cascading_event_ids: Vec<String>,
     deferred_actions: Vec<DeferredAction>,
+    /// Accounts whose status this dispatch changed; each is announced with
+    /// `#account` after commit (#499).
+    announce: Vec<String>,
+    /// Accounts whose rows this dispatch deleted; each deletion is announced
+    /// and its data removed after commit (#499).
+    deleted: Vec<String>,
 }
 
 impl DispatchEffects {
     fn merge(&mut self, other: DispatchEffects) {
         self.cascading_event_ids.extend(other.cascading_event_ids);
         self.deferred_actions.extend(other.deferred_actions);
+        self.announce.extend(other.announce);
+        self.deleted.extend(other.deleted);
+    }
+
+    /// Effects that announce `did`'s status after commit.
+    fn announcing(did: &str) -> Self {
+        Self {
+            announce: vec![did.to_string()],
+            ..Self::default()
+        }
+    }
+}
+
+/// Announce, after commit, every status change a dispatch made: each
+/// deleted account once, then each other account once with its status at
+/// that moment. Failures are logged; the change itself has committed.
+async fn announce_dispatch_effects(ctx: &AppContext, effects: &DispatchEffects) {
+    let mut deleted = effects.deleted.clone();
+    deleted.sort();
+    deleted.dedup();
+    for did in &deleted {
+        if let Err(e) = crate::api::account_state::finish_account_deletion(ctx, did).await {
+            tracing::error!(did = %did, error = %e, "account deletion not announced");
+        }
+    }
+    let mut announce = effects.announce.clone();
+    announce.sort();
+    announce.dedup();
+    for did in announce.iter().filter(|did| !deleted.contains(did)) {
+        if let Err(e) = crate::api::account_state::announce_account_state(ctx, did).await {
+            tracing::error!(did = %did, error = %e, "account status change not announced");
+        }
     }
 }
 
@@ -786,6 +824,7 @@ pub async fn emit_event(
     tx.commit().await.map_err(internal)?;
 
     // === Phase 4: post-commit deferred actions + response ===
+    announce_dispatch_effects(&ctx, &effects).await;
     for deferred in &effects.deferred_actions {
         match deferred {
             DeferredAction::BackendBlobDelete { cid } => {
@@ -1017,7 +1056,7 @@ async fn dispatch_action<'tx>(
                 },
             )
             .await?;
-            Ok(DispatchEffects::default())
+            Ok(DispatchEffects::announcing(did))
         }
         A::SuspendAccount => {
             let did = require_repo_did_pds(subject)?;
@@ -1039,29 +1078,34 @@ async fn dispatch_action<'tx>(
                 },
             )
             .await?;
-            Ok(DispatchEffects::default())
+            Ok(DispatchEffects::announcing(did))
         }
         A::RestoreAccount => {
+            // #499: a restore lifts the account's takedowns and suspensions
+            // from the moderation record and clears the row's takedown_ref.
+            // It used to insert a "restore" row and lift nothing.
             let did = require_repo_did_pds(subject)?;
-            ModerationManager::apply_action_in_tx(
+            ModerationManager::restore_account_in_tx(
                 tx,
-                ApplyActionParams {
-                    did,
-                    action: ModerationAction::Restore,
-                    reason: rationale,
-                    moderated_by: &auth.did,
-                    expires_in: None,
-                    report_id: None,
-                    notes: None,
-                },
+                did,
+                &auth.did,
+                rationale,
+                crate::admin::moderation::Lift::TakedownsAndSuspensions,
             )
             .await?;
-            Ok(DispatchEffects::default())
+            Ok(DispatchEffects::announcing(did))
         }
         A::DeleteAccount => {
             let did = require_repo_did_pds(subject)?;
+            // Only an account that exists is deleted and announced as deleted.
+            if let Err(PdsError::NotFound(_)) = ctx.account_manager.get_account(did).await {
+                return Err(PdsError::NotFound(format!("account {did} not found")));
+            }
             AccountManager::delete_account_permanent_in_tx(tx, did).await?;
-            Ok(DispatchEffects::default())
+            Ok(DispatchEffects {
+                deleted: vec![did.to_string()],
+                ..DispatchEffects::default()
+            })
         }
         A::ApplyLabel { val, neg: _neg } => {
             let (uri, cid) = subject_uri_cid_pds(subject)?;
@@ -1244,6 +1288,7 @@ async fn dispatch_action<'tx>(
                     )
                     .await?;
                     effects.cascading_event_ids.push(cascade_event.id.to_string());
+                    effects.announce.push(appellant_did.clone());
                 }
             }
             Ok(effects)
@@ -1295,24 +1340,39 @@ async fn dispatch_action<'tx>(
         A::UpdateSubjectStatus { status } => {
             let did = require_repo_did_pds(subject)?;
             let mod_action = match status {
-                SubjectStatusValue::Takedown => ModerationAction::Takedown,
-                SubjectStatusValue::Active => ModerationAction::Restore,
-                SubjectStatusValue::Deactivated => ModerationAction::Suspend,
+                SubjectStatusValue::Takedown => Some(ModerationAction::Takedown),
+                SubjectStatusValue::Active => None,
+                SubjectStatusValue::Deactivated => Some(ModerationAction::Suspend),
             };
-            ModerationManager::apply_action_in_tx(
-                tx,
-                ApplyActionParams {
-                    did,
-                    action: mod_action,
-                    reason: rationale,
-                    moderated_by: &auth.did,
-                    expires_in: None,
-                    report_id: None,
-                    notes: None,
-                },
-            )
-            .await?;
-            Ok(DispatchEffects::default())
+            match mod_action {
+                Some(action) => {
+                    ModerationManager::apply_action_in_tx(
+                        tx,
+                        ApplyActionParams {
+                            did,
+                            action,
+                            reason: rationale,
+                            moderated_by: &auth.did,
+                            expires_in: None,
+                            report_id: None,
+                            notes: None,
+                        },
+                    )
+                    .await?;
+                }
+                // #499: "active" lifts what the other two values apply.
+                None => {
+                    ModerationManager::restore_account_in_tx(
+                        tx,
+                        did,
+                        &auth.did,
+                        rationale,
+                        crate::admin::moderation::Lift::TakedownsAndSuspensions,
+                    )
+                    .await?;
+                }
+            }
+            Ok(DispatchEffects::announcing(did))
         }
     }
 }
@@ -1741,6 +1801,14 @@ pub async fn batch_takedown_accounts(
     .await
     .map_err(internal_pds)?;
     tx.commit().await.map_err(internal)?;
+    announce_dispatch_effects(
+        &ctx,
+        &DispatchEffects {
+            announce: input.dids.clone(),
+            ..DispatchEffects::default()
+        },
+    )
+    .await;
 
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
@@ -1835,6 +1903,14 @@ pub async fn batch_suspend_accounts(
     .await
     .map_err(internal_pds)?;
     tx.commit().await.map_err(internal)?;
+    announce_dispatch_effects(
+        &ctx,
+        &DispatchEffects {
+            announce: input.dids.clone(),
+            ..DispatchEffects::default()
+        },
+    )
+    .await;
 
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),
@@ -1877,19 +1953,19 @@ pub async fn batch_restore_accounts(
         &input.dids,
     )
     .await?;
+    // #499: lift takedowns and suspensions from the moderation record as
+    // well as the row's takedown_ref; clearing only the row announced the
+    // account active while its requests were still refused.
     for (idx, did) in input.dids.iter().enumerate() {
-        sqlx::query("UPDATE actor SET takedown_ref = NULL WHERE did = $1")
-            .bind(did)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                batch_subject_err_response(
-                    PdsError::Database(e),
-                    idx,
-                    did,
-                    "batch_restore_accounts",
-                )
-            })?;
+        ModerationManager::lift_in_tx(
+            &mut tx,
+            did,
+            &auth.did,
+            &input.rationale,
+            crate::admin::moderation::Lift::TakedownsAndSuspensions,
+        )
+        .await
+        .map_err(|e| batch_subject_err_response(e, idx, did, "batch_restore_accounts"))?;
     }
     let cascade: Vec<Subject> = input
         .dids
@@ -1915,6 +1991,14 @@ pub async fn batch_restore_accounts(
     .await
     .map_err(internal_pds)?;
     tx.commit().await.map_err(internal)?;
+    announce_dispatch_effects(
+        &ctx,
+        &DispatchEffects {
+            announce: input.dids.clone(),
+            ..DispatchEffects::default()
+        },
+    )
+    .await;
 
     Ok(Json(BatchAccountsOutput {
         event_id: event_id.to_string(),

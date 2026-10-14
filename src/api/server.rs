@@ -424,7 +424,7 @@ async fn create_session(
 
     // A deactivated account logs in like any other; the response says it is
     // not active, and the client shows its reactivate screen (#492).
-    let (active, status) = session_status(&account);
+    let (active, status) = session_status(&ctx, &account).await?;
     Ok(Json(SessionResponse {
         did: account.did,
         handle: account.handle.unwrap_or_default(),
@@ -439,14 +439,15 @@ async fn create_session(
 
 /// The `active` / `status` pair a session document reports for `account`
 /// (#492): `(true, None)` for an active account, otherwise `false` and
-/// `takendown` / `deactivated` / `suspended` / `desynchronized`.
-fn session_status(account: &crate::db::account::ActorAccount) -> (bool, Option<String>) {
-    crate::api::sync_helpers::get_repo_status(
-        account.takedown_ref.is_some(),
-        account.deactivated_at.as_ref(),
-        account.suspended_at.as_ref(),
-        account.desynchronized_at.as_ref(),
-    )
+/// `takendown` / `suspended` / `deactivated` / `desynchronized`. Read through
+/// the shared account state (#499), so an operator's suspension shows here as
+/// it does on `getRepoStatus` and on the firehose.
+async fn session_status(
+    ctx: &AppContext,
+    account: &crate::db::account::ActorAccount,
+) -> PdsResult<(bool, Option<String>)> {
+    let state = crate::api::account_state::state_for(ctx, account).await?;
+    Ok((state.active, state.status_str().map(str::to_string)))
 }
 
 /// Get session info endpoint
@@ -491,7 +492,7 @@ async fn get_session(
 
     // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
-    let (active, status) = session_status(&account);
+    let (active, status) = session_status(&ctx, &account).await?;
 
     Ok(Json(hide_email_unless_granted(
         &unified,
@@ -590,7 +591,7 @@ async fn refresh_session(
 
     // Get account info
     let account = ctx.account_manager.get_account(&session.did).await?;
-    let (active, status) = session_status(&account);
+    let (active, status) = session_status(&ctx, &account).await?;
 
     Ok(Json(SessionResponse {
         did: account.did.clone(),
@@ -1075,19 +1076,9 @@ async fn delete_account(
             e
         })?;
 
-    // Delete actor store data (repository, blobs, etc.)
-    // This should be done before deleting account records.
-    if let Err(e) = ctx.actor_store.destroy(&req.did).await {
-        tracing::warn!(
-            at_step = "delete_account:actor_store_destroy",
-            did = %req.did,
-            error = %e,
-            "deleteAccount: actor store cleanup failed; continuing with account row delete"
-        );
-        // Continue with account deletion even if actor store cleanup fails.
-    }
-
-    // Permanently delete account from database
+    // Rows first, then the announcement, then the data (#499): the
+    // reference PDS's order. A failure after the rows are gone leaves data
+    // that nothing serves, never an account without its repository.
     ctx.account_manager
         .delete_account_permanent(&req.did)
         .await
@@ -1096,49 +1087,21 @@ async fn delete_account(
                 at_step = "delete_account:delete_permanent",
                 did = %req.did,
                 error = %e,
-                "deleteAccount: permanent delete failed (actor store may be already destroyed)"
+                "deleteAccount: permanent delete failed"
             );
             e
         })?;
-
-    // Arc 15 §8.3.3: emit Deleted #account event + wipe prior history.
-    // Two-await non-atomic per §8.5.5 (matches bsky-PDS pattern;
-    // consumers duplicate-suppress on did).
-    let deletion_seq = ctx
-        .sequencer
-        .sequence_account(crate::sequencer::events::AccountEvent::from_status(
-            req.did.clone(),
-            crate::sequencer::events::AccountStatus::Deleted,
-        ))
+    crate::api::account_state::finish_account_deletion(&ctx, &req.did)
         .await
         .map_err(|e| {
             tracing::error!(
-                at_step = "delete_account:sequence_deletion_event",
+                at_step = "delete_account:finish",
                 did = %req.did,
                 error = %e,
-                "deleteAccount: failed to emit #account Deleted"
+                "deleteAccount: account rows removed but the deletion was not announced"
             );
             e
         })?;
-    ctx.sequencer
-        .delete_all_for_user(&req.did, &[deletion_seq])
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                at_step = "delete_account:wipe_prior_events",
-                did = %req.did,
-                deletion_seq,
-                error = %e,
-                "deleteAccount: retention wipe failed (deletion event emitted OK)"
-            );
-            e
-        })?;
-
-    tracing::info!(
-        did = %req.did,
-        deletion_seq,
-        "account_deleted_permanently"
-    );
 
     Ok(Json(serde_json::json!({})))
 }
@@ -1843,6 +1806,15 @@ async fn activate_account(
     // If account is pending deletion (has delete_after set), use cancel_account_deletion instead.
     let account = ctx.account_manager.get_account(&did).await?;
 
+    // A taken-down account is not reactivated (#499), as on the reference
+    // PDS. The {handle, password} path reaches here without a session, so
+    // the request-level takedown check does not stop it.
+    if crate::api::account_state::state_for(&ctx, &account).await?.status
+        == Some(crate::sequencer::events::AccountStatus::Takendown)
+    {
+        return Err(PdsError::AccountTakenDown(did));
+    }
+
     let message = if account.delete_after.is_some() {
         ctx.account_manager.cancel_account_deletion(&did).await?;
         "Account deletion cancelled and account reactivated"
@@ -1858,7 +1830,7 @@ async fn activate_account(
     // 1. Account (Pattern B — status from freshly-read row).
     let acc_post = ctx.account_manager.get_account(&did).await?;
     let (active, status) =
-        crate::api::sync_helpers::get_account_status(&acc_post);
+        crate::api::account_state::state_pair(&ctx, &acc_post).await;
     ctx.sequencer
         .sequence_account(crate::sequencer::events::AccountEvent {
             did: did.clone(),
@@ -1936,41 +1908,31 @@ async fn deactivate_account(
     let validated = middleware::require_auth(State(ctx.clone()), headers).await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
-    // `deleteAfter` is the lexicon-spec optional field. Aurora-Locus
-    // doesn't schedule deferred deletion in v0.5 (the field exists in
-    // the schema as `actor.delete_after` and is set via
-    // `requestAccountDelete` / `delete_account` flows). If present
-    // here, log + ignore — v0.6+ work to honor it from deactivate.
-    if let Some(delete_after) = req.delete_after.as_deref() {
-        tracing::info!(
-            did = %validated.did,
-            delete_after,
-            "deactivate_account: deleteAfter requested but not yet honored in v0.5 \
-             (deactivation only; use requestAccountDelete for scheduled deletion)"
-        );
-    }
+    // `deleteAfter` (#499): the time after which the deactivated account
+    // may be deleted. It is stored, and the purge job deletes a deactivated
+    // account once that time has passed, as it does for a scheduled deletion.
+    // It used to be ignored.
+    let delete_after = match req.delete_after.as_deref() {
+        Some(raw) => Some(
+            chrono::DateTime::parse_from_rfc3339(raw)
+                .map_err(|_| PdsError::Validation(format!("deleteAfter is not a datetime: {raw}")))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
 
-    // Temporarily deactivate account (NO deletion scheduled).
     ctx.account_manager
         .deactivate_account(&validated.did)
         .await?;
+    if let Some(at) = delete_after {
+        ctx.account_manager
+            .set_delete_after(&validated.did, at)
+            .await?;
+    }
 
-    // Arc 15 §8.3.4: emit Deactivated #account event (Pattern B —
-    // status derived from freshly-read post-mutation row).
-    let acc_post = ctx.account_manager.get_account(&validated.did).await?;
-    let (active, status) =
-        crate::api::sync_helpers::get_account_status(&acc_post);
-    debug_assert_eq!(
-        status,
-        Some(crate::sequencer::events::AccountStatus::Deactivated)
-    );
-    ctx.sequencer
-        .sequence_account(crate::sequencer::events::AccountEvent {
-            did: validated.did.clone(),
-            active,
-            status,
-        })
-        .await?;
+    // Arc 15 §8.3.4 / #499: announce the account's status after the change.
+    // A suspended account that deactivates is still announced suspended.
+    crate::api::account_state::announce_account_state(&ctx, &validated.did).await?;
 
     Ok(Json(serde_json::json!({
         "message": "Account temporarily deactivated. You can reactivate anytime by logging in or calling activateAccount."
@@ -1983,13 +1945,13 @@ async fn deactivate_account(
 struct CheckAccountStatusResponse {
     activated: bool,
     valid_did: bool,
-    repo_commit: Option<String>,
-    repo_rev: Option<String>,
-    repo_blocks: Option<i64>,
-    indexed_records: Option<i64>,
-    private_state_values: Option<i64>,
-    expected_blobs: Option<i64>,
-    imported_blobs: Option<i64>,
+    repo_commit: String,
+    repo_rev: String,
+    repo_blocks: i64,
+    indexed_records: i64,
+    private_state_values: i64,
+    expected_blobs: i64,
+    imported_blobs: i64,
 }
 
 /// Check account status endpoint
@@ -2013,18 +1975,32 @@ async fn check_account_status(
     // Check if account is active (not deactivated or taken down)
     let activated = account.deactivated_at.is_none() && account.takedown_ref.is_none();
 
-    // TODO: Get repo statistics from actor store
-    // For now, return basic info
+    // The repository fields the lexicon requires (#499); they were null.
+    // An account whose repository has no root yet reports empty values.
+    let root = match ctx.actor_store.get_repo_root(&validated.did).await {
+        Ok(root) => Some(root),
+        Err(PdsError::NotFound(_)) => None,
+        Err(e) => return Err(e),
+    };
+    let (repo_blocks, indexed_records) = match ctx.actor_store.repo_counts(&validated.did).await {
+        Ok(counts) => counts,
+        Err(PdsError::NotFound(_)) => (0, 0),
+        Err(e) => return Err(e),
+    };
+    let (expected_blobs, imported_blobs) =
+        ctx.blob_store.account_blob_counts(&validated.did).await?;
+
     Ok(Json(CheckAccountStatusResponse {
         activated,
         valid_did: true,
-        repo_commit: None,
-        repo_rev: None,
-        repo_blocks: None,
-        indexed_records: None,
-        private_state_values: None,
-        expected_blobs: None,
-        imported_blobs: None,
+        repo_commit: root.as_ref().map(|r| r.cid.clone()).unwrap_or_default(),
+        repo_rev: root.map(|r| r.rev).unwrap_or_default(),
+        repo_blocks,
+        indexed_records,
+        // As on the reference PDS.
+        private_state_values: 0,
+        expected_blobs,
+        imported_blobs,
     }))
 }
 
@@ -2430,6 +2406,58 @@ mod create_session_ip_binding_tests {
             .validate_access_token_with_ip(&token, None)
             .await
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod activate_taken_down_tests {
+    //! #499: `activateAccount` does not reactivate a taken-down account,
+    //! including through the {handle, password} path that has no session.
+    use super::*;
+    use crate::admin::moderation::{ApplyActionParams, ModerationAction};
+
+    #[tokio::test]
+    async fn a_taken_down_account_is_not_reactivated() {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let account = ctx
+            .account_manager
+            .create_account(
+                "downed.localhost".to_string(),
+                None,
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create account");
+        ctx.account_manager
+            .deactivate_account(&account.did)
+            .await
+            .expect("deactivate");
+        ctx.moderation_manager
+            .apply_action(ApplyActionParams {
+                did: &account.did,
+                action: ModerationAction::Takedown,
+                reason: "test",
+                moderated_by: "did:plc:admin",
+                expires_in: None,
+                report_id: None,
+                notes: None,
+            })
+            .await
+            .expect("takedown");
+
+        let body = ActivateAccountRequest {
+            handle: Some("downed.localhost".to_string()),
+            password: Some("password123".to_string()),
+        };
+        let err = activate_account(State(ctx.clone()), HeaderMap::new(), Some(Json(body)))
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, PdsError::AccountTakenDown(_)), "{err:?}");
+        let row = ctx.account_manager.get_account(&account.did).await.unwrap();
+        assert!(row.deactivated_at.is_some(), "still deactivated");
     }
 }
 

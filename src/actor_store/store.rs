@@ -371,6 +371,19 @@ impl ActorStore {
         subject_index::subject_facts(&pool, probes).await
     }
 
+    /// How many blocks and how many indexed records the repository of `did`
+    /// holds (`com.atproto.server.checkAccountStatus`).
+    pub async fn repo_counts(&self, did: &str) -> PdsResult<(i64, i64)> {
+        let pool = self.open_db(did).await?;
+        let blocks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM repo_block")
+            .fetch_one(&pool)
+            .await?;
+        let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM record")
+            .fetch_one(&pool)
+            .await?;
+        Ok((blocks, records))
+    }
+
     /// Get all distinct collections for a DID
     pub async fn get_collections(&self, did: &str) -> PdsResult<Vec<String>> {
         let pool = self.open_db(did).await?;
