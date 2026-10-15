@@ -49,7 +49,7 @@ async fn par_inner(
     let htu = format!("{}/oauth/atproto/par", ctx.service_url());
     verify_dpop_required(ctx, headers, &htu)
         .await
-        .map_err(|e| oauth_error_json(StatusCode::UNAUTHORIZED, "invalid_client", &e.to_string()))?;
+        .map_err(|e| super::dpop_failure(ctx, &e, StatusCode::UNAUTHORIZED, "invalid_client"))?;
 
     // 2. Validate the pushed parameters against the atproto-OAuth profile.
     let validated = params::validate(&raw).map_err(|e| {
@@ -199,21 +199,25 @@ mod tests {
         (sk, jwk)
     }
 
-    /// A proof shaped as third-party clients send it: jti, htm, htu, iat, and
-    /// no exp.
+    /// A proof shaped as third-party clients send it: jti, htm, htu, iat, the
+    /// server's nonce when given, and no exp.
     fn rfc_9449_proof(
         sk: &p256::ecdsa::SigningKey,
         jwk: &crate::federation::dpop::Jwk,
         htu: &str,
+        nonce: Option<String>,
     ) -> String {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
         use p256::pkcs8::EncodePrivateKey;
-        let claims = serde_json::json!({
+        let mut claims = serde_json::json!({
             "jti": uuid::Uuid::new_v4().to_string(),
             "htm": "POST",
             "htu": htu,
             "iat": Utc::now().timestamp(),
         });
+        if let Some(nonce) = nonce {
+            claims["nonce"] = serde_json::Value::String(nonce);
+        }
         let pem = sk.to_pkcs8_pem(Default::default()).unwrap().to_string();
         let key = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
         let mut header = Header::new(Algorithm::ES256);
@@ -260,7 +264,7 @@ mod tests {
         let (sk, jwk) = fresh_keypair_jwk();
         let htu = format!("{}/oauth/atproto/par", ctx.service_url());
         let mut headers = HeaderMap::new();
-        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu).parse().unwrap());
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu, Some(crate::oauth::dpop_nonce::current(&ctx))).parse().unwrap());
 
         let resp = par(
             State(ctx.clone()),
@@ -278,6 +282,39 @@ mod tests {
             .starts_with("urn:ietf:params:oauth:request_uri:"));
     }
 
+    /// #486: a proof without a nonce this server issued gets `use_dpop_nonce`
+    /// and the current nonce, and the retry carrying it is accepted.
+    #[tokio::test]
+    async fn par_challenges_for_a_nonce_then_accepts_the_retry() {
+        let ctx = ctx().await;
+        let redirect_uri = "https://app.example.com/cb";
+        let client_id = serve_client_metadata(redirect_uri).await;
+        let (sk, jwk) = fresh_keypair_jwk();
+        let htu = format!("{}/oauth/atproto/par", ctx.service_url());
+
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu, None).parse().unwrap());
+        let resp = par(State(ctx.clone()), headers, Form(form(&client_id, redirect_uri))).await;
+        let status = resp.status();
+        // The challenge itself carries the nonce to retry with.
+        let nonce = resp
+            .headers()
+            .get("dpop-nonce")
+            .expect("the challenge carries DPoP-Nonce")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let bytes = to_bytes(resp.into_body(), 8192).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(doc["error"], "use_dpop_nonce");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu, Some(nonce)).parse().unwrap());
+        let resp = par(State(ctx.clone()), headers, Form(form(&client_id, redirect_uri))).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
     /// #478: the Blacksky client's exact request — its full scope string and
     /// a proof without exp — is accepted, and the scope recorded for the
     /// grant is exactly the one requested (every token in it is supported).
@@ -291,7 +328,7 @@ mod tests {
         let (sk, jwk) = fresh_keypair_jwk();
         let htu = format!("{}/oauth/atproto/par", ctx.service_url());
         let mut headers = HeaderMap::new();
-        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu).parse().unwrap());
+        headers.insert("DPoP", rfc_9449_proof(&sk, &jwk, &htu, Some(crate::oauth::dpop_nonce::current(&ctx))).parse().unwrap());
         let mut params = form(&client_id, redirect_uri);
         params.scope = Some(SCOPE.to_string());
         // Browser clients on the reference libraries ask for fragment (#483).

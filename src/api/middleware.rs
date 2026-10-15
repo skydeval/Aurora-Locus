@@ -56,6 +56,27 @@ pub async fn www_authenticate_on_unauthorized(req: Request, next: Next) -> Respo
     response
 }
 
+/// Give every response to a request that carried a DPoP proof the current
+/// server nonce in `DPoP-Nonce` (RFC 9449 §8, §9; #486), so a client always
+/// holds a nonce for its next proof and rarely meets a `use_dpop_nonce`
+/// challenge.
+pub async fn dpop_nonce_header(
+    State(ctx): State<AppContext>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let carried_proof = req.headers().contains_key("dpop");
+    let mut response = next.run(req).await;
+    if carried_proof {
+        if let Ok(value) = HeaderValue::from_str(&crate::oauth::dpop_nonce::current(&ctx)) {
+            response
+                .headers_mut()
+                .insert(crate::oauth::dpop_nonce::DPOP_NONCE_HEADER, value);
+        }
+    }
+    response
+}
+
 /// Extract bearer token from Authorization header
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
@@ -267,6 +288,8 @@ async fn resolve_atproto_oauth(
         .dpop_verifier
         .verify_dpop_proof(proof, method, htu, Some(&ath))
         .await?;
+    // RFC 9449 §9 (#486): the proof must carry a nonce this server issued.
+    crate::oauth::dpop_nonce::require(ctx, proof)?;
 
     // 3. proof key == the token's bound DPoP thumbprint (β.3 binding).
     match token_info.dpop_thumbprint.as_deref() {
@@ -1688,7 +1711,13 @@ mod epsilon_oauth_gate_tests {
         (sk, jwk)
     }
 
-    fn dpop_proof(sk: &p256::ecdsa::SigningKey, jwk: &Jwk, htu: &str, ath: &str) -> String {
+    fn dpop_proof(
+        sk: &p256::ecdsa::SigningKey,
+        jwk: &Jwk,
+        htu: &str,
+        ath: &str,
+        nonce: Option<String>,
+    ) -> String {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
         use p256::pkcs8::EncodePrivateKey;
         let claims = DPopClaims {
@@ -1699,6 +1728,7 @@ mod epsilon_oauth_gate_tests {
             // Third-party clients send RFC 9449 proofs: no exp.
             exp: None,
             ath: Some(ath.to_string()),
+            nonce,
         };
         let pem = sk.to_pkcs8_pem(Default::default()).unwrap().to_string();
         let key = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
@@ -1750,7 +1780,7 @@ mod epsilon_oauth_gate_tests {
 
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
-        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath, Some(crate::oauth::dpop_nonce::current(&ctx)));
 
         let resolved = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
             .await
@@ -1801,11 +1831,30 @@ mod epsilon_oauth_gate_tests {
         let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "atproto").await;
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
-        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath, Some(crate::oauth::dpop_nonce::current(&ctx)));
         let resolved = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
             .await
             .expect("resolve");
         assert_eq!(resolved.internal_scope, "");
+    }
+
+    #[tokio::test]
+    async fn resolve_challenges_a_proof_without_this_servers_nonce() {
+        let ctx = ctx().await;
+        let did = "did:web:nonce.example.com";
+        seed_actor(&ctx, did).await;
+        let (sk, jwk) = fresh_p256();
+        let (bearer, _jkt) =
+            seed_token_and_device(&ctx, did, &jwk, "atproto transition:generic").await;
+        let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
+        let ath = crate::federation::dpop::compute_ath(&bearer);
+        for nonce in [None, Some("stale-or-forged".to_string())] {
+            let proof = dpop_proof(&sk, &jwk, &htu, &ath, nonce);
+            let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::UseDpopNonce));
+        }
     }
 
     #[tokio::test]
@@ -1839,7 +1888,7 @@ mod epsilon_oauth_gate_tests {
 
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
-        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath, Some(crate::oauth::dpop_nonce::current(&ctx)));
 
         let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.unwrap_err();
         assert!(matches!(err, PdsError::Authentication(ref m) if m.contains("device not registered")));
@@ -1855,7 +1904,7 @@ mod epsilon_oauth_gate_tests {
         let (bearer, _jkt) = seed_token_and_device(&ctx, did, &jwk, "transition:generic").await;
         let htu = format!("{}/xrpc/com.atproto.repo.createRecord", ctx.service_url());
         let ath = crate::federation::dpop::compute_ath(&bearer);
-        let proof = dpop_proof(&sk, &jwk, &htu, &ath);
+        let proof = dpop_proof(&sk, &jwk, &htu, &ath, Some(crate::oauth::dpop_nonce::current(&ctx)));
         let err = resolve_atproto_oauth(&ctx, "POST", &htu, Some(&proof), &bearer).await.unwrap_err();
         assert!(matches!(err, PdsError::Authorization(_)));
     }

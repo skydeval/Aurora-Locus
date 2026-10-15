@@ -80,7 +80,7 @@ async fn authorization_code_grant(
     let htu = format!("{}/oauth/atproto/token", ctx.service_url());
     let thumbprint = verify_dpop_required(ctx, headers, &htu)
         .await
-        .map_err(|e| oauth_error_json(StatusCode::UNAUTHORIZED, "invalid_dpop_proof", &e.to_string()))?;
+        .map_err(|e| super::dpop_failure(ctx, &e, StatusCode::UNAUTHORIZED, "invalid_dpop_proof"))?;
 
     // 2. Look up the authorization request by the code's hash. Generic
     //    `invalid_grant` for every lookup/validity failure (no oracle).
@@ -150,7 +150,7 @@ async fn refresh_token_grant(
     let htu = format!("{}/oauth/atproto/token", ctx.service_url());
     let thumbprint = verify_dpop_required(ctx, headers, &htu)
         .await
-        .map_err(|e| oauth_error_json(StatusCode::UNAUTHORIZED, "invalid_dpop_proof", &e.to_string()))?;
+        .map_err(|e| super::dpop_failure(ctx, &e, StatusCode::UNAUTHORIZED, "invalid_dpop_proof"))?;
 
     // 2. Proof-of-possession: the presented DPoP key must match the key the
     //    token was bound to at issuance. Look up the row's thumbprint directly;
@@ -397,7 +397,21 @@ mod tests {
         (signing_key, jwk)
     }
 
-    fn signed_proof(signing_key: &p256::ecdsa::SigningKey, jwk: &Jwk, htu: &str) -> String {
+    fn signed_proof(
+        ctx: &AppContext,
+        signing_key: &p256::ecdsa::SigningKey,
+        jwk: &Jwk,
+        htu: &str,
+    ) -> String {
+        proof_with_nonce(signing_key, jwk, htu, Some(crate::oauth::dpop_nonce::current(ctx)))
+    }
+
+    fn proof_with_nonce(
+        signing_key: &p256::ecdsa::SigningKey,
+        jwk: &Jwk,
+        htu: &str,
+        nonce: Option<String>,
+    ) -> String {
         use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
         use p256::pkcs8::EncodePrivateKey;
         let claims = DPopClaims {
@@ -408,6 +422,7 @@ mod tests {
             // Third-party clients send RFC 9449 proofs: no exp.
             exp: None,
             ath: None,
+            nonce,
         };
         let pem = signing_key.to_pkcs8_pem(Default::default()).unwrap().to_string();
         let key = EncodingKey::from_ec_pem(pem.as_bytes()).unwrap();
@@ -531,7 +546,7 @@ mod tests {
 
         let (sk, jwk) = fresh_keypair_jwk();
         let htu = format!("{}/oauth/atproto/token", ctx.service_url());
-        let proof = signed_proof(&sk, &jwk, &htu);
+        let proof = signed_proof(&ctx, &sk, &jwk, &htu);
 
         let mut form = token_form("authorization_code");
         form.code = Some(code.to_string());
@@ -540,6 +555,27 @@ mod tests {
         let (status, json) = body_json(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["error"], "invalid_grant");
+    }
+
+    #[tokio::test]
+    async fn a_proof_without_this_servers_nonce_is_challenged() {
+        let ctx = ctx().await;
+        let (_verifier, challenge) = pkce_pair();
+        let code = "nonce-code";
+        seed_code_request(&ctx, "req-nonce", &super::super::token_hash(code), &challenge).await;
+        let (sk, jwk) = fresh_keypair_jwk();
+        let htu = format!("{}/oauth/atproto/token", ctx.service_url());
+
+        for nonce in [None, Some("not-a-nonce-we-issued".to_string())] {
+            let proof = proof_with_nonce(&sk, &jwk, &htu, nonce);
+            let mut form = token_form("authorization_code");
+            form.code = Some(code.to_string());
+            form.code_verifier = Some("v".to_string());
+            let resp = token(State(ctx.clone()), dpop_headers(&proof), Form(form)).await;
+            let (status, json) = body_json(resp).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(json["error"], "use_dpop_nonce");
+        }
     }
 
     #[tokio::test]
@@ -557,7 +593,7 @@ mod tests {
         form.code_verifier = Some(verifier.clone());
         let resp = token(
             State(ctx.clone()),
-            dpop_headers(&signed_proof(&sk, &jwk, &htu)),
+            dpop_headers(&signed_proof(&ctx, &sk, &jwk, &htu)),
             Form(form),
         )
         .await;
@@ -605,7 +641,7 @@ mod tests {
         form2.code_verifier = Some(verifier);
         let resp2 = token(
             State(ctx.clone()),
-            dpop_headers(&signed_proof(&sk, &jwk, &htu)),
+            dpop_headers(&signed_proof(&ctx, &sk, &jwk, &htu)),
             Form(form2),
         )
         .await;
@@ -631,7 +667,7 @@ mod tests {
         let (status, json) = body_json(
             token(
                 State(ctx.clone()),
-                dpop_headers(&signed_proof(&sk, &jwk, &htu)),
+                dpop_headers(&signed_proof(&ctx, &sk, &jwk, &htu)),
                 Form(form),
             )
             .await,
@@ -646,7 +682,7 @@ mod tests {
         let (rstatus, rjson) = body_json(
             token(
                 State(ctx.clone()),
-                dpop_headers(&signed_proof(&sk, &jwk, &htu)),
+                dpop_headers(&signed_proof(&ctx, &sk, &jwk, &htu)),
                 Form(rform),
             )
             .await,
@@ -670,7 +706,7 @@ mod tests {
         rform2.refresh_token = Some(rjson["refresh_token"].as_str().unwrap().to_string());
         let resp = token(
             State(ctx.clone()),
-            dpop_headers(&signed_proof(&other_sk, &other_jwk, &htu)),
+            dpop_headers(&signed_proof(&ctx, &other_sk, &other_jwk, &htu)),
             Form(rform2),
         )
         .await;

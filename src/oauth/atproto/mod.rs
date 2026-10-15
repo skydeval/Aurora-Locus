@@ -138,9 +138,43 @@ pub(super) async fn verify_dpop_required(
     let proof = raw
         .to_str()
         .map_err(|_| PdsError::Authentication("invalid DPoP header value".to_string()))?;
-    ctx.dpop_verifier
+    let thumbprint = ctx
+        .dpop_verifier
         .verify_dpop_proof(proof, "POST", htu, None)
-        .await
+        .await?;
+    // RFC 9449 §8 (#486): the proof must carry a nonce this server issued.
+    crate::oauth::dpop_nonce::require(ctx, proof)?;
+    Ok(thumbprint)
+}
+
+/// The OAuth error answer for a failed DPoP check at an authorization-server
+/// endpoint: `use_dpop_nonce` (HTTP 400, RFC 9449 §8) when only the nonce was
+/// missing or stale, carrying the nonce to retry with in `DPoP-Nonce`;
+/// otherwise `code` with `status`.
+pub(super) fn dpop_failure(
+    ctx: &AppContext,
+    e: &PdsError,
+    status: StatusCode,
+    code: &str,
+) -> Response {
+    match e {
+        PdsError::UseDpopNonce => {
+            let mut response = oauth_error_json(
+                StatusCode::BAD_REQUEST,
+                "use_dpop_nonce",
+                "Authorization server requires nonce in DPoP proof",
+            );
+            if let Ok(value) =
+                header::HeaderValue::from_str(&crate::oauth::dpop_nonce::current(ctx))
+            {
+                response
+                    .headers_mut()
+                    .insert(crate::oauth::dpop_nonce::DPOP_NONCE_HEADER, value);
+            }
+            response
+        }
+        other => oauth_error_json(status, code, &other.to_string()),
+    }
 }
 
 /// SHA-256 hex digest of a value (authorization codes, here). Reuses the same
