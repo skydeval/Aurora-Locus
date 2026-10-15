@@ -1678,10 +1678,11 @@ impl ServerConfig {
         let service_did =
             env::var("PDS_SERVICE_DID").unwrap_or_else(|_| format!("did:web:{}", hostname));
         let version = env::var("PDS_VERSION").unwrap_or_else(|_| "0.1.0".to_string());
+        // 100 MiB by default: Bluesky's video limit (#513).
         let blob_upload_limit = env::var("PDS_BLOB_UPLOAD_LIMIT")
-            .unwrap_or_else(|_| "5242880".to_string())
+            .unwrap_or_else(|_| "104857600".to_string())
             .parse()
-            .unwrap_or(5242880);
+            .unwrap_or(104_857_600);
 
         let data_directory: PathBuf = env::var("PDS_DATA_DIRECTORY")
             .unwrap_or_else(|_| "./data".to_string())

@@ -179,12 +179,13 @@ fn validate_service_config(config: &ServerConfig, issues: &mut Vec<ValidationIss
             "Service",
             "Blob upload limit is 0 - uploads will be disabled".to_string(),
         ));
-    } else if config.service.blob_upload_limit > 52428800 {
-        // 50 MB
+    } else if config.service.blob_upload_limit > 104_857_600 {
+        // 100 MiB: Bluesky's video limit. An upload is held in memory until
+        // staged (a few at a time), so a larger limit needs memory to match.
         issues.push(ValidationIssue::warning(
             "Service",
             format!(
-                "Blob upload limit is {} bytes (>50MB) - may cause memory issues",
+                "Blob upload limit is {} bytes (>100MB) - may cause memory issues",
                 config.service.blob_upload_limit
             ),
         ));

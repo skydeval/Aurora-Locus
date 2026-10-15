@@ -129,19 +129,20 @@ impl BlobStore {
         }
     }
 
-    /// Extract image dimensions from data
+    /// Extract image dimensions from data. Only the image's header is read,
+    /// never the pixels, so a large upload costs no decode (#513).
     fn extract_image_dimensions(data: &[u8], mime_type: &str) -> Option<ImageDimensions> {
         // Only process images
         if !mime_type.starts_with("image/") {
             return None;
         }
 
-        // Try to load the image
-        match image::load_from_memory(data) {
-            Ok(img) => Some(ImageDimensions {
-                width: img.width(),
-                height: img.height(),
-            }),
+        let dimensions = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .map_err(image::ImageError::IoError)
+            .and_then(|reader| reader.into_dimensions());
+        match dimensions {
+            Ok((width, height)) => Some(ImageDimensions { width, height }),
             Err(e) => {
                 tracing::warn!("Failed to extract image dimensions: {}", e);
                 None
@@ -212,11 +213,16 @@ impl BlobStore {
         // Validate MIME type is allowed
         self.validate_mime_type(&mime_type)?;
 
-        // Calculate CID
-        let cid = self.calculate_cid(&data);
-
-        // Extract image dimensions if this is an image
-        let dimensions = Self::extract_image_dimensions(&data, &mime_type);
+        // Hash the bytes and read any image header on a blocking thread: a
+        // blob may be 100 MiB, which must not stall the async workers.
+        let mime_for_header = mime_type.clone();
+        let (data, cid, dimensions) = tokio::task::spawn_blocking(move || {
+            let cid = Self::raw_cid(&data);
+            let dimensions = Self::extract_image_dimensions(&data, &mime_for_header);
+            (data, cid, dimensions)
+        })
+        .await
+        .map_err(|e| PdsError::Internal(format!("blob hashing task failed: {e}")))?;
         let (width, height) = dimensions
             .map(|d| (Some(d.width as i64), Some(d.height as i64)))
             .unwrap_or((None, None));
@@ -572,6 +578,11 @@ impl BlobStore {
     /// digest), and base32-encodes the whole CIDv1 — NOT a
     /// hex-string concatenation onto a fixed prefix.
     fn calculate_cid(&self, data: &[u8]) -> String {
+        Self::raw_cid(data)
+    }
+
+    /// [`Self::calculate_cid`] without a store, for a blocking task.
+    fn raw_cid(data: &[u8]) -> String {
         proto_blue::lex_data::Cid::for_raw(data).to_string()
     }
 
