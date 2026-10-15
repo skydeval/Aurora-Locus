@@ -36,6 +36,9 @@ pub struct RawAuthParams {
     /// `login_hint`; #502). Advisory: the server signs in, or switches to,
     /// that account; it never binds the request to another one silently.
     pub login_hint: Option<String>,
+    /// What the client asks the server to show (OpenID `prompt`; #503):
+    /// `create`, `login`, `select_account` or `none`.
+    pub prompt: Option<String>,
 }
 
 /// A validated authorization request's parameters. Constructed only via
@@ -51,7 +54,12 @@ pub struct ValidatedParams {
     pub response_mode: ResponseMode,
     /// The client's `login_hint`, trimmed; `None` when absent or blank.
     pub login_hint: Option<String>,
+    /// The client's `prompt`, one of [`SUPPORTED_PROMPTS`]; `None` when absent.
+    pub prompt: Option<String>,
 }
+
+/// The `prompt` values this server acts on, as advertised in its metadata.
+pub const SUPPORTED_PROMPTS: [&str; 4] = ["create", "login", "none", "select_account"];
 
 /// Why a set of authorization parameters was rejected. Each variant maps to an
 /// RFC 6749 §4.1.2.1 OAuth error code via [`AuthParamError::oauth_code`].
@@ -67,6 +75,8 @@ pub enum AuthParamError {
     InvalidScope(ScopeParseError),
     /// `response_mode` was not one this server supports.
     UnsupportedResponseMode(String),
+    /// `prompt` was not one this server acts on.
+    UnsupportedPrompt(String),
 }
 
 impl AuthParamError {
@@ -78,6 +88,7 @@ impl AuthParamError {
             AuthParamError::UnsupportedChallengeMethod(_) => "invalid_request",
             AuthParamError::InvalidScope(_) => "invalid_scope",
             AuthParamError::UnsupportedResponseMode(_) => "invalid_request",
+            AuthParamError::UnsupportedPrompt(_) => "invalid_request",
         }
     }
 
@@ -94,6 +105,9 @@ impl AuthParamError {
             AuthParamError::InvalidScope(e) => e.to_string(),
             AuthParamError::UnsupportedResponseMode(m) => {
                 format!("unsupported response_mode '{m}' (query, fragment or form_post)")
+            }
+            AuthParamError::UnsupportedPrompt(p) => {
+                format!("unsupported prompt '{p}' (create, login, none or select_account)")
             }
         }
     }
@@ -154,7 +168,20 @@ pub fn validate(raw: &RawAuthParams) -> Result<ValidatedParams, AuthParamError> 
         code_challenge,
         response_mode,
         login_hint: normalize_login_hint(raw.login_hint.as_deref()),
+        prompt: normalize_prompt(raw.prompt.as_deref())?,
     })
+}
+
+/// A `prompt` as stored: `None` when absent or blank, one of
+/// [`SUPPORTED_PROMPTS`] otherwise. Any other value is refused rather than
+/// ignored: a client asking for a fresh sign-in must not silently get none.
+/// OpenID allows several space-separated values; this server acts on one.
+pub fn normalize_prompt(prompt: Option<&str>) -> Result<Option<String>, AuthParamError> {
+    match prompt.map(str::trim).filter(|p| !p.is_empty()) {
+        None => Ok(None),
+        Some(p) if SUPPORTED_PROMPTS.contains(&p) => Ok(Some(p.to_string())),
+        Some(p) => Err(AuthParamError::UnsupportedPrompt(p.to_string())),
+    }
 }
 
 /// The longest `login_hint` kept. A handle is at most 253 characters and a
@@ -185,6 +212,7 @@ mod tests {
             request_uri: None,
             response_mode: None,
             login_hint: None,
+            prompt: None,
         }
     }
 

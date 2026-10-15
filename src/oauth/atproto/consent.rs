@@ -200,6 +200,7 @@ mod tests {
             expires_at: (now + Duration::minutes(10)).to_rfc3339(),
             response_mode: None,
             login_hint: None,
+            prompt: None,
         };
         request_store::insert(&ctx.account_db, &req).await.unwrap();
     }

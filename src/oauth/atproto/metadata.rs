@@ -34,6 +34,9 @@ pub async fn authorization_server_metadata(
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}/oauth/atproto/authorize"),
         "token_endpoint": format!("{issuer}/oauth/atproto/token"),
+        // RFC 7009 (#503): clients end their grant here on sign-out.
+        "revocation_endpoint": format!("{issuer}/oauth/atproto/revoke"),
+        "revocation_endpoint_auth_methods_supported": ["none"],
         "pushed_authorization_request_endpoint": format!("{issuer}/oauth/atproto/par"),
         "require_pushed_authorization_requests": true,
         "response_types_supported": ["code"],
@@ -46,6 +49,9 @@ pub async fn authorization_server_metadata(
         "scopes_supported": scopes_supported,
         "dpop_signing_alg_values_supported": ["ES256"],
         "client_id_metadata_document_supported": true,
+        // #503: sign up (`create`), sign in afresh (`login`,
+        // `select_account`), or show nothing (`none`).
+        "prompt_values_supported": super::params::SUPPORTED_PROMPTS,
     });
 
     let bytes = serde_json::to_vec(&body).map_err(|e| {

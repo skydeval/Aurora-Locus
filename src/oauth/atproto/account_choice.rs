@@ -292,6 +292,7 @@ mod tests {
                 expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
                 response_mode: None,
                 login_hint: None,
+                prompt: None,
             },
         )
         .await

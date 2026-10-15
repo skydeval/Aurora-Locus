@@ -192,6 +192,14 @@ pub async fn submit_signin(
             }
         };
 
+    // A pushed request that asked for a fresh sign-in (`prompt=login`) has
+    // had one (#503).
+    if let Some(request_uri) = super::signup::request_uri_of(&return_to) {
+        if let Err(e) = super::request_store::clear_prompt(&ctx.account_db, &request_uri).await {
+            tracing::warn!(error = %e, "signin: request prompt not cleared");
+        }
+    }
+
     let cookie = browser_session::set_session_cookie(&session.id);
     // Fetch-driven single-page admin login: when the caller is JS
     // (`Accept: application/json`), set the session cookie and return 204 with NO

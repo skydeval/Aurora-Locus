@@ -27,8 +27,10 @@ pub mod par;
 pub mod params;
 pub mod request_store;
 pub mod response;
+pub mod revoke;
 pub mod scope;
 pub mod signin;
+pub mod signup;
 pub mod token;
 
 use axum::http::{header, StatusCode};
@@ -65,6 +67,11 @@ pub fn routes() -> Router<AppContext> {
             "/oauth/atproto/signin",
             get(signin::signin_page).post(signin::submit_signin),
         )
+        // Sign up during an authorization (`prompt=create`, #503).
+        .route(
+            "/oauth/atproto/signup",
+            get(signup::signup_page).post(signup::submit_signup),
+        )
         // whoami — resolves the current session (exercises the validation
         // extractor; reused by β.3's authorize/consent handlers).
         .route("/oauth/atproto/session", get(login::whoami))
@@ -82,6 +89,8 @@ pub fn routes() -> Router<AppContext> {
         )
         .route("/oauth/atproto/consent/deny", post(consent::deny))
         .route("/oauth/atproto/token", post(token::token))
+        // RFC 7009 token revocation (#503): a client ends its own grant.
+        .route("/oauth/atproto/revoke", post(revoke::revoke))
         .route("/oauth/atproto/par", post(par::par))
         .route(
             "/.well-known/oauth-authorization-server",
