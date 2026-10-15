@@ -42,13 +42,40 @@ pub fn detect_mime_type_from_data(data: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
 
-    // MP4: "ftyp" box at offset 4
+    // ISO base media: an "ftyp" box at offset 4. Brand "qt  " is QuickTime;
+    // every other brand is played as MP4.
     if data.len() >= 12 && data[4] == b'f' && data[5] == b't' && data[6] == b'y' && data[7] == b'p'
     {
+        if &data[8..12] == b"qt  " {
+            return Some("video/quicktime");
+        }
         return Some("video/mp4");
     }
 
+    // WebM: an EBML header (1A 45 DF A3) whose DocType is "webm".
+    if data[..4] == [0x1A, 0x45, 0xDF, 0xA3] {
+        let header = &data[..data.len().min(64)];
+        if header.windows(4).any(|w| w == b"webm") {
+            return Some("video/webm");
+        }
+    }
+
     None
+}
+
+/// The media type a blob is stored with: the type its bytes show, as the
+/// reference PDS takes it; else the declared type, unless it names no type
+/// (`*/*`, which Bluesky's video service sends, #513); else
+/// `application/octet-stream`.
+pub fn resolve_mime_type(declared: Option<&str>, data: &[u8]) -> String {
+    detect_mime_type_from_data(data)
+        .map(String::from)
+        .or_else(|| {
+            declared
+                .filter(|declared| !declared.contains('*'))
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string())
 }
 
 /// Validate that a blob's size is within the configured maximum.
@@ -100,6 +127,33 @@ mod tests {
             0, 0, 0, 0x20, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm',
         ];
         assert_eq!(detect_mime_type_from_data(mp4), Some("video/mp4"));
+    }
+
+    #[test]
+    fn detects_quicktime_and_webm() {
+        let mov: &[u8] = &[0, 0, 0, 0x14, b'f', b't', b'y', b'p', b'q', b't', b' ', b' '];
+        assert_eq!(detect_mime_type_from_data(mov), Some("video/quicktime"));
+        let mut webm = vec![0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x84];
+        webm.extend_from_slice(b"webm");
+        assert_eq!(detect_mime_type_from_data(&webm), Some("video/webm"));
+        // Matroska that is not WebM is not called WebM.
+        let mut mkv = vec![0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01, 0x42, 0x82, 0x88];
+        mkv.extend_from_slice(b"matroska");
+        assert_eq!(detect_mime_type_from_data(&mkv), None);
+    }
+
+    /// #513: the bytes decide; a wildcard declaration names nothing.
+    #[test]
+    fn the_stored_type_comes_from_the_bytes_first() {
+        let mp4: &[u8] = &[0, 0, 0, 0x20, b'f', b't', b'y', b'p', b'i', b's', b'o', b'm'];
+        assert_eq!(resolve_mime_type(Some("*/*"), mp4), "video/mp4");
+        assert_eq!(resolve_mime_type(Some("image/png"), mp4), "video/mp4");
+        assert_eq!(resolve_mime_type(None, mp4), "video/mp4");
+        let unknown = [0u8, 1, 2, 3, 4];
+        assert_eq!(resolve_mime_type(Some("video/webm"), &unknown), "video/webm");
+        assert_eq!(resolve_mime_type(Some("*/*"), &unknown), "application/octet-stream");
+        assert_eq!(resolve_mime_type(Some("video/*"), &unknown), "application/octet-stream");
+        assert_eq!(resolve_mime_type(None, &unknown), "application/octet-stream");
     }
 
     #[test]
