@@ -40,6 +40,9 @@ pub struct CreateAccountResponse {
 pub struct CreateSessionRequest {
     pub identifier: String, // handle or email
     pub password: String,
+    /// The emailed sign-in code, for an account with `emailAuthFactor` (#503).
+    #[serde(default, rename = "authFactorToken", skip_serializing_if = "Option::is_none")]
+    pub auth_factor_token: Option<String>,
 }
 
 /// Session response
@@ -95,6 +98,11 @@ pub struct SessionInfo {
     /// Why the account is not active; omitted when it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    /// Whether signing in with the password also needs an emailed code
+    /// (#503). Reported with the email, and hidden with it from OAuth clients
+    /// not granted the email.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email_auth_factor: Option<bool>,
 }
 
 /// Validated session from bearer token
@@ -171,6 +179,7 @@ mod session_info_tests {
             role: Some("superadmin".to_string()),
             active: true,
             status: None,
+            email_auth_factor: None,
         };
         let v = serde_json::to_value(&s).expect("serialize");
         assert_eq!(v["role"], serde_json::json!("superadmin"));
@@ -186,6 +195,7 @@ mod session_info_tests {
             role: None,
             active: true,
             status: None,
+            email_auth_factor: None,
         };
         let v = serde_json::to_value(&s).expect("serialize");
         assert!(
@@ -210,6 +220,7 @@ mod session_info_tests {
             role: None,
             active: false,
             status: Some("deactivated".to_string()),
+            email_auth_factor: None,
         };
         let v = serde_json::to_value(&s).expect("serialize");
         assert_eq!(v["active"], serde_json::json!(false));

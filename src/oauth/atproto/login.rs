@@ -150,10 +150,24 @@ pub async fn verify(
         .into_response())
 }
 
+/// The header a logout request carries its session's CSRF token in.
+pub const CSRF_HEADER: &str = "x-csrf-token";
+
 /// `POST /oauth/atproto/logout` — delete the current session and clear the
 /// cookie. Idempotent: succeeds whether or not a session was present.
+///
+/// A request that would end a live session must carry that session's CSRF
+/// token (as returned by login and `whoami`) in the `X-CSRF-Token` header
+/// (#503). Without it another site could sign the browser out by posting
+/// here; the cookie's `SameSite=Lax` was the only defence.
 pub async fn logout(State(ctx): State<AppContext>, headers: HeaderMap) -> Response {
     if let Some(id) = browser_session::read_session_cookie(&headers) {
+        if let Ok(Some(session)) = browser_session::get_valid_session(&ctx.account_db, &id).await {
+            let presented = headers.get(CSRF_HEADER).and_then(|v| v.to_str().ok());
+            if presented != Some(session.csrf_token.as_str()) {
+                return (StatusCode::FORBIDDEN, "CSRF token mismatch").into_response();
+            }
+        }
         let _ = browser_session::delete_session(&ctx.account_db, &id).await;
     }
     (
@@ -495,7 +509,8 @@ mod tests {
         let who = whoami(browser_session::BrowserSessionContext { session }).await;
         assert_eq!(who.0.did, did);
 
-        // logout deletes the row + clears the cookie.
+        // logout without the session's CSRF token is refused and ends nothing
+        // (#503).
         let mut headers = HeaderMap::new();
         headers.insert(
             header::COOKIE,
@@ -503,6 +518,15 @@ mod tests {
                 .parse()
                 .unwrap(),
         );
+        let refused = logout(State(ctx.clone()), headers.clone()).await.into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(browser_session::get_valid_session(&ctx.account_db, &session_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // With it, logout deletes the row + clears the cookie.
+        headers.insert(CSRF_HEADER, who.0.csrf_token.parse().unwrap());
         let lresp = logout(State(ctx.clone()), headers).await.into_response();
         assert_eq!(lresp.status(), StatusCode::NO_CONTENT);
         assert!(browser_session::get_valid_session(&ctx.account_db, &session_id)

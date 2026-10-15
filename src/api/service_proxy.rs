@@ -48,12 +48,19 @@ const FORWARDED_REQUEST_HEADERS: [&str; 4] = [
     "x-bsky-topics",
 ];
 
-/// Response headers passed back to the client.
-const FORWARDED_RESPONSE_HEADERS: [&str; 4] = [
+/// Response headers passed back to the client. The rate-limit headers (#503)
+/// tell a client when an upstream that refused it with 429 will take requests
+/// again; without them it can only guess.
+const FORWARDED_RESPONSE_HEADERS: [&str; 9] = [
     "content-type",
     "atproto-content-labelers",
     "atproto-repo-rev",
     "content-language",
+    "retry-after",
+    "ratelimit-limit",
+    "ratelimit-remaining",
+    "ratelimit-reset",
+    "ratelimit-policy",
 ];
 
 /// Namespaces never forwarded: they act on the account itself, so an

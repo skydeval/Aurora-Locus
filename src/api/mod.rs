@@ -16,6 +16,7 @@ pub mod did_web;
 pub mod federation;
 pub mod account_emit;
 pub mod account_state;
+pub mod email_factor;
 pub mod firehose;
 pub mod firehose_encoder;
 pub mod health;

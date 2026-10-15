@@ -310,11 +310,42 @@ async fn resolve_request(
                     "The request_uri is unknown or has already been used.",
                 )
             })?;
-        if row.is_expired(Utc::now()) {
+        // A request_uri presented with another client's client_id is not
+        // this client's to use, and its stored redirect is not sent to.
+        if raw
+            .client_id
+            .as_deref()
+            .is_some_and(|client_id| client_id != row.client_id)
+        {
             return Err(error_page(
                 StatusCode::BAD_REQUEST,
-                "Expired request_uri",
-                "The pushed authorization request has expired; please restart.",
+                "Invalid request_uri",
+                "The request_uri does not belong to this client.",
+            ));
+        }
+        // A request that can no longer go on returns to the client with an
+        // OAuth error it can act on (#503), instead of stopping on a page of
+        // ours: the redirect was registered and checked when it was pushed.
+        let ended = if row.is_denied() {
+            Some(("access_denied", "The sign-in was cancelled"))
+        } else if row.code_is_used() {
+            Some(("invalid_request", "This sign-in request has already been completed"))
+        } else if row.is_expired(Utc::now()) {
+            Some(("invalid_request", "The sign-in request expired; please start again"))
+        } else {
+            None
+        };
+        if let Some((error, description)) = ended {
+            let mut pairs: Vec<(&str, &str)> =
+                vec![("error", error), ("error_description", description)];
+            if let Some(state) = row.state.as_deref() {
+                pairs.push(("state", state));
+            }
+            return Err(respond_to_client(
+                &row.redirect_uri,
+                row.response_mode(),
+                &ctx.service_url(),
+                &pairs,
             ));
         }
         let response_mode = row.response_mode();
@@ -1057,4 +1088,40 @@ mod tests {
             "https://pds.example/oauth/atproto/authorize"
         );
     }
+
+    // ---- ended requests return to the client (chainlink #503) ----
+
+    #[tokio::test]
+    async fn an_expired_pushed_request_returns_to_the_client() {
+        let redirect_uri = "https://app.example.com/cb";
+        let ctx = ctx().await;
+        two_accounts(&ctx).await;
+        let client_id = "https://app.example.com/cm.json";
+        let (request_id, request_uri) = push(&ctx, client_id, redirect_uri, "bob.localhost").await;
+        sqlx::query("UPDATE atproto_authorization_request SET expires_at = $1 WHERE request_id = $2")
+            .bind((Utc::now() - Duration::seconds(5)).to_rfc3339())
+            .bind(&request_id)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let (raw_query, query) = par_query(client_id, &request_uri);
+        let resp = authorize(State(ctx.clone()), HeaderMap::new(), raw_query, query).await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = location(&resp);
+        assert!(loc.starts_with("https://app.example.com/cb?"), "{loc}");
+        assert!(loc.contains("error=invalid_request") && loc.contains("state=st") && loc.contains("iss="), "{loc}");
+    }
+
+    #[tokio::test]
+    async fn another_clients_request_uri_is_refused_on_our_page() {
+        let redirect_uri = "https://app.example.com/cb";
+        let ctx = ctx().await;
+        two_accounts(&ctx).await;
+        let (_, request_uri) = push(&ctx, "https://app.example.com/cm.json", redirect_uri, "bob.localhost").await;
+        let (raw_query, query) = par_query("https://evil.example.com/cm.json", &request_uri);
+        let resp = authorize(State(ctx.clone()), HeaderMap::new(), raw_query, query).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.headers().get(header::LOCATION).is_none());
+    }
 }
+
