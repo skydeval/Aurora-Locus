@@ -60,9 +60,133 @@ pub struct ClientMetadata {
 impl ClientMetadata {
     /// True iff `requested` is an exact member of the registered redirect URIs.
     /// atproto OAuth requires exact-match (no prefix/wildcard) redirect URIs.
+    ///
+    /// A loopback development client (#503) is the exception RFC 8252 §7.3
+    /// makes: its redirect URIs are on the loopback interface, where the port
+    /// is chosen when the app starts, so the port is not compared.
     pub fn allows_redirect_uri(&self, requested: &str) -> bool {
-        self.redirect_uris.iter().any(|u| u == requested)
+        if self.redirect_uris.iter().any(|u| u == requested) {
+            return true;
+        }
+        is_loopback_client_id(&self.client_id)
+            && self
+                .redirect_uris
+                .iter()
+                .any(|registered| same_loopback_redirect(registered, requested))
     }
+}
+
+impl ClientMetadata {
+    /// True iff every token of the space-separated `requested` scope is one
+    /// the client declares in its metadata `scope` (atproto OAuth: a client is
+    /// never granted more than it declares; #503). A document without a
+    /// `scope` declares nothing to check against and allows the request.
+    pub fn allows_scope(&self, requested: &str) -> bool {
+        let Some(declared) = self.scope.as_deref() else {
+            return true;
+        };
+        // Compare in the provider's canonical spelling, so a granular scope
+        // written with its parameters in another order or encoding still
+        // matches. `requested` is already canonical (it was parsed on the way
+        // in); the declaration is parsed the same way, and kept as written if
+        // it does not parse.
+        let declared = super::scope::AtprotoScope::parse_set(declared)
+            .map(|set| set.to_canonical_string())
+            .unwrap_or_else(|_| declared.to_string());
+        let declared: std::collections::HashSet<&str> = declared.split_whitespace().collect();
+        requested
+            .split_whitespace()
+            .all(|token| declared.contains(token))
+    }
+}
+
+/// Whether `client_id` names a loopback development client: `http://localhost`
+/// with no port and an empty or `/` path (atproto OAuth "localhost client
+/// development").
+pub fn is_loopback_client_id(client_id: &str) -> bool {
+    Url::parse(client_id).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url.host_str() == Some("localhost")
+            && url.port().is_none()
+            && matches!(url.path(), "" | "/")
+            && url.fragment().is_none()
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
+/// A loopback redirect URI: `http`, host `127.0.0.1` or `[::1]` (atproto
+/// forbids `localhost` here), no fragment.
+fn is_loopback_redirect(url: &Url) -> bool {
+    url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1") | Some("[::1]"))
+        && url.fragment().is_none()
+}
+
+/// Two loopback redirect URIs that differ at most in port.
+fn same_loopback_redirect(registered: &str, requested: &str) -> bool {
+    match (Url::parse(registered), Url::parse(requested)) {
+        (Ok(a), Ok(b)) => {
+            is_loopback_redirect(&a)
+                && is_loopback_redirect(&b)
+                && a.host_str() == b.host_str()
+                && a.path() == b.path()
+                && a.query() == b.query()
+        }
+        _ => false,
+    }
+}
+
+/// The metadata of a loopback development client, built from its `client_id`
+/// instead of fetched (#503). `redirect_uri` (repeatable) and `scope` may be
+/// given as query parameters; nothing else may. Without `redirect_uri` the
+/// client may redirect to `http://127.0.0.1/` or `http://[::1]/` (any port);
+/// without `scope` it gets `atproto`. Such a client is public and DPoP-bound,
+/// like every client of this provider.
+fn loopback_client_metadata(client_id: &str) -> Result<ClientMetadata, ClientMetadataError> {
+    let url = Url::parse(client_id)
+        .map_err(|e| ClientMetadataError::InvalidUrl(format!("{client_id}: {e}")))?;
+    let mut redirect_uris = Vec::new();
+    let mut scope = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "redirect_uri" => {
+                let redirect = Url::parse(&value).map_err(|e| {
+                    ClientMetadataError::InvalidUrl(format!("redirect_uri {value}: {e}"))
+                })?;
+                if !is_loopback_redirect(&redirect) {
+                    return Err(ClientMetadataError::InvalidUrl(format!(
+                        "a loopback client's redirect_uri must be http://127.0.0.1 or http://[::1]: {value}"
+                    )));
+                }
+                redirect_uris.push(value.into_owned());
+            }
+            "scope" if scope.is_none() => scope = Some(value.into_owned()),
+            other => {
+                return Err(ClientMetadataError::InvalidUrl(format!(
+                    "a loopback client_id may carry only redirect_uri and scope: {other}"
+                )))
+            }
+        }
+    }
+    if redirect_uris.is_empty() {
+        redirect_uris = vec!["http://127.0.0.1/".to_string(), "http://[::1]/".to_string()];
+    }
+    Ok(ClientMetadata {
+        client_id: client_id.to_string(),
+        redirect_uris,
+        client_name: Some("Local development app (http://localhost)".to_string()),
+        scope: Some(scope.unwrap_or_else(|| "atproto".to_string())),
+        response_types: Some(vec!["code".to_string()]),
+        grant_types: Some(vec![
+            "authorization_code".to_string(),
+            "refresh_token".to_string(),
+        ]),
+        token_endpoint_auth_method: Some("none".to_string()),
+        dpop_bound_access_tokens: Some(true),
+        jwks_uri: None,
+        application_type: Some("native".to_string()),
+    })
 }
 
 /// Failure modes of a client-metadata fetch. Distinct variants so the
@@ -124,6 +248,10 @@ impl ClientMetadataFetcher {
     ) -> Result<ClientMetadata, ClientMetadataError> {
         if let Some(hit) = self.cache.get(client_id).await {
             return Ok(hit);
+        }
+        // A loopback development client has no document to fetch (#503).
+        if is_loopback_client_id(client_id) {
+            return loopback_client_metadata(client_id);
         }
 
         let url = Url::parse(client_id)
@@ -311,3 +439,94 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+
+#[cfg(test)]
+mod loopback_and_scope_tests {
+    //! #503: loopback development clients and declared scopes.
+    use super::*;
+
+    #[test]
+    fn only_bare_http_localhost_is_a_loopback_client() {
+        for id in [
+            "http://localhost",
+            "http://localhost/",
+            "http://localhost?scope=atproto",
+            "http://localhost/?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Fcb",
+        ] {
+            assert!(is_loopback_client_id(id), "{id}");
+        }
+        for id in [
+            "https://localhost",
+            "http://localhost:8080",
+            "http://localhost/client.json",
+            "http://127.0.0.1",
+            "http://localhost#x",
+            "http://user@localhost",
+            "https://app.example.com/cm.json",
+        ] {
+            assert!(!is_loopback_client_id(id), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loopback_client_needs_no_document() {
+        let fetcher = ClientMetadataFetcher::new();
+        let id = "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%3A8081%2Fauth%2Fweb%2Fcallback&scope=atproto%20transition%3Ageneric";
+        let meta = fetcher.fetch(id).await.expect("synthesised");
+        assert_eq!(meta.client_id, id);
+        assert_eq!(meta.redirect_uris, vec!["http://127.0.0.1:8081/auth/web/callback"]);
+        assert_eq!(meta.scope.as_deref(), Some("atproto transition:generic"));
+        assert_eq!(meta.token_endpoint_auth_method.as_deref(), Some("none"));
+        assert_eq!(meta.dpop_bound_access_tokens, Some(true));
+        assert!(meta.allows_redirect_uri("http://127.0.0.1:8081/auth/web/callback"));
+        // The loopback port is chosen at start-up, so it is not compared.
+        assert!(meta.allows_redirect_uri("http://127.0.0.1:9999/auth/web/callback"));
+        assert!(!meta.allows_redirect_uri("http://127.0.0.1:8081/elsewhere"));
+        assert!(!meta.allows_redirect_uri("http://[::1]:8081/auth/web/callback"));
+        assert!(!meta.allows_redirect_uri("https://evil.example.com/auth/web/callback"));
+    }
+
+    #[tokio::test]
+    async fn a_bare_loopback_client_gets_the_defaults() {
+        let meta = ClientMetadataFetcher::new().fetch("http://localhost").await.unwrap();
+        assert_eq!(meta.scope.as_deref(), Some("atproto"));
+        assert!(meta.allows_redirect_uri("http://127.0.0.1:4321/"));
+        assert!(meta.allows_redirect_uri("http://[::1]:4321/"));
+        assert!(!meta.allows_redirect_uri("http://localhost:4321/"));
+    }
+
+    #[tokio::test]
+    async fn a_loopback_client_id_with_bad_parts_is_refused() {
+        let fetcher = ClientMetadataFetcher::new();
+        for id in [
+            "http://localhost?redirect_uri=http%3A%2F%2Flocalhost%3A8081%2Fcb",
+            "http://localhost?redirect_uri=https%3A%2F%2Fevil.example.com%2Fcb",
+            "http://localhost?client_name=Mine",
+        ] {
+            assert!(fetcher.fetch(id).await.is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn requested_scope_must_be_declared() {
+        let mut meta = ClientMetadata {
+            client_id: "https://app.example.com/cm.json".to_string(),
+            redirect_uris: vec![],
+            client_name: None,
+            scope: Some("atproto transition:generic".to_string()),
+            response_types: None,
+            grant_types: None,
+            token_endpoint_auth_method: None,
+            dpop_bound_access_tokens: None,
+            jwks_uri: None,
+            application_type: None,
+        };
+        assert!(meta.allows_scope("atproto"));
+        assert!(meta.allows_scope("atproto transition:generic"));
+        assert!(!meta.allows_scope("atproto transition:chat.bsky"));
+        meta.scope = None;
+        assert!(meta.allows_scope("atproto transition:chat.bsky"), "nothing declared, nothing to check");
+    }
+}
+

@@ -165,34 +165,15 @@ async fn create_account(
         None
     };
 
-    // Create the account. The invite code (#464) is checked and redeemed by
-    // AccountManager::create_account alone: checked before anything is
-    // written, redeemed in the account-insert transaction against the new DID.
-    // Arc 13 §6.3.3 / Step 2.2: pass through the optional `recovery_key` input
-    // so it ends up first in the genesis op's rotation_keys per §6.3.3.
-    tracing::debug!("create_account: Creating account in database");
-    let email = req.email.clone();
-    let account = ctx
-        .account_manager
-        .create_account(
-            req.handle.clone(),
-            req.email,
-            req.password,
-            req.invite_code,
-            req.recovery_key,
-        )
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "create_account: Failed to create account in database: {}",
-                e
-            );
-            e
-        })?;
-    tracing::info!(
-        "create_account: Account created successfully, DID: {}",
-        account.did
-    );
+    let account = provision_account(
+        &ctx,
+        req.handle.clone(),
+        req.email,
+        req.password,
+        req.invite_code,
+        req.recovery_key,
+    )
+    .await?;
 
     // Clear the reserved keypair now that the account is created
     if let Some(ref signing_key) = reserved_signing_key {
@@ -205,6 +186,62 @@ async fn create_account(
             // Don't fail account creation for cleanup failure
         }
     }
+
+    // Create initial session
+    tracing::debug!("create_account: Creating initial session");
+    let session = ctx
+        .account_manager
+        .create_session(&account.did, None)
+        .await
+        .map_err(|e| {
+            tracing::error!("create_account: Failed to create session: {}", e);
+            e
+        })?;
+    tracing::info!("create_account: Session created successfully");
+
+    Ok(Json(CreateAccountResponse {
+        did: account.did,
+        handle: account.handle.unwrap_or_default(),
+        access_jwt: session.access_token,
+        refresh_jwt: session.refresh_token,
+    }))
+}
+
+/// Create an account and everything it starts with (#503): the account rows
+/// (checking and redeeming the invite code), the repository, the firehose
+/// announcements, the deployment's default audience, and the verification
+/// email. Shared by `com.atproto.server.createAccount` and the OAuth sign-up
+/// page, so an account is created the same way whichever way it is asked for.
+/// The caller decides how the new account signs in.
+pub(crate) async fn provision_account(
+    ctx: &AppContext,
+    handle: String,
+    email: Option<String>,
+    password: String,
+    invite_code: Option<String>,
+    recovery_key: Option<String>,
+) -> PdsResult<crate::db::account::ActorAccount> {
+    // Create the account. The invite code (#464) is checked and redeemed by
+    // AccountManager::create_account alone: checked before anything is
+    // written, redeemed in the account-insert transaction against the new DID.
+    // Arc 13 §6.3.3 / Step 2.2: pass through the optional `recovery_key` input
+    // so it ends up first in the genesis op's rotation_keys per §6.3.3.
+    tracing::debug!("create_account: Creating account in database");
+    let account = ctx
+        .account_manager
+        .create_account(handle, email.clone(), password, invite_code, recovery_key)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                "create_account: Failed to create account in database: {}",
+                e
+            );
+            e
+        })?;
+    tracing::info!(
+        "create_account: Account created successfully, DID: {}",
+        account.did
+    );
 
     // Initialize repository for the new account
     tracing::debug!(
@@ -229,7 +266,7 @@ async fn create_account(
     // consumers will resync on next connection).
     if let Some(ref handle) = account.handle {
         if let Err(e) = crate::api::account_emit::create_account_emit_sequence(
-            &ctx,
+            ctx,
             &account.did,
             handle,
         )
@@ -250,7 +287,7 @@ async fn create_account(
     // (the prior behavior). Best-effort: a failure is logged but never fails
     // account creation — the account and its repo already exist.
     if let Some(mode) = crate::kryphocron_policy::default_audience_mode(&ctx.account_db).await {
-        match crate::api::kryphocron_endpoints::author_default_audience(&ctx, &account.did, &mode)
+        match crate::api::kryphocron_endpoints::author_default_audience(ctx, &account.did, &mode)
             .await
         {
             Ok(uri) => tracing::info!(
@@ -300,24 +337,7 @@ async fn create_account(
         }
     }
 
-    // Create initial session
-    tracing::debug!("create_account: Creating initial session");
-    let session = ctx
-        .account_manager
-        .create_session(&account.did, None)
-        .await
-        .map_err(|e| {
-            tracing::error!("create_account: Failed to create session: {}", e);
-            e
-        })?;
-    tracing::info!("create_account: Session created successfully");
-
-    Ok(Json(CreateAccountResponse {
-        did: account.did,
-        handle: account.handle.unwrap_or_default(),
-        access_jwt: session.access_token,
-        refresh_jwt: session.refresh_token,
-    }))
+    Ok(account)
 }
 
 /// Create session (login) endpoint

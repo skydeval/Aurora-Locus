@@ -56,6 +56,8 @@ struct Resolved {
     response_mode: ResponseMode,
     /// The account the client asked for (`login_hint`), as sent (#502).
     login_hint: Option<String>,
+    /// The client's `prompt`, not yet acted on (#503).
+    prompt: Option<String>,
     /// The account a PAR row is already bound to, if any. A request is bound
     /// once and never rebound (#502).
     bound_did: Option<String>,
@@ -91,6 +93,15 @@ async fn authorize_inner(
             "redirect_uri not registered for this client.",
         ));
     }
+    // 3b. Only scopes the client declares in its metadata (#503). A pushed
+    //     request was checked at the push; an inline one is checked here.
+    if !metadata.allows_scope(&resolved.scope) {
+        return Err(error_page(
+            StatusCode::BAD_REQUEST,
+            "Invalid scope",
+            "The app asked for permissions it does not declare.",
+        ));
+    }
 
     // 4. The account the client asked for, when it named one hosted here
     //    (#502). An unknown hint is ignored, as if none had been sent.
@@ -98,12 +109,36 @@ async fn authorize_inner(
         Some(hint) => account_choice::resolve_hint(ctx, hint).await,
         None => None,
     };
-    let return_to = authorize_url(ctx, raw_query.as_deref());
+    // The place to come back to. An inline `prompt` is dropped from it, so
+    // coming back after acting on the prompt does not ask again; a pushed
+    // request's prompt is cleared on its row by the page that acts on it.
+    let return_to = without_prompt(&authorize_url(ctx, raw_query.as_deref()));
+
+    // 4b. `prompt` (#503): sign up, or sign in afresh, before anything else.
+    match resolved.prompt.as_deref() {
+        Some("create") => {
+            give_time_to_act(ctx, &resolved).await?;
+            let suggested = match hinted_did {
+                None => resolved.login_hint.as_deref(),
+                Some(_) => None,
+            };
+            return Ok(redirect(&super::signup::signup_url(ctx, &return_to, suggested)));
+        }
+        Some("login") | Some("select_account") => {
+            give_time_to_act(ctx, &resolved).await?;
+            let prefill = hinted_did.as_ref().and(resolved.login_hint.as_deref());
+            return Ok(redirect(&account_choice::signin_url(ctx, &return_to, prefill)));
+        }
+        _ => {}
+    }
+    let prompt_none = resolved.prompt.as_deref() == Some("none");
 
     // 5. Require an authenticated browser session. Absent → the sign-in page,
     //    prefilled with the requested account, returning here afterwards.
     let session = match resolve_session(ctx, headers).await {
         Some(s) => s,
+        // `prompt=none`: no page may be shown, and signing in would be one.
+        None if prompt_none => return Ok(prompt_none_error(ctx, &resolved, "login_required")),
         None => {
             if let Some(id) = &resolved.existing_request_id {
                 let window = (Utc::now() + Duration::seconds(CONSENT_WINDOW_SECS)).to_rfc3339();
@@ -125,6 +160,18 @@ async fn authorize_inner(
     //    the resource owner chooses to sign in as the requested account or to
     //    cancel.
     let wanted = resolved.bound_did.clone().or(hinted_did);
+    if prompt_none {
+        // Another account would need choosing, or consent would need asking:
+        // both are pages. Only the first-party admin client, which skips
+        // consent, can complete without one.
+        let other_account = wanted.as_ref().is_some_and(|did| *did != session.did);
+        if other_account {
+            return Ok(prompt_none_error(ctx, &resolved, "login_required"));
+        }
+        if !is_first_party_admin(ctx, &resolved.client_id, &session.did).await {
+            return Ok(prompt_none_error(ctx, &resolved, "consent_required"));
+        }
+    }
     if let Some(wanted) = wanted.filter(|did| *did != session.did) {
         let request_id = match &resolved.existing_request_id {
             Some(id) => {
@@ -242,6 +289,7 @@ fn new_row(
         expires_at: expires_at.to_string(),
         response_mode: Some(resolved.response_mode.as_str().to_string()),
         login_hint: resolved.login_hint.clone(),
+        prompt: None,
     }
 }
 
@@ -274,6 +322,7 @@ async fn resolve_request(
             existing_request_id: Some(row.request_id),
             response_mode,
             login_hint: row.login_hint,
+            prompt: row.prompt,
             bound_did: row.did,
             client_id: row.client_id,
             redirect_uri: row.redirect_uri,
@@ -294,6 +343,7 @@ async fn resolve_request(
             code_challenge: validated.code_challenge,
             response_mode: validated.response_mode,
             login_hint: validated.login_hint,
+            prompt: validated.prompt,
             bound_did: None,
         })
     }
@@ -321,6 +371,52 @@ fn authorize_url(ctx: &AppContext, raw_query: Option<&str>) -> String {
         }
         _ => format!("{}/oauth/atproto/authorize", ctx.service_url()),
     }
+}
+
+/// `prompt=none` could not be honoured: answer the client with `error`
+/// (`login_required` or `consent_required`), `state` and `iss`, showing no
+/// page (#503).
+fn prompt_none_error(ctx: &AppContext, resolved: &Resolved, error: &str) -> Response {
+    let mut pairs: Vec<(&str, &str)> = vec![("error", error)];
+    if let Some(state) = resolved.state.as_deref() {
+        pairs.push(("state", state));
+    }
+    respond_to_client(
+        &resolved.redirect_uri,
+        resolved.response_mode,
+        &ctx.service_url(),
+        &pairs,
+    )
+}
+
+/// Give a pushed request the consent window while the resource owner signs
+/// up or signs in (#502, #503).
+async fn give_time_to_act(ctx: &AppContext, resolved: &Resolved) -> Result<(), Response> {
+    if let Some(id) = &resolved.existing_request_id {
+        let window = (Utc::now() + Duration::seconds(CONSENT_WINDOW_SECS)).to_rfc3339();
+        request_store::extend_unbound(&ctx.account_db, id, &window)
+            .await
+            .map_err(internal_error_page)?;
+    }
+    Ok(())
+}
+
+/// `url` without its `prompt` query parameter.
+fn without_prompt(url: &str) -> String {
+    let Ok(mut parsed) = url::Url::parse(url) else {
+        return url.to_string();
+    };
+    let kept: Vec<(String, String)> = parsed
+        .query_pairs()
+        .filter(|(key, _)| key != "prompt")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if kept.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed.query_pairs_mut().clear().extend_pairs(kept);
+    }
+    parsed.to_string()
 }
 
 /// A 302 to `location`.
@@ -487,6 +583,7 @@ mod tests {
             request_uri: None,
             response_mode: None,
             login_hint: None,
+            prompt: None,
         }
     }
 
@@ -753,6 +850,7 @@ mod tests {
                 expires_at: (now + Duration::seconds(60)).to_rfc3339(),
                 response_mode: None,
                 login_hint: Some(hint.to_string()),
+                prompt: None,
             },
         )
         .await
@@ -875,5 +973,88 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.did.as_deref(), Some(bob.as_str()));
+    }
+
+    // ---- prompt (chainlink #503) ----
+
+    async fn with_prompt(ctx: &AppContext, client_id: &str, redirect_uri: &str, prompt: &str, headers: HeaderMap) -> Response {
+        let mut raw = query(client_id, redirect_uri);
+        raw.prompt = Some(prompt.to_string());
+        let raw_query = format!(
+            "client_id={}&response_type=code&scope=atproto&redirect_uri={}&state=st&code_challenge=chal&code_challenge_method=S256&prompt={prompt}",
+            urlencoding(client_id),
+            urlencoding(redirect_uri)
+        );
+        authorize(State(ctx.clone()), headers, RawQuery(Some(raw_query)), Query(raw)).await
+    }
+
+    fn location(resp: &Response) -> String {
+        resp.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn prompt_create_goes_to_sign_up_without_the_prompt() {
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx().await;
+        let resp = with_prompt(&ctx, &client_id, redirect_uri, "create", HeaderMap::new()).await;
+        server.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        let loc = location(&resp);
+        assert!(loc.contains("/oauth/atproto/signup?return_to="), "{loc}");
+        assert!(!loc.contains("prompt%3Dcreate"), "coming back must not ask again: {loc}");
+    }
+
+    #[tokio::test]
+    async fn prompt_login_signs_in_afresh_even_with_a_session() {
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx().await;
+        let (alice, _) = two_accounts(&ctx).await;
+        let session = browser_session::create_session(&ctx.account_db, &alice, None, None)
+            .await
+            .unwrap();
+        let resp = with_prompt(&ctx, &client_id, redirect_uri, "login", session_cookie(&session.id)).await;
+        server.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert!(location(&resp).contains("/oauth/atproto/signin?return_to="));
+    }
+
+    #[tokio::test]
+    async fn prompt_none_without_a_session_is_login_required() {
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx().await;
+        let resp = with_prompt(&ctx, &client_id, redirect_uri, "none", HeaderMap::new()).await;
+        server.await.unwrap();
+        let loc = location(&resp);
+        assert!(loc.starts_with("https://app.example.com/cb?"), "{loc}");
+        assert!(loc.contains("error=login_required") && loc.contains("state=st"), "{loc}");
+    }
+
+    #[tokio::test]
+    async fn prompt_none_with_a_session_is_consent_required() {
+        let redirect_uri = "https://app.example.com/cb";
+        let (client_id, server) = spawn_metadata(redirect_uri).await;
+        let ctx = ctx().await;
+        let (alice, _) = two_accounts(&ctx).await;
+        let session = browser_session::create_session(&ctx.account_db, &alice, None, None)
+            .await
+            .unwrap();
+        let resp = with_prompt(&ctx, &client_id, redirect_uri, "none", session_cookie(&session.id)).await;
+        server.await.unwrap();
+        assert!(location(&resp).contains("error=consent_required"));
+    }
+
+    #[test]
+    fn the_prompt_is_dropped_from_the_return_url() {
+        assert_eq!(
+            without_prompt("https://pds.example/oauth/atproto/authorize?client_id=a&prompt=create&state=s"),
+            "https://pds.example/oauth/atproto/authorize?client_id=a&state=s"
+        );
+        assert_eq!(
+            without_prompt("https://pds.example/oauth/atproto/authorize?prompt=login"),
+            "https://pds.example/oauth/atproto/authorize"
+        );
     }
 }

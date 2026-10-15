@@ -43,11 +43,13 @@ pub struct AtprotoAuthorizationRequest {
     pub response_mode: Option<String>,
     /// The `login_hint` the client sent (a handle or DID), if any (#502).
     pub login_hint: Option<String>,
+    /// The `prompt` the client sent, until it has been acted on (#503).
+    pub prompt: Option<String>,
 }
 
 const COLUMNS: &str = "request_id, request_uri, client_id, redirect_uri, scope, state, \
      code_challenge, code_challenge_method, did, code_hash, code_used_at, denied_at, \
-     created_at, expires_at, response_mode, login_hint";
+     created_at, expires_at, response_mode, login_hint, prompt";
 
 impl AtprotoAuthorizationRequest {
     /// True iff `now` is at or past `expires_at`. A malformed timestamp is
@@ -83,9 +85,9 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
         INSERT INTO atproto_authorization_request (
             request_id, request_uri, client_id, redirect_uri, scope, state,
             code_challenge, code_challenge_method, did, code_hash, code_used_at,
-            denied_at, created_at, expires_at, response_mode, login_hint
+            denied_at, created_at, expires_at, response_mode, login_hint, prompt
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         "#,
     )
     .bind(&req.request_id)
@@ -104,6 +106,7 @@ pub async fn insert(db: &AnyPool, req: &AtprotoAuthorizationRequest) -> PdsResul
     .bind(&req.expires_at)
     .bind(&req.response_mode)
     .bind(&req.login_hint)
+    .bind(&req.prompt)
     .execute(db)
     .await
     .map_err(PdsError::Database)?;
@@ -213,6 +216,18 @@ pub async fn extend_unbound(db: &AnyPool, request_id: &str, expires_at: &str) ->
     Ok(())
 }
 
+/// Mark a pushed request's `prompt` as acted on (#503): after the sign-up or
+/// fresh sign-in it asked for, returning to the authorize URL must not ask
+/// again.
+pub async fn clear_prompt(db: &AnyPool, request_uri: &str) -> PdsResult<()> {
+    sqlx::query("UPDATE atproto_authorization_request SET prompt = NULL WHERE request_uri = $1")
+        .bind(request_uri)
+        .execute(db)
+        .await
+        .map_err(PdsError::Database)?;
+    Ok(())
+}
+
 /// Record the minted authorization code's hash (consent/approve).
 pub async fn set_code_hash(db: &AnyPool, request_id: &str, code_hash: &str) -> PdsResult<()> {
     sqlx::query("UPDATE atproto_authorization_request SET code_hash = $1 WHERE request_id = $2")
@@ -282,6 +297,7 @@ mod tests {
             expires_at: (now + chrono::Duration::minutes(10)).to_rfc3339(),
             response_mode: None,
             login_hint: None,
+            prompt: None,
         }
     }
 

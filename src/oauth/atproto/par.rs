@@ -77,6 +77,15 @@ async fn par_inner(
             "redirect_uri not registered for this client",
         ));
     }
+    // 4b. Only scopes the client declares in its metadata (#503).
+    let requested_scope = validated.scope.to_canonical_string();
+    if !metadata.allows_scope(&requested_scope) {
+        return Err(oauth_error_json(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "the requested scope is not declared in the client's metadata",
+        ));
+    }
 
     // 5. Persist the request with a fresh opaque request_uri and NO did yet
     //    (bound at the authorize step once the holder authenticates).
@@ -99,6 +108,7 @@ async fn par_inner(
         expires_at: (now + Duration::seconds(PAR_TTL_SECS)).to_rfc3339(),
         response_mode: Some(validated.response_mode.as_str().to_string()),
         login_hint: validated.login_hint.clone(),
+        prompt: validated.prompt.clone(),
     };
     request_store::insert(&ctx.account_db, &req)
         .await
@@ -151,6 +161,7 @@ mod tests {
             request_uri: None,
             response_mode: None,
             login_hint: None,
+            prompt: None,
         }
     }
 
