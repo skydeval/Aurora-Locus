@@ -2,7 +2,7 @@
 use crate::{
     api::middleware::{
         atproto_oauth_gate, check_account_moderation, federation_enabled_gate,
-        jwt_deprecation_headers, namespace_scope_check,
+        jwt_deprecation_headers, namespace_scope_check, www_authenticate_on_unauthorized,
     },
     context::AppContext,
     error::{PdsError, PdsResult},
@@ -207,6 +207,10 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         // the per-request layers so the headers reach the client
         // verbatim.
         .layer(middleware::from_fn_with_state(ctx, jwt_deprecation_headers))
+        // `WWW-Authenticate` on 401s (#503, #486): outside every layer that
+        // can answer 401 (the OAuth gate, moderation, the handlers), so it
+        // sees all of them.
+        .layer(middleware::from_fn(www_authenticate_on_unauthorized))
         .layer(cors)
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())

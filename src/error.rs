@@ -173,6 +173,17 @@ pub enum PdsError {
     #[error("Account is deactivated: {0}")]
     AccountDeactivated(String),
 
+    /// The account signs in with an emailed code as well as its password, and
+    /// none was given; one has just been sent (#503). HTTP 401
+    /// `AuthFactorTokenRequired`, the reference PDS's name.
+    #[error("A sign-in code has been sent to your email address")]
+    AuthFactorTokenRequired,
+
+    /// The emailed sign-in code given is not the account's current one: wrong,
+    /// expired, or already used (#503). HTTP 401 `InvalidToken`.
+    #[error("The sign-in code is invalid or has expired")]
+    InvalidAuthFactorToken,
+
     /// Arc 14 §7.3.5 — sync-namespace handler called against a DID
     /// with no actor row. Distinct from the generic `NotFound` so
     /// the wire-emitted `error` name is `"RepoNotFound"` per spec.
@@ -906,6 +917,16 @@ impl IntoResponse for PdsError {
             PdsError::AccountDeactivated(_) => (
                 StatusCode::UNAUTHORIZED,
                 "AccountDeactivated",
+                self.to_string(),
+            ),
+            PdsError::AuthFactorTokenRequired => (
+                StatusCode::UNAUTHORIZED,
+                "AuthFactorTokenRequired",
+                self.to_string(),
+            ),
+            PdsError::InvalidAuthFactorToken => (
+                StatusCode::UNAUTHORIZED,
+                "InvalidToken",
                 self.to_string(),
             ),
             PdsError::DidTombstoned(_) => (

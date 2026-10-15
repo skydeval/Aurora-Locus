@@ -1741,6 +1741,74 @@ impl AccountManager {
         Ok(token)
     }
 
+    /// Whether signing in with the account password also needs an emailed
+    /// code (`emailAuthFactor`; #503).
+    pub async fn email_auth_factor(&self, did: &str) -> PdsResult<bool> {
+        let row = sqlx::query("SELECT email_auth_factor FROM account WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        match row {
+            Some(row) => Ok(crate::db::read_bool(&row, "email_auth_factor")?),
+            None => Ok(false),
+        }
+    }
+
+    /// Turn the emailed sign-in code on or off for an account (#503).
+    pub async fn set_email_auth_factor(&self, did: &str, enabled: bool) -> PdsResult<()> {
+        sqlx::query("UPDATE account SET email_auth_factor = $1 WHERE did = $2")
+            .bind(enabled)
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Store a one-time sign-in code for `did`, valid for `ttl` (#503). Codes
+    /// issued earlier and not used are withdrawn, so only the newest works.
+    pub async fn issue_sign_in_code(&self, did: &str, code: &str, ttl: Duration) -> PdsResult<()> {
+        let now = Utc::now();
+        sqlx::query("UPDATE email_token SET used = true WHERE did = $1 AND purpose = 'sign_in_code'")
+            .bind(did)
+            .execute(&self.db)
+            .await
+            .map_err(PdsError::Database)?;
+        sqlx::query(
+            "INSERT INTO email_token (token, did, purpose, created_at, expires_at, used)
+             VALUES ($1, $2, 'sign_in_code', $3, $4, $5)",
+        )
+        .bind(code)
+        .bind(did)
+        .bind(now.to_rfc3339())
+        .bind((now + ttl).to_rfc3339())
+        .bind(false)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?;
+        Ok(())
+    }
+
+    /// Use up `did`'s sign-in code `code` (#503). True when it was the
+    /// account's current, unexpired, unused code; it cannot be used again.
+    pub async fn consume_sign_in_code(&self, did: &str, code: &str) -> PdsResult<bool> {
+        let now = Utc::now().to_rfc3339();
+        let used = sqlx::query(
+            "UPDATE email_token SET used = true
+             WHERE token = $1 AND did = $2 AND purpose = 'sign_in_code'
+               AND NOT used AND expires_at > $3",
+        )
+        .bind(code)
+        .bind(did)
+        .bind(&now)
+        .execute(&self.db)
+        .await
+        .map_err(PdsError::Database)?
+        .rows_affected();
+        Ok(used == 1)
+    }
+
     /// Confirm email address using verification token
     ///
     /// Marks the email as confirmed if the token is valid and not expired

@@ -369,16 +369,39 @@ async fn create_session(
     // failure masked here for weeks, surfacing as a generic NotFound
     // with zero log signal. Emit at warn for non-auth errors so the
     // next decode/database failure is grep-visible.
-    let (account, session) = match ctx
+    let primary = match ctx
         .account_manager
-        .login(&req.identifier, &req.password)
+        .verify_password(&req.identifier, &req.password)
         .await
     {
+        // The account password matched. An account that signs in with an
+        // emailed code as well needs it now, before any session exists
+        // (#503); app passwords below are not asked for one.
+        Ok(account) => {
+            crate::api::email_factor::require_sign_in_code(
+                &ctx,
+                &account,
+                req.auth_factor_token.as_deref(),
+            )
+            .await?;
+            ctx.account_manager
+                .create_session(&account.did, None)
+                .await
+                .map(|session| (account, session))
+        }
+        Err(e) => Err(e),
+    };
+    let (account, session) = match primary {
         Ok(result) => result,
         // The password was right but the account is taken down: say so, and
         // do not fall through to the app-password path (which would turn it
         // into a generic "invalid password") (#492).
         Err(err @ PdsError::AccountTakenDown(_)) => return Err(err),
+        // The password was right and the account needs its emailed code
+        // (#503): say so, rather than retrying it as an app password.
+        Err(err @ (PdsError::AuthFactorTokenRequired | PdsError::InvalidAuthFactorToken)) => {
+            return Err(err)
+        }
         Err(err) => {
             if !matches!(
                 err,
@@ -513,6 +536,7 @@ async fn get_session(
     // Standalone path.
     let account = ctx.account_manager.get_account(&did).await?;
     let (active, status) = session_status(&ctx, &account).await?;
+    let email_auth_factor = ctx.account_manager.email_auth_factor(&account.did).await?;
 
     Ok(Json(hide_email_unless_granted(
         &unified,
@@ -524,6 +548,7 @@ async fn get_session(
             role,
             active,
             status,
+            email_auth_factor: Some(email_auth_factor),
         },
     )))
 }
@@ -542,6 +567,7 @@ fn hide_email_unless_granted(
     {
         session.email = None;
         session.email_confirmed = None;
+        session.email_auth_factor = None;
     }
     session
 }
@@ -872,6 +898,9 @@ struct UpdateEmailRequest {
     email: String,
     /// The confirmation token (required if current email was confirmed)
     token: Option<String>,
+    /// Turn the emailed sign-in code on or off (#503).
+    #[serde(default, rename = "emailAuthFactor")]
+    email_auth_factor: Option<bool>,
 }
 
 async fn update_email(
@@ -918,10 +947,31 @@ async fn update_email(
             .await?;
     }
 
-    // Update email
-    ctx.account_manager
-        .update_email(&validated.did, &req.email)
-        .await?;
+    // Update email, when it changes. Re-saving the same address (to change
+    // only emailAuthFactor) must not touch its confirmation.
+    let email_changes = account.email.as_deref() != Some(req.email.as_str());
+    if email_changes {
+        ctx.account_manager
+            .update_email(&validated.did, &req.email)
+            .await?;
+    }
+
+    // #503: the emailed sign-in code. Turning it on needs a confirmed address
+    // that is staying the same, and a server that can send email; otherwise
+    // the account could not sign in again.
+    if let Some(enabled) = req.email_auth_factor {
+        if enabled {
+            if email_changes {
+                return Err(crate::error::PdsError::Validation(
+                    "confirm the new email address before turning on emailAuthFactor".to_string(),
+                ));
+            }
+            crate::api::email_factor::can_enable(&ctx, &account)?;
+        }
+        ctx.account_manager
+            .set_email_auth_factor(&validated.did, enabled)
+            .await?;
+    }
 
     Ok(Json(serde_json::json!({})))
 }
@@ -2235,6 +2285,7 @@ mod create_session_ip_binding_tests {
                 Json(CreateSessionRequest {
                     identifier: identifier.to_string(),
                     password: "wrong-password".to_string(),
+                    auth_factor_token: None,
                 }),
             )
             .await
@@ -2258,6 +2309,7 @@ mod create_session_ip_binding_tests {
             Json(CreateSessionRequest {
                 identifier: identifier.to_string(),
                 password: password.to_string(),
+                auth_factor_token: None,
             }),
         )
         .await
@@ -2373,6 +2425,7 @@ mod create_session_ip_binding_tests {
             Json(CreateSessionRequest {
                 identifier: "createbind.localhost".to_string(),
                 password: "pw-correct".to_string(),
+                auth_factor_token: None,
             }),
         )
         .await
@@ -2410,6 +2463,7 @@ mod create_session_ip_binding_tests {
             Json(CreateSessionRequest {
                 identifier: "createunbound.localhost".to_string(),
                 password: "pw-correct".to_string(),
+                auth_factor_token: None,
             }),
         )
         .await
@@ -2426,6 +2480,72 @@ mod create_session_ip_binding_tests {
             .validate_access_token_with_ip(&token, None)
             .await
             .is_ok());
+    }
+}
+
+#[cfg(test)]
+mod email_factor_session_tests {
+    //! #503: createSession with an emailed sign-in code.
+    use super::*;
+
+    async fn ctx_with_factor() -> (AppContext, String) {
+        let ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let account = ctx
+            .account_manager
+            .create_account(
+                "coded.localhost".to_string(),
+                Some("coded@example.com".to_string()),
+                "password123".to_string(),
+                None,
+                None,
+            )
+            .await
+            .expect("create account");
+        ctx.account_manager
+            .set_email_auth_factor(&account.did, true)
+            .await
+            .unwrap();
+        ctx.account_manager
+            .issue_sign_in_code(&account.did, "ABCDE-FGHIJ", chrono::Duration::minutes(15))
+            .await
+            .unwrap();
+        (ctx, account.did)
+    }
+
+    async fn login(ctx: &AppContext, password: &str, code: Option<&str>) -> PdsResult<Json<SessionResponse>> {
+        create_session(
+            State(ctx.clone()),
+            HeaderMap::new(),
+            Json(CreateSessionRequest {
+                identifier: "coded.localhost".to_string(),
+                password: password.to_string(),
+                auth_factor_token: code.map(str::to_string),
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_password_alone_is_not_enough() {
+        let (ctx, _) = ctx_with_factor().await;
+        let err = login(&ctx, "password123", Some("WRONG-CODES")).await.expect_err("wrong code");
+        assert!(matches!(err, PdsError::InvalidAuthFactorToken), "{err:?}");
+        let session = login(&ctx, "password123", Some("abcde-fghij")).await.expect("right code");
+        assert_eq!(session.0.handle, "coded.localhost");
+        let err = login(&ctx, "password123", Some("ABCDE-FGHIJ")).await.expect_err("used up");
+        assert!(matches!(err, PdsError::InvalidAuthFactorToken), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_never_reaches_the_code() {
+        let (ctx, _) = ctx_with_factor().await;
+        let err = login(&ctx, "wrong-password", Some("ABCDE-FGHIJ")).await.expect_err("wrong password");
+        assert!(matches!(err, PdsError::Authentication(_)), "{err:?}");
+        // The code is still unused.
+        let _session = login(&ctx, "password123", Some("ABCDE-FGHIJ"))
+            .await
+            .expect("code still good");
     }
 }
 

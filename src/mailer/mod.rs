@@ -340,6 +340,42 @@ Aurora Locus PDS
         .await
     }
 
+    /// Send a one-time sign-in code (`emailAuthFactor`; #503).
+    pub async fn send_sign_in_code_email(
+        &self,
+        to_email: &str,
+        handle: &str,
+        code: &str,
+        valid_minutes: i64,
+    ) -> PdsResult<()> {
+        let Some(config) = self.config.as_ref() else {
+            return Err(PdsError::Internal(
+                "email is not configured; a sign-in code cannot be sent".to_string(),
+            ));
+        };
+        let body = format!(
+            r#"
+Hello {handle},
+
+Someone, hopefully you, is signing in to your account on our AT Protocol
+Personal Data Server with your password. To finish signing in, enter this
+code:
+
+{code}
+
+The code works once and expires in {valid_minutes} minutes.
+
+If this was not you, your password is known to someone else: change it.
+Nobody can sign in without this code.
+
+Best regards,
+Aurora Locus PDS
+"#
+        );
+        self.send_email(to_email, "Your sign-in code", &body, &config.from_address)
+            .await
+    }
+
     /// Send a generic email
     async fn send_email(&self, to: &str, subject: &str, body: &str, from: &str) -> PdsResult<()> {
         if let Some(transport) = &self.transport {

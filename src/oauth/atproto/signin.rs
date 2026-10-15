@@ -49,6 +49,10 @@ struct PageContext {
     /// The account this browser is already signed in as, and the session's
     /// CSRF token for the sign-out form.
     signed_in: Option<(String, String)>,
+    /// The identifier typed, kept when the page is shown again.
+    identifier: Option<String>,
+    /// The account signs in with an emailed code too: show its field (#503).
+    code_requested: bool,
 }
 
 /// The sign-in form body.
@@ -62,6 +66,9 @@ pub struct SigninForm {
     pub return_to: Option<String>,
     #[serde(default)]
     pub login_hint: Option<String>,
+    /// The emailed sign-in code, for an account with `emailAuthFactor` (#503).
+    #[serde(default)]
+    pub auth_code: Option<String>,
 }
 
 /// `GET /oauth/atproto/signin?return_to=…&login_hint=…` — render the sign-in
@@ -103,6 +110,7 @@ async fn page_context(
         login_hint,
         client_name: client_name_for(ctx, return_to).await,
         signed_in,
+        ..PageContext::default()
     }
 }
 
@@ -147,11 +155,12 @@ pub async fn submit_signin(
     Form(form): Form<SigninForm>,
 ) -> Response {
     let return_to = sanitize_return_to(&ctx, form.return_to.as_deref());
-    let extras = PageContext {
+    let identifier = form.identifier.as_deref().unwrap_or_default().trim();
+    let mut extras = PageContext {
         login_hint: super::params::normalize_login_hint(form.login_hint.as_deref()),
+        identifier: Some(identifier.to_string()).filter(|i| !i.is_empty()),
         ..PageContext::default()
     };
-    let identifier = form.identifier.as_deref().unwrap_or_default().trim();
     let password = form.password.as_deref().unwrap_or_default();
 
     // Verify the account credential (account.password_hash) via the same
@@ -170,6 +179,41 @@ pub async fn submit_signin(
             )
         }
     };
+
+    // An account that signs in with an emailed code as well (#503): ask for
+    // it, or check it. The password must be typed again with the code; it is
+    // never sent back to the browser.
+    match crate::api::email_factor::require_sign_in_code(&ctx, &account, form.auth_code.as_deref())
+        .await
+    {
+        Ok(()) => {}
+        Err(crate::error::PdsError::AuthFactorTokenRequired) => {
+            extras.code_requested = true;
+            return page(
+                StatusCode::UNAUTHORIZED,
+                &return_to,
+                Some("We emailed you a sign-in code. Enter it with your password."),
+                &extras,
+            );
+        }
+        Err(crate::error::PdsError::InvalidAuthFactorToken) => {
+            extras.code_requested = true;
+            return page(
+                StatusCode::UNAUTHORIZED,
+                &return_to,
+                Some("That sign-in code is wrong or has expired."),
+                &extras,
+            );
+        }
+        Err(_) => {
+            return page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &return_to,
+                Some("A sign-in code could not be sent. Please try again later."),
+                &extras,
+            )
+        }
+    }
 
     // Session-fixation defense: discard any pre-existing session before minting.
     if let Some(old) = browser_session::read_session_cookie(&headers) {
@@ -269,6 +313,14 @@ fn page(status: StatusCode, return_to: &str, error: Option<&str>, extras: &PageC
         })
         .unwrap_or_default();
     let hint = extras.login_hint.as_deref().unwrap_or_default();
+    let identifier_value = extras.identifier.as_deref().unwrap_or(hint);
+    let code_html = if extras.code_requested {
+        r#"<label>Sign-in code<br>
+        <input type="text" name="auth_code" autocomplete="one-time-code" required>
+      </label><br>"#
+    } else {
+        ""
+    };
     let body = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -287,11 +339,12 @@ fn page(status: StatusCode, return_to: &str, error: Option<&str>, extras: &PageC
       <input type="hidden" name="return_to" value="{return_to}">
       <input type="hidden" name="login_hint" value="{hint}">
       <label>Handle or DID<br>
-        <input type="text" name="identifier" value="{hint}" autocomplete="username" autofocus required>
+        <input type="text" name="identifier" value="{identifier_value}" autocomplete="username" autofocus required>
       </label><br>
       <label>Password<br>
         <input type="password" name="password" autocomplete="current-password" required>
       </label><br>
+      {code_html}
       <button type="submit">Sign in</button>
     </form>
   </main>
@@ -302,6 +355,8 @@ fn page(status: StatusCode, return_to: &str, error: Option<&str>, extras: &PageC
         signed_in_html = signed_in_html,
         return_to = html_escape(return_to),
         hint = html_escape(hint),
+        identifier_value = html_escape(identifier_value),
+        code_html = code_html,
     );
     (status, [(header::CACHE_CONTROL, "no-store")], Html(body)).into_response()
 }
@@ -401,6 +456,7 @@ mod tests {
                 password: Some("correct-horse-battery-staple".to_string()),
                 return_to: Some(rt.clone()),
                 login_hint: None,
+                auth_code: None,
             }),
         )
         .await;
@@ -434,6 +490,7 @@ mod tests {
                 password: Some("correct-horse-battery-staple".to_string()),
                 return_to: None,
                 login_hint: None,
+                auth_code: None,
             }),
         )
         .await;
@@ -465,6 +522,7 @@ mod tests {
                 password: Some("the-WRONG-password".to_string()),
                 return_to: Some(authorize_url(&ctx)),
                 login_hint: None,
+                auth_code: None,
             }),
         )
         .await;
@@ -483,6 +541,7 @@ mod tests {
                 password: Some("whatever".to_string()),
                 return_to: Some(authorize_url(&ctx)),
                 login_hint: None,
+                auth_code: None,
             }),
         )
         .await;

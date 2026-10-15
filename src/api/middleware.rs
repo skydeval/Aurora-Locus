@@ -19,6 +19,43 @@ use axum::{
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+/// Add `WWW-Authenticate` to a 401 answered to a request that presented a
+/// credential (RFC 6750 §3, RFC 9449 §7.1; #503, #486): `DPoP algs="ES256",
+/// error="invalid_token"` when it used the DPoP scheme, `Bearer
+/// error="invalid_token"` when it used Bearer. That header is how an OAuth
+/// client tells "this token is dead, refresh it" from any other failure;
+/// without it a client waits for a refresh to fail. A 401 that already
+/// carries the header, a request with no credential, and the OAuth endpoints
+/// (whose errors are in the body, RFC 6749 §5.2) are left alone.
+pub async fn www_authenticate_on_unauthorized(req: Request, next: Next) -> Response {
+    let scheme = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_whitespace().next())
+        .map(str::to_ascii_lowercase);
+    let oauth_endpoint = req.uri().path().starts_with("/oauth/");
+    let mut response = next.run(req).await;
+    if response.status() != StatusCode::UNAUTHORIZED
+        || oauth_endpoint
+        || response
+            .headers()
+            .contains_key(axum::http::header::WWW_AUTHENTICATE)
+    {
+        return response;
+    }
+    let challenge = match scheme.as_deref() {
+        Some("dpop") => r#"DPoP algs="ES256", error="invalid_token""#,
+        Some("bearer") => r#"Bearer error="invalid_token""#,
+        _ => return response,
+    };
+    response.headers_mut().insert(
+        axum::http::header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(challenge),
+    );
+    response
+}
+
 /// Extract bearer token from Authorization header
 pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     headers
@@ -2141,3 +2178,74 @@ mod oauth_permission_tests {
         ));
     }
 }
+
+
+#[cfg(test)]
+mod www_authenticate_tests {
+    //! #503 / #486: 401s say which scheme failed and that the token is dead.
+    use super::*;
+    use axum::http::{header, Request as HttpRequest};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn app() -> Router {
+        Router::new()
+            .route("/xrpc/x.denied", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route("/xrpc/x.ok", get(|| async { "ok" }))
+            .route("/oauth/atproto/token", get(|| async { StatusCode::UNAUTHORIZED }))
+            .route(
+                "/xrpc/x.own",
+                get(|| async {
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(header::WWW_AUTHENTICATE, r#"DPoP error="use_dpop_nonce""#)],
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn(www_authenticate_on_unauthorized))
+    }
+
+    async fn challenge(path: &str, authorization: Option<&str>) -> Option<String> {
+        let mut request = HttpRequest::builder().uri(path);
+        if let Some(value) = authorization {
+            request = request.header(header::AUTHORIZATION, value);
+        }
+        let resp = app()
+            .oneshot(request.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        resp.headers()
+            .get(header::WWW_AUTHENTICATE)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn a_dead_token_is_named_in_the_scheme_used() {
+        assert_eq!(
+            challenge("/xrpc/x.denied", Some("DPoP at_x")).await.as_deref(),
+            Some(r#"DPoP algs="ES256", error="invalid_token""#)
+        );
+        assert_eq!(
+            challenge("/xrpc/x.denied", Some("Bearer jwt")).await.as_deref(),
+            Some(r#"Bearer error="invalid_token""#)
+        );
+    }
+
+    #[tokio::test]
+    async fn other_answers_are_left_alone() {
+        assert_eq!(challenge("/xrpc/x.ok", Some("DPoP at_x")).await, None, "not a 401");
+        assert_eq!(challenge("/xrpc/x.denied", None).await, None, "no credential");
+        assert_eq!(
+            challenge("/oauth/atproto/token", Some("DPoP at_x")).await,
+            None,
+            "OAuth endpoints answer in the body"
+        );
+        assert_eq!(
+            challenge("/xrpc/x.own", Some("DPoP at_x")).await.as_deref(),
+            Some(r#"DPoP error="use_dpop_nonce""#),
+            "a handler's own challenge is kept"
+        );
+    }
+}
+
