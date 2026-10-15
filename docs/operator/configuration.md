@@ -119,7 +119,7 @@ selected, `PDS_BLOBSTORE_S3_ACCESS_KEY_ID` and
 
 | Variable | Default | Type | Purpose |
 |---|---|---|---|
-| `PDS_BLOB_UPLOAD_LIMIT` | `5242880` (5 MiB) | u64 bytes | Max blob upload size. |
+| `PDS_BLOB_UPLOAD_LIMIT` | `104857600` (100 MiB) | u64 bytes | Max blob upload size. 100 MiB is Bluesky's video limit. An upload is held in memory until staged; at most four uploads over 8 MiB are read at once. |
 | `PDS_BLOBSTORE_DISK_LOCATION` | `{PDS_DATA_DIRECTORY}/blobs` | path | Disk blob storage location (disk mode). |
 | `PDS_BLOBSTORE_DISK_TMP_LOCATION` | `{PDS_DATA_DIRECTORY}/temp` | path | Disk staging directory (disk mode). |
 | `PDS_BLOBSTORE_S3_BUCKET` | None | string | S3 bucket name. Presence triggers S3 mode. |

@@ -507,6 +507,108 @@ pub async fn require_auth_unified(
         .await
 }
 
+/// Require what [`require_auth_unified`] accepts, or a service-auth token
+/// that an account on this PDS signed for itself to call `lxm` here: the
+/// reference PDS's "user service
+/// auth" (#513). Bluesky's video service uploads a processed video back to
+/// the user's PDS this way, with a token the user got from
+/// `com.atproto.server.getServiceAuth`.
+///
+/// Such a token is recognised by its issuer being a well-formed DID with an
+/// account row here. It must then:
+///
+/// - name this PDS as `aud` and exactly `lxm` as its method;
+/// - be signed by the issuer's `#atproto` key, within the expiry window
+///   [`crate::service_auth::verify_service_jwt_for_method`] enforces;
+/// - come from an account that may make the call (takedown and deactivation,
+///   as for any request).
+///
+/// A token may be used more than once within its lifetime, as on the
+/// reference PDS: the upload service retries with the token it was given.
+///
+/// Every other token takes [`require_auth_unified`] unchanged. Only the
+/// endpoints the reference PDS opens to user service auth call this.
+pub async fn require_auth_or_user_service_auth(
+    ctx: &AppContext,
+    headers: HeaderMap,
+    lxm: &str,
+) -> PdsResult<UnifiedAuthContext> {
+    if oauth_resolved_did(&headers).is_none() {
+        if let Some(token) = extract_bearer_token(&headers) {
+            if let Some(issuer) = local_service_auth_issuer(ctx, &token).await {
+                return verify_user_service_auth(ctx, &token, &issuer, lxm).await;
+            }
+        }
+    }
+    require_auth_unified(State(ctx.clone()), headers).await
+}
+
+/// The issuer of `token` when it is shaped as a service-auth JWT (ES256 or
+/// ES256K) and its unverified `iss` is an account whose repository is held
+/// here. Nothing in it is trusted yet; this only picks the verifier.
+async fn local_service_auth_issuer(ctx: &AppContext, token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let (header, claims) = (parts.next()?, parts.next()?);
+    let decode = |segment: &str| -> Option<serde_json::Value> {
+        let bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            segment,
+        )
+        .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    };
+    let alg = decode(header)?.get("alg")?.as_str()?.to_string();
+    if alg != "ES256K" && alg != "ES256" {
+        return None;
+    }
+    let iss = decode(claims)?.get("iss")?.as_str()?.to_string();
+    // A well-formed DID with an account row here: the string reaches the
+    // account table and the DID resolver exactly as written, so nothing
+    // that only resembles an account (`did:web:host/./`) is routed here.
+    if !proto_blue::syntax::Did::is_valid(&iss) || ctx.is_trusted_iss(&iss) {
+        return None;
+    }
+    match ctx.account_manager.get_actor_serve_state(&iss).await {
+        Ok(Some(_)) => Some(iss),
+        _ => None,
+    }
+}
+
+/// Verify a user service-auth token from `issuer`, an account held here, for
+/// the method `lxm`. See [`require_auth_or_user_service_auth`].
+async fn verify_user_service_auth(
+    ctx: &AppContext,
+    token: &str,
+    issuer: &str,
+    lxm: &str,
+) -> PdsResult<UnifiedAuthContext> {
+    let claims = crate::service_auth::verify_service_jwt_for_method(
+        token,
+        ctx.service_did(),
+        Some(lxm),
+        ctx.identity_resolver.as_ref(),
+    )
+    .await
+    .map_err(|e| {
+        warn!(iss = %issuer, lxm = %lxm, error = %e, "user_service_auth_failed");
+        metrics::record_error("AuthenticationFailed", "middleware");
+        PdsError::from(e)
+    })?;
+    if claims.iss != issuer {
+        return Err(PdsError::Authentication("Invalid token".to_string()));
+    }
+
+    // No replay store, as on the reference PDS: the token is bound to this
+    // PDS, this one method and at most an hour, and a service that retries
+    // a failed upload reuses it.
+
+    enforce_account_moderation(ctx, issuer, &format!("/xrpc/{lxm}")).await?;
+    tracing::info!(did = %issuer, lxm = %lxm, auth_type = "user_service", "authentication_successful");
+    Ok(UnifiedAuthContext::CrossPDS {
+        did: issuer.to_string(),
+    })
+}
+
 /// A request authenticated as an account on this PDS (#470): a session JWT
 /// from `createSession` / `refreshSession` (the account password or an app
 /// password) or an atproto-OAuth token, i.e. everything
@@ -2295,6 +2397,163 @@ mod www_authenticate_tests {
             Some(r#"DPoP error="use_dpop_nonce""#),
             "a handler's own challenge is kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod user_service_auth_tests {
+    //! #513: an account here may authorise a service to call uploadBlob for
+    //! it with a service-auth token it signed, as on the reference PDS.
+    use super::*;
+    use crate::identity::did_document::{DidDocument, VerificationMethod};
+    use crate::identity::resolver::test_doubles::MockIdentityResolver;
+    use crate::service_auth::create_service_jwt;
+    use std::sync::Arc;
+
+    const LXM: &str = "com.atproto.repo.uploadBlob";
+
+    /// A context whose identity resolver is a mock, and one local account
+    /// whose DID document carries its signing key. Returns the account's DID
+    /// and signing key.
+    async fn setup() -> (AppContext, Arc<MockIdentityResolver>, String, Vec<u8>) {
+        let mut ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let mock = Arc::new(MockIdentityResolver::new());
+        ctx.identity_resolver = mock.clone();
+        let acc = ctx
+            .account_manager
+            .create_account(
+                "uploader".into(),
+                Some("uploader@example.com".into()),
+                "password123".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        ctx.actor_store.create(&acc.did).await.unwrap();
+        let key = ctx
+            .account_manager
+            .get_atproto_signing_key_bytes(&acc.did)
+            .await
+            .unwrap();
+        mock.script_did(&acc.did, did_doc(&acc.did, &key));
+        (ctx, mock, acc.did, key)
+    }
+
+    fn did_doc(did: &str, secret: &[u8]) -> DidDocument {
+        let signing = k256::ecdsa::SigningKey::from_slice(secret).unwrap();
+        let point = signing.verifying_key().to_encoded_point(true);
+        let mut multikey = vec![0xe7_u8, 0x01];
+        multikey.extend_from_slice(point.as_bytes());
+        DidDocument {
+            context: None,
+            id: did.to_string(),
+            also_known_as: vec![],
+            service: vec![],
+            verification_method: vec![VerificationMethod {
+                id: format!("{did}#atproto"),
+                key_type: "Multikey".to_string(),
+                controller: did.to_string(),
+                public_key_multibase: Some(format!("z{}", bs58::encode(&multikey).into_string())),
+            }],
+        }
+    }
+
+    fn bearer(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        headers
+    }
+
+    #[tokio::test]
+    async fn the_accounts_own_token_for_this_method_is_accepted() {
+        let (ctx, _mock, did, key) = setup().await;
+        let token = create_service_jwt(&did, ctx.service_did(), Some(60), Some(LXM), &key).unwrap();
+
+        let auth = require_auth_or_user_service_auth(&ctx, bearer(&token), LXM)
+            .await
+            .expect("accepted");
+        assert_eq!(auth.did(), did);
+
+        // A retry of a failed upload reuses the token, as on the reference PDS.
+        let retry = require_auth_or_user_service_auth(&ctx, bearer(&token), LXM)
+            .await
+            .expect("accepted again");
+        assert_eq!(retry.did(), did);
+    }
+
+    #[tokio::test]
+    async fn only_a_well_formed_did_with_an_account_row_is_routed_here() {
+        let (ctx, _mock, did, key) = setup().await;
+        for iss in [
+            format!("{did}/./"),
+            format!("{did}#atproto"),
+            did.to_uppercase(),
+            "did:plc:noaccounthere".to_string(),
+        ] {
+            let token =
+                create_service_jwt(&iss, ctx.service_did(), Some(60), Some(LXM), &key).unwrap();
+            assert!(
+                local_service_auth_issuer(&ctx, &token).await.is_none(),
+                "{iss} must not be routed as a local account"
+            );
+        }
+        let token = create_service_jwt(&did, ctx.service_did(), Some(60), Some(LXM), &key).unwrap();
+        assert_eq!(local_service_auth_issuer(&ctx, &token).await.as_deref(), Some(did.as_str()));
+    }
+
+    #[tokio::test]
+    async fn another_method_audience_or_key_is_refused() {
+        let (ctx, _mock, did, key) = setup().await;
+        let other_key = k256::ecdsa::SigningKey::random(&mut rand::thread_rng())
+            .to_bytes()
+            .to_vec();
+        let cases = [
+            create_service_jwt(&did, ctx.service_did(), Some(60), Some("com.atproto.repo.createRecord"), &key),
+            create_service_jwt(&did, ctx.service_did(), Some(60), None, &key),
+            create_service_jwt(&did, "did:web:elsewhere.example", Some(60), Some(LXM), &key),
+            create_service_jwt(&did, ctx.service_did(), Some(60), Some(LXM), &other_key),
+        ];
+        for token in cases {
+            let token = token.unwrap();
+            assert!(
+                require_auth_or_user_service_auth(&ctx, bearer(&token), LXM)
+                    .await
+                    .is_err(),
+                "refused: {token}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_taken_down_account_cannot_authorise_uploads() {
+        let (ctx, _mock, did, key) = setup().await;
+        sqlx::query("UPDATE actor SET takedown_ref = 'test' WHERE did = $1")
+            .bind(&did)
+            .execute(&ctx.account_db)
+            .await
+            .unwrap();
+        let token = create_service_jwt(&did, ctx.service_did(), Some(60), Some(LXM), &key).unwrap();
+        let err = require_auth_or_user_service_auth(&ctx, bearer(&token), LXM)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::AccountTakenDown(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn an_issuer_not_held_here_takes_the_usual_path() {
+        let (ctx, _mock, _did, key) = setup().await;
+        let token =
+            create_service_jwt("did:plc:notheld", ctx.service_did(), Some(60), Some(LXM), &key)
+                .unwrap();
+        assert!(local_service_auth_issuer(&ctx, &token).await.is_none());
+        assert!(require_auth_or_user_service_auth(&ctx, bearer(&token), LXM)
+            .await
+            .is_err());
     }
 }
 
