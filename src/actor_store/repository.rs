@@ -1089,8 +1089,13 @@ impl RepositoryManager {
                             // string), not its CID.
                             let prev_rev = repo.commit().map(|c| c.rev.clone());
                             let prev_data = repo.commit().map(|c| c.data.clone());
-                            let data =
-                                repo.apply_writes(&repo_writes_owned, signer_for_blocking.as_ref())?;
+                            let data = apply_writes_verified(
+                                &mut repo,
+                                storage_dyn.as_ref(),
+                                prev_data.as_ref(),
+                                &repo_writes_owned,
+                                signer_for_blocking.as_ref(),
+                            )?;
                             Ok((
                                 data.commit_cid,
                                 data.commit.rev.clone(),
@@ -1265,7 +1270,13 @@ impl RepositoryManager {
                     // #467: `since` is the previous commit's rev, not its CID.
                     let prev_rev = repo.commit().map(|c| c.rev.clone());
                     let prev_data = repo.commit().map(|c| c.data.clone());
-                    let data = repo.apply_writes(&repo_writes, signer_arc.as_ref())?;
+                    let data = apply_writes_verified(
+                        &mut repo,
+                        storage_dyn.as_ref(),
+                        prev_data.as_ref(),
+                        &repo_writes,
+                        signer_arc.as_ref(),
+                    )?;
                     Ok((
                         data.commit_cid,
                         data.commit.rev.clone(),
@@ -2178,6 +2189,139 @@ impl RepositoryManager {
     }
 }
 
+/// Format the commit for `writes` and apply it only if its record tree holds
+/// exactly what it must (#505): the records of the previous tree, with the
+/// batch's creates and updates set to their new values and its deletes
+/// removed. Anything else is refused with `InvalidMst` before a block is
+/// stored.
+///
+/// proto-blue-repo 0.3.3's tree delete can drop neighbouring records when the
+/// deleted key sits between two subtrees: it concatenates the two subtrees
+/// instead of merging them, and the node cannot encode two subtrees side by
+/// side. A commit built that way removed six records from a repository while
+/// claiming to delete one; the records stayed in the index, and deleting them
+/// afterwards failed. This check refuses any such commit, whatever tree
+/// operation produced it.
+///
+/// The cost is one walk of the previous tree, the same walk `Repo::load`
+/// already makes on every write.
+fn apply_writes_verified(
+    repo: &mut Repo,
+    storage: &dyn RepoStorage,
+    prev_data: Option<&Cid>,
+    writes: &[RepoWrite],
+    signer: &dyn Signer,
+) -> Result<CommitData, ProtoRepoError> {
+    let mut expected = match prev_data {
+        Some(root) => tree_records(storage, root)?,
+        None => std::collections::BTreeMap::new(),
+    };
+    for write in writes {
+        match write {
+            RepoWrite::Create {
+                collection,
+                rkey,
+                value,
+            }
+            | RepoWrite::Update {
+                collection,
+                rkey,
+                value,
+            } => {
+                expected.insert(format!("{collection}/{rkey}"), cid_for_lex(value)?);
+            }
+            RepoWrite::Delete { collection, rkey } => {
+                expected.remove(&format!("{collection}/{rkey}"));
+            }
+        }
+    }
+
+    let data = repo.format_commit(writes, signer)?;
+    // `format_commit` serialises the whole new tree into `data.blocks`.
+    let actual: std::collections::BTreeMap<String, Cid> =
+        proto_blue::repo::MstNode::load(&data.commit.data, &data.blocks)?
+            .leaves()
+            .into_iter()
+            .map(|leaf| (leaf.key, leaf.value))
+            .collect();
+    if actual != expected {
+        let lost: Vec<&String> = expected
+            .keys()
+            .filter(|key| !actual.contains_key(*key))
+            .take(5)
+            .collect();
+        let extra: Vec<&String> = actual
+            .keys()
+            .filter(|key| !expected.contains_key(*key))
+            .take(5)
+            .collect();
+        tracing::error!(
+            expected = expected.len(),
+            actual = actual.len(),
+            lost = ?lost,
+            extra = ?extra,
+            "refusing a commit whose record tree is not the previous tree plus this batch",
+        );
+        return Err(ProtoRepoError::InvalidMst(format!(
+            "refusing commit: the new tree would hold {} records where {} are expected",
+            actual.len(),
+            expected.len()
+        )));
+    }
+
+    let returned = CommitData {
+        commit_cid: data.commit_cid.clone(),
+        commit: data.commit.clone(),
+        blocks: {
+            let mut copy = BlockMap::new();
+            for (cid, bytes) in data.blocks.iter() {
+                copy.set(cid.clone(), bytes.to_vec());
+            }
+            copy
+        },
+        removed_cids: data.removed_cids.clone(),
+    };
+    repo.apply_commit(data)?;
+    Ok(returned)
+}
+
+/// Every record of the tree rooted at `root`, key to record CID.
+fn tree_records(
+    storage: &dyn RepoStorage,
+    root: &Cid,
+) -> Result<std::collections::BTreeMap<String, Cid>, ProtoRepoError> {
+    let mut blocks = BlockMap::new();
+    let mut pending = vec![root.clone()];
+    while let Some(cid) = pending.pop() {
+        if blocks.has(&cid) {
+            continue;
+        }
+        let bytes = storage
+            .get_block(&cid)?
+            .ok_or_else(|| ProtoRepoError::MissingBlock(cid.clone()))?;
+        if let proto_blue::lex_data::LexValue::Map(node) = proto_blue::lex_cbor::decode(&bytes)? {
+            if let Some(proto_blue::lex_data::LexValue::Cid(left)) = node.get("l") {
+                pending.push(left.clone());
+            }
+            if let Some(proto_blue::lex_data::LexValue::Array(entries)) = node.get("e") {
+                for entry in entries {
+                    if let proto_blue::lex_data::LexValue::Map(entry) = entry {
+                        if let Some(proto_blue::lex_data::LexValue::Cid(tree)) = entry.get("t") {
+                            pending.push(tree.clone());
+                        }
+                    }
+                }
+            }
+        }
+        blocks.set(cid, bytes);
+    }
+    Ok(proto_blue::repo::MstNode::load(root, &blocks)?
+        .leaves()
+        .into_iter()
+        .map(|leaf| (leaf.key, leaf.value))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2252,6 +2396,120 @@ mod tests {
         assert!(uri.starts_with(&format!("at://{}/app.bsky.feed.post/", did)));
         assert!(!cid.is_empty());
         assert!(!rev.is_empty());
+    }
+
+    // ---- #505 — a commit never loses records ----
+
+    /// The keys a record tree holds, read back through storage.
+    async fn stored_keys(repo_mgr: &RepositoryManager, candidates: &[(&str, &str)]) -> Vec<String> {
+        let storage: Arc<dyn RepoStorage> = repo_mgr.make_storage();
+        let candidates: Vec<(String, String)> = candidates
+            .iter()
+            .map(|(c, r)| (c.to_string(), r.to_string()))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let repo = Repo::load(storage).expect("load");
+            candidates
+                .into_iter()
+                .filter(|(c, r)| repo.get_record(c, r).expect("read").is_some())
+                .map(|(c, r)| format!("{c}/{r}"))
+                .collect()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The tree a live repository lost six records from (#505): the same
+    /// keys, so the same tree shape. Deleting the feed generator either
+    /// succeeds and leaves the other six, or is refused and leaves all seven;
+    /// it never stores a tree that lost the others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_one_record_never_loses_its_neighbours() {
+        let keys: [(&str, &str); 7] = [
+            ("app.bsky.graph.follow", "3mxukoz5puc2u"),
+            ("app.bsky.graph.list", "3mxukozoc522u"),
+            ("app.bsky.graph.list", "3mxukozsso22u"),
+            ("app.bsky.graph.starterpack", "3mxukp22ax22u"),
+            ("app.bsky.labeler.service", "self"),
+            ("app.bsky.feed.generator", "3mxukp2fzvk2u"),
+            ("app.bsky.actor.profile", "self"),
+        ];
+        let (store, _tmp) = test_store();
+        let repo_mgr = RepositoryManager::new(unique_did(), store);
+        repo_mgr.initialize().await.unwrap();
+        let signer = test_signer();
+        for (i, (collection, rkey)) in keys.iter().enumerate() {
+            repo_mgr
+                .create_record(
+                    collection,
+                    Some(rkey),
+                    serde_json::json!({ "n": i }),
+                    Some(false),
+                    signer.clone(),
+                )
+                .await
+                .expect("create");
+        }
+        assert_eq!(stored_keys(&repo_mgr, &keys).await.len(), 7);
+
+        let result = repo_mgr
+            .delete_record("app.bsky.feed.generator", "3mxukp2fzvk2u", None, signer.clone())
+            .await;
+        let held = stored_keys(&repo_mgr, &keys).await;
+        match result {
+            Ok(_) => {
+                assert_eq!(held.len(), 6, "deleted one, kept the rest: {held:?}");
+                assert!(!held.contains(&"app.bsky.feed.generator/3mxukp2fzvk2u".to_string()));
+            }
+            Err(e) => assert_eq!(held.len(), 7, "refused ({e}) and lost nothing: {held:?}"),
+        }
+    }
+
+    /// Many records created and deleted in a scrambled order: after every
+    /// write the tree holds exactly the records that should be there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scrambled_history_keeps_the_tree_exact() {
+        let collections = [
+            "app.bsky.feed.post",
+            "app.bsky.feed.like",
+            "app.bsky.graph.follow",
+            "app.bsky.graph.list",
+        ];
+        let owned: Vec<(String, String)> = (0..48)
+            .map(|i| {
+                (
+                    collections[i % collections.len()].to_string(),
+                    format!("3mxu{:09}", (i * 7_919) % 1_000_003),
+                )
+            })
+            .collect();
+        let keys: Vec<(&str, &str)> = owned.iter().map(|(c, r)| (c.as_str(), r.as_str())).collect();
+        let (store, _tmp) = test_store();
+        let repo_mgr = RepositoryManager::new(unique_did(), store);
+        repo_mgr.initialize().await.unwrap();
+        let signer = test_signer();
+        for (collection, rkey) in &keys {
+            repo_mgr
+                .create_record(collection, Some(rkey), serde_json::json!({}), Some(false), signer.clone())
+                .await
+                .expect("create");
+        }
+        let mut expected: BTreeSet<String> = keys.iter().map(|(c, r)| format!("{c}/{r}")).collect();
+        // Delete in a scrambled order, checking the whole tree each time.
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by_key(|i| (i * 31) % keys.len());
+        for i in order {
+            let (collection, rkey) = keys[i];
+            if repo_mgr
+                .delete_record(collection, rkey, None, signer.clone())
+                .await
+                .is_ok()
+            {
+                expected.remove(&format!("{collection}/{rkey}"));
+            }
+            let held: BTreeSet<String> = stored_keys(&repo_mgr, &keys).await.into_iter().collect();
+            assert_eq!(held, expected, "after deleting {collection}/{rkey}");
+        }
     }
 
     // ---- #449 — putRecord upsert semantics ----
