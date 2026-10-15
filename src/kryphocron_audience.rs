@@ -14,11 +14,12 @@
 //!
 //! The rule follows the AppView's read-side rule for the same modes: `list`
 //! consults `members`; `followers` needs a follow record by the writer naming
-//! the audience's owner; `everyone` admits anyone; `nobody`, `following` and
-//! unknown values admit no one. For `followers` and `everyone` a block in
-//! either direction between the writer and the audience's owner denies. `list`
-//! is not subject to the block test: there the owner removes a writer by
-//! editing `members`.
+//! the audience's owner; `following` needs a follow record by the audience's
+//! owner naming the writer; `everyone` admits anyone; `nobody` and unknown
+//! values admit no one. For `followers`, `following` and `everyone` a block
+//! in either direction between the writer and the audience's owner denies.
+//! `list` is not subject to the block test: there the owner removes a writer
+//! by editing `members`.
 //!
 //! The audience's owner is not handled here: the caller admits it before any
 //! record is read.
@@ -99,7 +100,7 @@ pub(crate) enum AudienceMode {
     Everyone,
     /// No account but the owner.
     Nobody,
-    /// The accounts the owner follows. Not resolved yet.
+    /// The accounts the owner follows.
     Following,
     /// Any other stored value.
     Unknown,
@@ -144,6 +145,8 @@ pub(crate) struct AudienceFacts {
     pub is_member: bool,
     /// The writer's repository holds a follow of the audience's owner.
     pub follows: bool,
+    /// The audience's owner's repository holds a follow of the writer.
+    pub followed: bool,
     /// A block exists, in either direction, between the writer and the
     /// audience's owner.
     pub blocked: bool,
@@ -165,11 +168,10 @@ pub(crate) fn decide_write(mode: AudienceMode, facts: AudienceFacts) -> Audience
     let admitted = match mode {
         AudienceMode::List => facts.is_member,
         AudienceMode::Followers => facts.follows && !facts.blocked,
+        AudienceMode::Following => facts.followed && !facts.blocked,
         AudienceMode::Everyone => !facts.blocked,
         AudienceMode::Nobody => false,
-        AudienceMode::Following | AudienceMode::Unknown => {
-            return AudienceWriteDecision::Unresolved;
-        }
+        AudienceMode::Unknown => return AudienceWriteDecision::Unresolved,
     };
     if admitted {
         AudienceWriteDecision::Allowed
@@ -186,7 +188,8 @@ pub(crate) fn decide_write(mode: AudienceMode, facts: AudienceFacts) -> Audience
 /// Only the facts the mode uses are read, each from the subject index of one
 /// repository: none for `list` beyond `members`; for `followers` the writer's
 /// follow of the owner, and the blocks once the follow is found; for
-/// `everyone` the blocks.
+/// `following` the owner's follow of the writer, and the blocks once it is
+/// found; for `everyone` the blocks.
 ///
 /// # Errors
 ///
@@ -234,11 +237,35 @@ pub(crate) async fn resolve_write(
                     || blocks(ctx, owner_did, writer_did).await?;
             }
         }
+        AudienceMode::Following => {
+            // One read of the owner's repository: the follow, and the
+            // owner's own blocks of the writer.
+            let answers = ctx
+                .actor_store
+                .subject_facts(
+                    owner_did,
+                    &[
+                        SubjectProbe {
+                            collection: SubjectCollection::Follow,
+                            subject: writer_did,
+                            matching: SubjectMatch::Exact,
+                        },
+                        block_probe(SubjectCollection::PublicBlock, writer_did),
+                        block_probe(SubjectCollection::PrivateBlock, writer_did),
+                    ],
+                )
+                .await?;
+            facts.followed = answers.first().copied().unwrap_or(false);
+            if facts.followed {
+                facts.blocked = answers.iter().skip(1).any(|&b| b)
+                    || blocks(ctx, writer_did, owner_did).await?;
+            }
+        }
         AudienceMode::Everyone => {
             facts.blocked = blocks(ctx, writer_did, owner_did).await?
                 || blocks(ctx, owner_did, writer_did).await?;
         }
-        AudienceMode::Nobody | AudienceMode::Following | AudienceMode::Unknown => {}
+        AudienceMode::Nobody | AudienceMode::Unknown => {}
     }
     Ok((mode, decide_write(mode, facts)))
 }
@@ -435,7 +462,13 @@ mod tests {
         let facts = |is_member, follows, blocked| AudienceFacts {
             is_member,
             follows,
+            followed: false,
             blocked,
+        };
+        let followed = |blocked| AudienceFacts {
+            followed: true,
+            blocked,
+            ..AudienceFacts::default()
         };
         let cases = [
             (AudienceMode::List, facts(true, false, false), Allowed),
@@ -464,10 +497,13 @@ mod tests {
                 facts(true, true, false),
                 NotInAudience,
             ),
+            (AudienceMode::Following, followed(false), Allowed),
+            (AudienceMode::Following, followed(true), NotInAudience),
+            // the writer following the owner is not the owner following the writer
             (
                 AudienceMode::Following,
                 facts(true, true, false),
-                Unresolved,
+                NotInAudience,
             ),
             (AudienceMode::Unknown, facts(true, true, false), Unresolved),
         ];
@@ -538,12 +574,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn following_admits_whom_the_owner_follows_until_unfollowed() {
+        let ctx = ctx_with_repos(&[WRITER, OWNER]).await;
+        let audience = json!({ "mode": "following" });
+        // the writer following the owner does not count
+        seed(&ctx, WRITER, NSID_FOLLOW, "f1", json!({ "subject": OWNER })).await;
+        assert_eq!(
+            decision(&ctx, audience.clone()).await,
+            AudienceWriteDecision::NotInAudience
+        );
+
+        let follow = seed(&ctx, OWNER, NSID_FOLLOW, "f1", json!({ "subject": WRITER })).await;
+        assert_eq!(
+            decision(&ctx, audience.clone()).await,
+            AudienceWriteDecision::Allowed
+        );
+
+        ctx.actor_store
+            .delete_record(OWNER, &follow)
+            .await
+            .expect("delete follow");
+        assert_eq!(
+            decision(&ctx, audience).await,
+            AudienceWriteDecision::NotInAudience
+        );
+    }
+
+    #[tokio::test]
     async fn a_block_in_either_repository_and_collection_denies() {
-        for mode in ["followers", "everyone"] {
+        for mode in ["followers", "following", "everyone"] {
             for (repo, subject) in [(OWNER, WRITER), (WRITER, OWNER)] {
                 for collection in [NSID_PUBLIC_BLOCK, NSID_BLOCK] {
                     let ctx = ctx_with_repos(&[WRITER, OWNER]).await;
                     seed(&ctx, WRITER, NSID_FOLLOW, "f1", json!({ "subject": OWNER })).await;
+                    seed(&ctx, OWNER, NSID_FOLLOW, "f1", json!({ "subject": WRITER })).await;
                     let audience = json!({ "mode": mode });
                     assert_eq!(
                         decision(&ctx, audience.clone()).await,
@@ -615,15 +679,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nobody_following_and_unknown_modes_admit_no_one() {
+    async fn nobody_and_unknown_modes_admit_no_one() {
         let ctx = ctx_with_repos(&[WRITER, OWNER]).await;
         seed(&ctx, WRITER, NSID_FOLLOW, "f1", json!({ "subject": OWNER })).await;
+        seed(&ctx, OWNER, NSID_FOLLOW, "f1", json!({ "subject": WRITER })).await;
         let members = json!([WRITER]);
         assert_eq!(
             decision(&ctx, json!({ "mode": "nobody", "members": members })).await,
             AudienceWriteDecision::NotInAudience
         );
-        for mode in [json!("following"), json!("Followers"), json!(""), json!(1)] {
+        for mode in [json!("Following"), json!("Followers"), json!(""), json!(1)] {
             assert_eq!(
                 decision(&ctx, json!({ "mode": mode, "members": members })).await,
                 AudienceWriteDecision::Unresolved

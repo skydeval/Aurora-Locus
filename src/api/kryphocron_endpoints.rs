@@ -80,6 +80,8 @@ pub(crate) const PROC_CREATE_POST_PRIVATE: &str = "tools.kryphocron.feed.createP
 pub(crate) const PROC_DELETE_POST_PRIVATE: &str = "tools.kryphocron.feed.deletePostPrivate";
 pub(crate) const PROC_PARTICIPATE_PRIVATE: &str = "tools.kryphocron.actor.participatePrivate";
 pub(crate) const PROC_MANAGE_AUDIENCE: &str = "tools.kryphocron.policy.manageAudience";
+pub(crate) const PROC_UPDATE_POST_PRIVATE: &str = "tools.kryphocron.feed.updatePostPrivate";
+pub(crate) const PROC_DELETE_AUDIENCE: &str = "tools.kryphocron.policy.deleteAudience";
 /// `graph.block` create/delete procedures (#281). The routes are intentionally
 /// NOT registered in [`routes`] until #282 wires the block cascade (rev4 F6/M-5)
 /// — a `createBlock` that persists the block without removing the blocked DID
@@ -107,6 +109,14 @@ pub fn routes() -> Router<AppContext> {
         .route(
             &format!("/xrpc/{PROC_MANAGE_AUDIENCE}"),
             post(manage_audience),
+        )
+        .route(
+            &format!("/xrpc/{PROC_UPDATE_POST_PRIVATE}"),
+            post(update_post_private),
+        )
+        .route(
+            &format!("/xrpc/{PROC_DELETE_AUDIENCE}"),
+            post(delete_audience),
         );
 
     // #282 — the `graph.block` cascade now ships, so the create/delete routes
@@ -143,6 +153,32 @@ struct CreateLikeRequest {
 struct DeleteLikeRequest {
     repo: String,
     rkey: String,
+}
+
+/// `manageAudience` request: as [`CreateLikeRequest`], plus the swap for an
+/// update of an existing record.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManageAudienceRequest {
+    repo: String,
+    #[serde(default)]
+    rkey: Option<String>,
+    #[serde(default)]
+    validate: Option<bool>,
+    #[serde(default)]
+    swap_record: Option<String>,
+    record: serde_json::Value,
+}
+
+/// `updatePostPrivate` request (A-9).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdatePostPrivateRequest {
+    repo: String,
+    rkey: String,
+    audience_list: String,
+    #[serde(default)]
+    swap_record: Option<String>,
 }
 
 /// Bsky-style createRecord response: uri + cid.
@@ -213,9 +249,9 @@ async fn authenticated_did_for_repo(
 }
 
 /// Helper — apply a single kryphocron-authorized create `WriteOp`
-/// and return the (uri, commit_cid) response. Wraps the
-/// `repo_mgr.apply_writes` call so the four create-style endpoints
-/// share the same plumbing.
+/// and return the record's URI and CID (the stored record's, not the
+/// commit's: A-1). Wraps the `repo_mgr.apply_writes` call so the
+/// create-style endpoints share the same plumbing.
 async fn apply_single_create(
     ctx: &AppContext,
     auth: &AuthenticatedDid,
@@ -238,21 +274,113 @@ async fn apply_single_create(
         swap_cid: None,
         kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
             capability_class: CapabilityClass::User,
+            prior: None,
         }),
     };
 
-    let (commit_cid, _rev) = repo_mgr
-        .apply_writes(
+    let outcome = repo_mgr
+        .apply_writes_detailed(
             vec![write],
             signer,
             Arc::new(crate::blob_store::StrictPromoter),
         )
         .await?;
 
-    let uri = format!("at://{auth_did}/{collection}/{rkey}");
     Ok(WriteResponse {
-        uri,
-        cid: commit_cid,
+        uri: format!("at://{auth_did}/{collection}/{rkey}"),
+        cid: outcome.single_record_cid()?,
+    })
+}
+
+/// A record of the writer's own repository as stored: its CID and value.
+struct StoredRecord {
+    cid: String,
+    value: serde_json::Value,
+}
+
+/// Read one record of `did`'s repository. `None` when there is no such
+/// record.
+///
+/// # Errors
+///
+/// A store error, or `PdsError::Internal` when the record is indexed but its
+/// block is missing or does not decode.
+async fn read_own_record(
+    ctx: &AppContext,
+    did: &str,
+    collection: &str,
+    rkey: &str,
+) -> PdsResult<Option<StoredRecord>> {
+    let uri = format!("at://{did}/{collection}/{rkey}");
+    let Some(record) = ctx.actor_store.get_record(did, &uri).await? else {
+        return Ok(None);
+    };
+    let block = ctx
+        .actor_store
+        .get_block(did, &record.cid)
+        .await?
+        .ok_or_else(|| PdsError::Internal(format!("{uri}: record block is missing")))?;
+    let lex = proto_blue::lex_cbor::decode(&block)
+        .map_err(|e| PdsError::Internal(format!("{uri}: record does not decode: {e}")))?;
+    Ok(Some(StoredRecord {
+        cid: record.cid,
+        value: proto_blue::lex_json::lex_to_json(&lex),
+    }))
+}
+
+/// Refuse a write whose `swapRecord` does not name the record's current CID:
+/// 409 `InvalidSwap`, as `putRecord`.
+fn check_swap(current: &StoredRecord, swap_cid: Option<&str>, path: &str) -> PdsResult<()> {
+    match swap_cid {
+        Some(expected) if expected != current.cid => Err(PdsError::SwapCidMismatch(format!(
+            "{path}: expected '{expected}', found '{}'",
+            current.cid
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Helper — replace `current`, an existing record of the writer's own
+/// repository, with `record`, under the same `DedicatedEndpoint`/`User`
+/// authorization as [`apply_single_create`], and return its URI and new
+/// record CID. The caller has already checked any `swapRecord` against
+/// `current` ([`check_swap`]).
+async fn apply_single_update(
+    ctx: &AppContext,
+    auth: &AuthenticatedDid,
+    collection: &str,
+    rkey: &str,
+    record: serde_json::Value,
+    current: StoredRecord,
+) -> PdsResult<WriteResponse> {
+    let auth_did = auth.value();
+    let repo_mgr = RepositoryManager::for_writer(ctx, auth_did.to_string());
+    let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
+
+    let write = WriteOp {
+        action: WriteOpAction::Update,
+        collection: collection.to_string(),
+        rkey: rkey.to_string(),
+        value: Some(record),
+        validate: None,
+        swap_cid: Some(current.cid),
+        kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
+            capability_class: CapabilityClass::User,
+            prior: Some(current.value),
+        }),
+    };
+
+    let outcome = repo_mgr
+        .apply_writes_detailed(
+            vec![write],
+            signer,
+            Arc::new(crate::blob_store::StrictPromoter),
+        )
+        .await?;
+
+    Ok(WriteResponse {
+        uri: format!("at://{auth_did}/{collection}/{rkey}"),
+        cid: outcome.single_record_cid()?,
     })
 }
 
@@ -260,6 +388,10 @@ async fn apply_single_create(
 /// authenticated writer's own repo. The delete-side analog of
 /// [`apply_single_create`]; shares the `DedicatedEndpoint`/`User` authorization
 /// so the dispatcher routes through `bind_pipeline`, not the deny-map.
+///
+/// Deleting a record that is not there succeeds without a commit, as
+/// `deleteRecord` does; the tree delete would otherwise fail on the
+/// missing key.
 async fn apply_single_delete(
     ctx: &AppContext,
     auth: &AuthenticatedDid,
@@ -267,6 +399,9 @@ async fn apply_single_delete(
     rkey: String,
 ) -> PdsResult<()> {
     let auth_did = auth.value();
+    let Some(current) = read_own_record(ctx, auth_did, collection, &rkey).await? else {
+        return Ok(());
+    };
     let repo_mgr = RepositoryManager::for_writer(ctx, auth_did.to_string());
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
@@ -279,6 +414,7 @@ async fn apply_single_delete(
         swap_cid: None,
         kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
             capability_class: CapabilityClass::User,
+            prior: Some(current.value),
         }),
     };
 
@@ -707,26 +843,130 @@ pub(crate) fn parse_at_uri_did(uri: &str) -> Option<String> {
 
 /// `tools.kryphocron.policy.manageAudience` — create or update a
 /// `tools.kryphocron.policy.audience` record under the
-/// `ManageAudience` (user-class) capability. Step 5 ships the
-/// create path; the cascade machinery for audience-update cascade-
-/// reassign (per `v07_DESIGN.md` §7a) is the post-arc-2 cycle's
-/// concern.
+/// `ManageAudience` (user-class) capability.
+///
+/// With the `rkey` of a record that exists, the record is replaced (A-4):
+/// `swapRecord`, when given, must be its current CID (409 `InvalidSwap`).
+/// Membership changes apply to every post that names the audience. Without
+/// an `rkey`, or with one that names no record, a record is created and
+/// `swapRecord` must be absent. The answer carries the record's CID.
 async fn manage_audience(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
-    Json(req): Json<CreateLikeRequest>,
+    Json(req): Json<ManageAudienceRequest>,
 ) -> PdsResult<Json<WriteResponse>> {
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
-    let resp = apply_single_create(
-        &ctx,
-        &auth_did,
-        NSID_AUDIENCE,
-        req.rkey,
-        req.record,
-        req.validate,
-    )
-    .await?;
+    if !req.record.is_object() {
+        return Err(PdsError::Validation("record must be an object".to_string()));
+    }
+    let current = match req.rkey.as_deref() {
+        Some(rkey) => read_own_record(&ctx, auth_did.value(), NSID_AUDIENCE, rkey).await?,
+        None => None,
+    };
+    let resp = match (current, req.rkey) {
+        (Some(current), Some(rkey)) => {
+            let path = format!("{NSID_AUDIENCE}/{rkey}");
+            check_swap(&current, req.swap_record.as_deref(), &path)?;
+            apply_single_update(&ctx, &auth_did, NSID_AUDIENCE, &rkey, req.record, current)
+                .await?
+        }
+        (_, rkey) => {
+            if req.swap_record.is_some() {
+                return Err(PdsError::Validation(
+                    "swapRecord names a record to replace, and there is no audience \
+                     record at this rkey"
+                        .to_string(),
+                ));
+            }
+            apply_single_create(&ctx, &auth_did, NSID_AUDIENCE, rkey, req.record, req.validate)
+                .await?
+        }
+    };
+    Ok(Json(resp))
+}
+
+/// `tools.kryphocron.policy.deleteAudience` — delete one of the writer's
+/// `tools.kryphocron.policy.audience` records (A-4). Posts that still name it
+/// are then readable by their authors only; nothing is reassigned. Deleting
+/// an audience that is not there succeeds, as `deleteRecord` does. The audit
+/// names the members the audience had.
+async fn delete_audience(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteLikeRequest>,
+) -> PdsResult<Json<serde_json::Value>> {
+    let auth_did =
+        authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoDelete).await?;
+    apply_single_delete(&ctx, &auth_did, NSID_AUDIENCE, req.rkey).await?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// `tools.kryphocron.feed.updatePostPrivate` — move a posted private post to
+/// another of the writer's audiences (A-9).
+///
+/// Only `audienceList` changes: every other field of the stored record is
+/// kept, `encodedContent` included (the codec's seed is the originator, NSID
+/// and rkey, so it decodes as before). The URI stays the same and the
+/// answer carries the new record CID.
+///
+/// Refused with 400 `InvalidRequest`: no such post; a reply (a reply's
+/// audience is its thread's); an `audienceList` that is not one of the
+/// writer's own audience records, or names one that does not exist.
+/// `swapRecord` must be the post's current CID (409 `InvalidSwap`).
+///
+/// Replies already written keep their own `audienceList`. A new reply to
+/// this post must name the new audience: `participatePrivate` requires a
+/// reply to name its local parent's audience.
+async fn update_post_private(
+    State(ctx): State<AppContext>,
+    headers: HeaderMap,
+    Json(req): Json<UpdatePostPrivateRequest>,
+) -> PdsResult<Json<WriteResponse>> {
+    let auth_did =
+        authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoUpdate).await?;
+    let writer = auth_did.value();
+    let reference = serde_json::json!({ "audienceList": req.audience_list });
+    private_post_preconditions(&ctx, writer, &reference).await?;
+    if audience_owner(&req.audience_list) != Some(writer) {
+        return Err(PdsError::Validation(
+            "audienceList must be the at:// URI of one of the writer's own audience records"
+                .to_string(),
+        ));
+    }
+    if load_record_json(&ctx, writer, &req.audience_list).await?.is_none() {
+        return Err(PdsError::Validation(format!(
+            "audienceList names no audience record: {}",
+            req.audience_list
+        )));
+    }
+
+    let Some(current) = read_own_record(&ctx, writer, NSID_POST_PRIVATE, &req.rkey).await?
+    else {
+        return Err(PdsError::Validation(format!(
+            "no private post at {NSID_POST_PRIVATE}/{}",
+            req.rkey
+        )));
+    };
+    if current.value.get("reply").is_some_and(|reply| !reply.is_null()) {
+        return Err(PdsError::Validation(
+            "a reply's audience is its thread's and cannot be changed".to_string(),
+        ));
+    }
+    let path = format!("{NSID_POST_PRIVATE}/{}", req.rkey);
+    check_swap(&current, req.swap_record.as_deref(), &path)?;
+
+    let mut record = current.value.clone();
+    record
+        .as_object_mut()
+        .ok_or_else(|| PdsError::Internal(format!("{path}: stored record is not an object")))?
+        .insert(
+            "audienceList".to_string(),
+            serde_json::Value::String(req.audience_list),
+        );
+    let resp =
+        apply_single_update(&ctx, &auth_did, NSID_POST_PRIVATE, &req.rkey, record, current)
+            .await?;
     Ok(Json(resp))
 }
 
@@ -982,10 +1222,22 @@ mod participate_audience_tests {
     }
 
     #[tokio::test]
+    async fn following_admits_a_writer_the_owner_follows() {
+        let (ctx, post) = thread(json!("following")).await;
+        let audience = audience_uri(OWNER);
+        seed(&ctx, OWNER, FOLLOW, "f1", json!({ "subject": WRITER })).await;
+        assert_allowed(check(&ctx, &post, &audience, WRITER).await);
+        let refused = denial(check(&ctx, &post, &audience, THIRD).await);
+        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
+        assert_eq!(refused.audience_mode, "following");
+    }
+
+    #[tokio::test]
     async fn nobody_following_and_unknown_modes_refuse_everyone_but_the_owner() {
+        // The writer follows the owner below; `following` needs the reverse.
         let cases = [
             (json!("nobody"), AudienceCheckResult::NotInAudience, "nobody"),
-            (json!("following"), AudienceCheckResult::NoAudienceConfigured, "following"),
+            (json!("following"), AudienceCheckResult::NotInAudience, "following"),
             (json!("Followers"), AudienceCheckResult::NoAudienceConfigured, "unknown"),
             (json!(7), AudienceCheckResult::NoAudienceConfigured, "unknown"),
         ];
@@ -1213,5 +1465,239 @@ mod participate_audience_tests {
             .await
             .expect_err("no repository here");
         assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+    }
+}
+
+#[cfg(test)]
+mod procedure_tests {
+    //! The procedures end to end, through an OAuth session (A-1, A-4, A-9).
+    use super::*;
+    use serde_json::json;
+
+    /// A local account with its repository and genesis commit, as
+    /// `createAccount` leaves it.
+    async fn account(ctx: &AppContext, handle: &str) -> String {
+        let acc = ctx
+            .account_manager
+            .create_account(
+                handle.into(),
+                Some(format!("{handle}@example.com")),
+                "password123".into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        RepositoryManager::for_writer(ctx, acc.did.clone())
+            .initialize()
+            .await
+            .unwrap();
+        crate::api::account_emit::create_account_emit_sequence(ctx, &acc.did, handle)
+            .await
+            .unwrap();
+        acc.did
+    }
+
+    fn session(did: &str) -> HeaderMap {
+        middleware::oauth_gate_headers(did, "atproto transition:generic")
+    }
+
+    async fn stored_cid(ctx: &AppContext, did: &str, uri: &str) -> String {
+        ctx.actor_store.get_record(did, uri).await.unwrap().unwrap().cid
+    }
+
+    async fn audience(
+        ctx: &AppContext,
+        did: &str,
+        rkey: &str,
+        record: serde_json::Value,
+        swap_record: Option<String>,
+    ) -> PdsResult<WriteResponse> {
+        manage_audience(
+            State(ctx.clone()),
+            session(did),
+            Json(ManageAudienceRequest {
+                repo: did.to_string(),
+                rkey: Some(rkey.to_string()),
+                validate: None,
+                swap_record,
+                record,
+            }),
+        )
+        .await
+        .map(|Json(resp)| resp)
+    }
+
+    async fn post(ctx: &AppContext, did: &str, record: serde_json::Value) -> WriteResponse {
+        create_post_private(
+            State(ctx.clone()),
+            session(did),
+            Json(CreateLikeRequest {
+                repo: did.to_string(),
+                rkey: None,
+                validate: None,
+                record,
+            }),
+        )
+        .await
+        .unwrap()
+        .0
+    }
+
+    async fn update(
+        ctx: &AppContext,
+        did: &str,
+        rkey: &str,
+        audience_list: &str,
+        swap_record: Option<String>,
+    ) -> PdsResult<WriteResponse> {
+        update_post_private(
+            State(ctx.clone()),
+            session(did),
+            Json(UpdatePostPrivateRequest {
+                repo: did.to_string(),
+                rkey: rkey.to_string(),
+                audience_list: audience_list.to_string(),
+                swap_record,
+            }),
+        )
+        .await
+        .map(|Json(resp)| resp)
+    }
+
+    fn rkey_of(uri: &str) -> &str {
+        uri.rsplit('/').next().unwrap()
+    }
+
+    fn post_record(audience_uri: &str) -> serde_json::Value {
+        json!({
+            "$type": NSID_POST_PRIVATE,
+            "text": "for some eyes",
+            "createdAt": "2026-10-15T00:00:00Z",
+            "audienceList": audience_uri,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_post_moves_to_another_audience_and_keeps_everything_else() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let alice = account(&ctx, "alice").await;
+        let followers = audience(&ctx, &alice, "followers", json!({ "mode": "followers" }), None)
+            .await
+            .unwrap();
+        let close = audience(&ctx, &alice, "close", json!({ "mode": "list", "members": [] }), None)
+            .await
+            .unwrap();
+        // A-1: the answered CID is the stored record's.
+        assert_eq!(close.cid, stored_cid(&ctx, &alice, &close.uri).await);
+
+        let written = post(&ctx, &alice, post_record(&followers.uri)).await;
+        assert_eq!(written.cid, stored_cid(&ctx, &alice, &written.uri).await);
+        let before = load_record_json(&ctx, &alice, &written.uri).await.unwrap().unwrap();
+
+        // A stale swap is refused and changes nothing.
+        let err = update(&ctx, &alice, rkey_of(&written.uri), &close.uri, Some(close.cid.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::SwapCidMismatch(_)), "{err:?}");
+
+        let moved = update(
+            &ctx,
+            &alice,
+            rkey_of(&written.uri),
+            &close.uri,
+            Some(written.cid.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(moved.uri, written.uri);
+        assert_ne!(moved.cid, written.cid);
+        assert_eq!(moved.cid, stored_cid(&ctx, &alice, &written.uri).await);
+
+        let after = load_record_json(&ctx, &alice, &written.uri).await.unwrap().unwrap();
+        assert_eq!(after["audienceList"], json!(close.uri));
+        let mut expected = before;
+        expected["audienceList"] = json!(close.uri);
+        assert_eq!(after, expected, "only audienceList changes");
+    }
+
+    #[tokio::test]
+    async fn update_refuses_replies_foreign_or_missing_audiences_and_missing_posts() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let alice = account(&ctx, "alice").await;
+        let bob = account(&ctx, "bob").await;
+        let mine = audience(&ctx, &alice, "aud", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let theirs = audience(&ctx, &bob, "aud", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let root = post(&ctx, &alice, post_record(&mine.uri)).await;
+        let mut reply_record = post_record(&mine.uri);
+        reply_record["reply"] = json!({
+            "root": { "uri": root.uri, "cid": root.cid },
+            "parent": { "uri": root.uri, "cid": root.cid },
+        });
+        let reply = post(&ctx, &alice, reply_record).await;
+
+        let missing_audience = format!("at://{alice}/{NSID_AUDIENCE}/nothing-here");
+        for (rkey, audience_list) in [
+            (rkey_of(&reply.uri), mine.uri.as_str()),
+            (rkey_of(&root.uri), theirs.uri.as_str()),
+            (rkey_of(&root.uri), missing_audience.as_str()),
+            ("3nosuchpost22", mine.uri.as_str()),
+        ] {
+            let err = update(&ctx, &alice, rkey, audience_list, None).await.unwrap_err();
+            assert!(matches!(err, PdsError::Validation(_)), "{rkey} {audience_list}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn manage_audience_replaces_an_existing_record_and_delete_removes_it() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let alice = account(&ctx, "alice").await;
+        let created = audience(
+            &ctx,
+            &alice,
+            "friends",
+            json!({ "mode": "list", "name": "friends", "members": ["did:plc:a"] }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let renamed = json!({ "mode": "list", "name": "close friends", "members": ["did:plc:b"] });
+        let err = audience(&ctx, &alice, "friends", renamed.clone(), Some("bafystale".to_string()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::SwapCidMismatch(_)), "{err:?}");
+
+        let updated = audience(&ctx, &alice, "friends", renamed.clone(), Some(created.cid.clone()))
+            .await
+            .unwrap();
+        assert_eq!(updated.uri, created.uri);
+        assert_eq!(updated.cid, stored_cid(&ctx, &alice, &created.uri).await);
+        let stored = load_record_json(&ctx, &alice, &created.uri).await.unwrap().unwrap();
+        assert_eq!(stored, renamed);
+
+        // A swap for a record that is not there cannot hold.
+        let err = audience(&ctx, &alice, "other", renamed, Some(updated.cid.clone()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+
+        for _ in 0..2 {
+            let _answer = delete_audience(
+                State(ctx.clone()),
+                session(&alice),
+                Json(DeleteLikeRequest {
+                    repo: alice.clone(),
+                    rkey: "friends".to_string(),
+                }),
+            )
+            .await
+            .expect("delete, and delete again, succeed");
+        }
+        assert!(ctx.actor_store.get_record(&alice, &created.uri).await.unwrap().is_none());
     }
 }

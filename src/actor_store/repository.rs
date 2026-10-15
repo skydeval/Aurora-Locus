@@ -101,6 +101,43 @@ pub struct WriteOp {
     pub kryphocron_authorization: Option<crate::kryphocron::KryphocronWriteAuthorization>,
 }
 
+/// What one write of a commit did: its action, the record's URI, and for a
+/// create or update the CID of the record as stored (not the commit's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteResult {
+    pub action: WriteOpAction,
+    pub uri: String,
+    /// The stored record's CID; `None` for a delete.
+    pub cid: Option<String>,
+}
+
+/// What a commit produced: the commit's CID and rev, and one
+/// [`WriteResult`] per write, in the order the writes were given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitOutcome {
+    pub commit_cid: String,
+    pub rev: String,
+    pub results: Vec<WriteResult>,
+}
+
+impl CommitOutcome {
+    /// The record CID of the first write: the one write of a single-record
+    /// call (`createRecord`, `putRecord`, a kryphocron procedure).
+    ///
+    /// # Errors
+    ///
+    /// `PdsError::Internal` when the commit holds no create or update, which
+    /// a single-record write cannot produce.
+    pub fn single_record_cid(&self) -> PdsResult<String> {
+        self.results
+            .first()
+            .and_then(|result| result.cid.clone())
+            .ok_or_else(|| {
+                PdsError::Internal("commit carries no written record".to_string())
+            })
+    }
+}
+
 /// Per-record bookkeeping captured during commit prep so we can update
 /// the SQLite `record` table after the proto-blue commit lands and so
 /// Phase B (Arc 16e §9.5.3.2.2) can compute per-record STRICT / unref
@@ -918,6 +955,18 @@ impl RepositoryManager {
         signer: Arc<dyn Signer>,
         promoter: Arc<dyn crate::blob_store::BlobPromoter>,
     ) -> PdsResult<(String, String)> {
+        let outcome = self.apply_writes_inner(writes, signer, promoter, None).await?;
+        Ok((outcome.commit_cid, outcome.rev))
+    }
+
+    /// [`Self::apply_writes`], answering every write's result too: what a
+    /// caller that reports record CIDs needs (A-1).
+    pub async fn apply_writes_detailed(
+        &self,
+        writes: Vec<WriteOp>,
+        signer: Arc<dyn Signer>,
+        promoter: Arc<dyn crate::blob_store::BlobPromoter>,
+    ) -> PdsResult<CommitOutcome> {
         self.apply_writes_inner(writes, signer, promoter, None).await
     }
 
@@ -935,8 +984,10 @@ impl RepositoryManager {
         promoter: Arc<dyn crate::blob_store::BlobPromoter>,
         cascade_context: &mut crate::cascade::CascadeContext,
     ) -> PdsResult<(String, String)> {
-        self.apply_writes_inner(writes, signer, promoter, Some(cascade_context))
-            .await
+        let outcome = self
+            .apply_writes_inner(writes, signer, promoter, Some(cascade_context))
+            .await?;
+        Ok((outcome.commit_cid, outcome.rev))
     }
 
     async fn apply_writes_inner(
@@ -945,7 +996,7 @@ impl RepositoryManager {
         signer: Arc<dyn Signer>,
         promoter: Arc<dyn crate::blob_store::BlobPromoter>,
         mut cascade_context: Option<&mut crate::cascade::CascadeContext>,
-    ) -> PdsResult<(String, String)> {
+    ) -> PdsResult<CommitOutcome> {
         // ATProto spec: max 200 writes per commit.
         if writes.len() > 200 {
             return Err(PdsError::Validation(
@@ -1371,7 +1422,23 @@ impl RepositoryManager {
                 .ok();
         }
 
-        Ok((commit_cid.to_string(), new_rev))
+        let results = prepared
+            .into_iter()
+            .map(|rec| WriteResult {
+                action: match rec.op {
+                    OpAction::Create => WriteOpAction::Create,
+                    OpAction::Update => WriteOpAction::Update,
+                    OpAction::Delete => WriteOpAction::Delete,
+                },
+                uri: rec.uri,
+                cid: rec.cid,
+            })
+            .collect();
+        Ok(CommitOutcome {
+            commit_cid: commit_cid.to_string(),
+            rev: new_rev,
+            results,
+        })
     }
 
     /// Arc 16e §9.5.3.2.2 Phase B body — shared-DB blob-ref
@@ -1680,7 +1747,8 @@ impl RepositoryManager {
         }
     }
 
-    /// Create a single record
+    /// Create a single record. The outcome's one result carries the new
+    /// record's URI and CID.
     pub async fn create_record(
         &self,
         collection: &str,
@@ -1688,7 +1756,7 @@ impl RepositoryManager {
         value: serde_json::Value,
         validate: Option<bool>,
         signer: Arc<dyn Signer>,
-    ) -> PdsResult<(String, String, String)> {
+    ) -> PdsResult<CommitOutcome> {
         // Generate rkey if not provided — proto-blue's next_tid is monotonic
         // per process, so successive calls won't collide even sub-millisecond.
         let rkey = match rkey {
@@ -1706,11 +1774,8 @@ impl RepositoryManager {
             kryphocron_authorization: None,
         }];
 
-        let (commit_cid, rev) = self
-            .apply_writes(writes, signer, Arc::new(crate::blob_store::StrictPromoter))
-            .await?;
-        let uri = format!("at://{}/{}/{}", self.did, collection, rkey);
-        Ok((uri, commit_cid, rev))
+        self.apply_writes_detailed(writes, signer, Arc::new(crate::blob_store::StrictPromoter))
+            .await
     }
 
     /// Upsert a record (`com.atproto.repo.putRecord` semantics).
@@ -1741,8 +1806,8 @@ impl RepositoryManager {
     /// (404). Keeping one comparison site means putRecord and applyWrites
     /// cannot drift apart on precondition semantics.
     ///
-    /// Returns `(commit_cid, rev)` for the update arms and the record CID
-    /// for the create arm — see the return-value note below.
+    /// Returns the commit's outcome; its one result carries the record's
+    /// URI and CID, whichever arm ran.
     ///
     /// # Errors
     ///
@@ -1760,7 +1825,7 @@ impl RepositoryManager {
         validate: Option<bool>,
         swap_cid: Option<String>,
         signer: Arc<dyn Signer>,
-    ) -> PdsResult<(String, String)> {
+    ) -> PdsResult<CommitOutcome> {
         use crate::actor_store::models::{
             PreparedWrite, WriteOpAction as ModelAction,
         };
@@ -1782,10 +1847,9 @@ impl RepositoryManager {
 
             // Create arm. `create_record` generates an rkey when passed
             // `None`; putRecord always addresses an explicit rkey, so pin it.
-            let (_uri, commit_cid, rev) = self
+            return self
                 .create_record(collection, Some(rkey), value, validate, signer)
-                .await?;
-            return Ok((commit_cid, rev));
+                .await;
         }
 
         // Update arm. Route through `apply_batch_writes` so `validate_batch`
@@ -1800,7 +1864,7 @@ impl RepositoryManager {
             validate,
         }];
 
-        self.apply_batch_writes(writes, signer).await
+        self.apply_batch_writes_detailed(writes, signer).await
     }
 
     /// Delete a record (`com.atproto.repo.deleteRecord` semantics).
@@ -2151,6 +2215,17 @@ impl RepositoryManager {
         writes: Vec<crate::actor_store::models::PreparedWrite>,
         signer: Arc<dyn Signer>,
     ) -> PdsResult<(String, String)> {
+        let outcome = self.apply_batch_writes_detailed(writes, signer).await?;
+        Ok((outcome.commit_cid, outcome.rev))
+    }
+
+    /// [`Self::apply_batch_writes`], answering every write's result too
+    /// (`applyWrites`'s `results`, A-1).
+    pub async fn apply_batch_writes_detailed(
+        &self,
+        writes: Vec<crate::actor_store::models::PreparedWrite>,
+        signer: Arc<dyn Signer>,
+    ) -> PdsResult<CommitOutcome> {
         use crate::actor_store::models::WriteOpAction as ModelAction;
 
         self.validate_batch(&writes).await?;
@@ -2176,7 +2251,8 @@ impl RepositoryManager {
             })
             .collect();
 
-        self.apply_writes(ops, signer, Arc::new(crate::blob_store::StrictPromoter)).await
+        self.apply_writes_detailed(ops, signer, Arc::new(crate::blob_store::StrictPromoter))
+            .await
     }
 }
 
@@ -2399,10 +2475,14 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "create_record failed: {:?}", result.err());
-        let (uri, cid, rev) = result.unwrap();
-        assert!(uri.starts_with(&format!("at://{}/app.bsky.feed.post/", did)));
-        assert!(!cid.is_empty());
-        assert!(!rev.is_empty());
+        let outcome = result.unwrap();
+        let written = &outcome.results[0];
+        assert!(written.uri.starts_with(&format!("at://{}/app.bsky.feed.post/", did)));
+        assert!(!outcome.rev.is_empty());
+        // A-1: the answered CID is the stored record's, not the commit's.
+        let record_cid = outcome.single_record_cid().unwrap();
+        assert_ne!(record_cid, outcome.commit_cid);
+        assert_eq!(store_record_cid(&repo_mgr, &written.uri).await, record_cid);
     }
 
     // ---- #506 — an unreadable repository is never replaced ----
@@ -3990,6 +4070,7 @@ mod tests {
                 kryphocron_authorization: Some(
                     KryphocronWriteAuthorization::DedicatedEndpoint {
                         capability_class: CapabilityClass::User,
+                        prior: None,
                     },
                 ),
             };
@@ -4137,6 +4218,7 @@ mod tests {
             let with_auth = recovery_test_write(Some(
                 KryphocronWriteAuthorization::DedicatedEndpoint {
                     capability_class: CapabilityClass::User,
+                    prior: None,
                 },
             ));
 
