@@ -202,13 +202,7 @@ impl BlobStore {
         crate::blob_store::mime::validate_blob_size(size, self.config.storage.max_blob_size)
             .map_err(PdsError::Validation)?;
 
-        // Detect MIME type from data if not provided
-        let mime_type = mime_type
-            .map(String::from)
-            .or_else(|| {
-                crate::blob_store::mime::detect_mime_type_from_data(&data).map(String::from)
-            })
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mime_type = crate::blob_store::mime::resolve_mime_type(mime_type, &data);
 
         // Validate MIME type is allowed
         self.validate_mime_type(&mime_type)?;
@@ -418,13 +412,7 @@ impl BlobStore {
         crate::blob_store::mime::validate_blob_size(size, self.config.storage.max_blob_size)
             .map_err(PdsError::Validation)?;
 
-        // Detect MIME type from data if not provided
-        let mime_type = mime_type
-            .map(String::from)
-            .or_else(|| {
-                crate::blob_store::mime::detect_mime_type_from_data(&data).map(String::from)
-            })
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let mime_type = crate::blob_store::mime::resolve_mime_type(mime_type, &data);
 
         // Validate MIME type is allowed
         self.validate_mime_type(&mime_type)?;
