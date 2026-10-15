@@ -2,7 +2,8 @@
 use crate::{
     api::middleware::{
         atproto_oauth_gate, check_account_moderation, federation_enabled_gate,
-        jwt_deprecation_headers, namespace_scope_check, www_authenticate_on_unauthorized,
+        dpop_nonce_header, jwt_deprecation_headers, namespace_scope_check,
+        www_authenticate_on_unauthorized,
     },
     context::AppContext,
     error::{PdsError, PdsResult},
@@ -206,6 +207,10 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         // structurally — see token_looks_like_jwt). Outermost of
         // the per-request layers so the headers reach the client
         // verbatim.
+        // DPoP-Nonce on every response to a DPoP request (#486), outside the
+        // OAuth gate and the authorization-server handlers so their nonce
+        // challenges carry it too.
+        .layer(middleware::from_fn_with_state(ctx.clone(), dpop_nonce_header))
         .layer(middleware::from_fn_with_state(ctx, jwt_deprecation_headers))
         // `WWW-Authenticate` on 401s (#503, #486): outside every layer that
         // can answer 401 (the OAuth gate, moderation, the handlers), so it

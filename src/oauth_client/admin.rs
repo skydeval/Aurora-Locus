@@ -247,8 +247,12 @@ impl AdminOAuthClient {
         }
         // If the AS demanded a nonce and actually supplied one, retry once with
         // a proof that now carries it. Without a supplied nonce a retry would be
-        // identical, so we fall through to surface the error instead.
-        if status == reqwest::StatusCode::UNAUTHORIZED && is_use_dpop_nonce(&body) && nonce.is_some()
+        // identical, so we fall through to surface the error instead. RFC 9449
+        // §8 has the AS answer 400; some answer 401, so both are accepted (#486).
+        if (status == reqwest::StatusCode::BAD_REQUEST
+            || status == reqwest::StatusCode::UNAUTHORIZED)
+            && is_use_dpop_nonce(&body)
+            && nonce.is_some()
         {
             let (status2, nonce2, body2) = self.one_shot(url, form).await?;
             if let Some(n) = nonce2 {
@@ -549,6 +553,13 @@ mod tests {
 
     #[tokio::test]
     async fn use_dpop_nonce_challenge_triggers_one_retry_with_the_nonce() {
+        // RFC 9449 §8 answers 400 (what Aurora's own AS sends); some send 401.
+        for status in [StatusCode::BAD_REQUEST, StatusCode::UNAUTHORIZED] {
+            nonce_challenge_is_retried_once(status).await;
+        }
+    }
+
+    async fn nonce_challenge_is_retried_once(challenge_status: StatusCode) {
         let calls = Arc::new(AtomicUsize::new(0));
         let cap = Arc::new(Mutex::new(Vec::<Captured>::new()));
         let calls_h = calls.clone();
@@ -570,7 +581,7 @@ mod tests {
                     if n == 0 {
                         // First call: demand a nonce.
                         (
-                            StatusCode::UNAUTHORIZED,
+                            challenge_status,
                             [
                                 (header::CONTENT_TYPE, "application/json"),
                                 (HeaderName::from_static("dpop-nonce"), "srv-nonce-1"),

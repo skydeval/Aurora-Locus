@@ -1076,15 +1076,11 @@ impl RepositoryManager {
                     let proto_blue_join = tokio::task::spawn_blocking(
                         move || -> Result<_, ProtoRepoError> {
                             let storage_dyn: Arc<dyn RepoStorage> = storage_for_blocking;
-                            let mut repo = match Repo::load(storage_dyn.clone()) {
-                                Ok(r) => r,
-                                Err(ProtoRepoError::Storage(_)) => Repo::create(
-                                    storage_dyn.clone(),
-                                    did_for_blocking,
-                                    signer_for_blocking.as_ref(),
-                                )?,
-                                Err(e) => return Err(e),
-                            };
+                            let mut repo = load_or_create(
+                                storage_dyn.clone(),
+                                did_for_blocking,
+                                signer_for_blocking.as_ref(),
+                            )?;
                             // #467: `since` is the previous commit's rev (a TID
                             // string), not its CID.
                             let prev_rev = repo.commit().map(|c| c.rev.clone());
@@ -1260,13 +1256,8 @@ impl RepositoryManager {
             ) = tokio::task::spawn_blocking(
                 move || -> Result<_, ProtoRepoError> {
                     let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
-                    let mut repo = match Repo::load(storage_dyn.clone()) {
-                        Ok(r) => r,
-                        Err(ProtoRepoError::Storage(_)) => {
-                            Repo::create(storage_dyn.clone(), did, signer_arc.as_ref())?
-                        }
-                        Err(e) => return Err(e),
-                    };
+                    let mut repo =
+                        load_or_create(storage_dyn.clone(), did, signer_arc.as_ref())?;
                     // #467: `since` is the previous commit's rev, not its CID.
                     let prev_rev = repo.commit().map(|c| c.rev.clone());
                     let prev_data = repo.commit().map(|c| c.data.clone());
@@ -2285,6 +2276,22 @@ fn apply_writes_verified(
     Ok(returned)
 }
 
+/// Load the stored repository, or start one when none has been stored yet.
+///
+/// Only a missing root means "no repository": any other failure (an
+/// unreadable root, a missing commit or tree block) is returned, because
+/// starting afresh then would sign an empty repository over the real one.
+fn load_or_create(
+    storage: Arc<dyn RepoStorage>,
+    did: String,
+    signer: &dyn Signer,
+) -> Result<Repo, ProtoRepoError> {
+    if storage.get_root()?.is_none() {
+        return Repo::create(storage, did, signer);
+    }
+    Repo::load(storage)
+}
+
 /// Every record of the tree rooted at `root`, key to record CID.
 fn tree_records(
     storage: &dyn RepoStorage,
@@ -2396,6 +2403,32 @@ mod tests {
         assert!(uri.starts_with(&format!("at://{}/app.bsky.feed.post/", did)));
         assert!(!cid.is_empty());
         assert!(!rev.is_empty());
+    }
+
+    // ---- #506 — an unreadable repository is never replaced ----
+
+    #[test]
+    fn an_empty_store_gets_a_new_repository() {
+        use proto_blue::repo::MemoryBlockstore;
+        let storage: Arc<dyn RepoStorage> = Arc::new(MemoryBlockstore::new());
+        let signer = test_signer();
+        load_or_create(storage.clone(), unique_did(), signer.as_ref()).expect("create");
+        assert!(storage.get_root().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_stored_repository_that_cannot_be_read_is_an_error_not_a_fresh_start() {
+        use proto_blue::repo::MemoryBlockstore;
+        let signer = test_signer();
+        let original: Arc<dyn RepoStorage> = Arc::new(MemoryBlockstore::new());
+        load_or_create(original.clone(), unique_did(), signer.as_ref()).expect("create");
+        let root = original.get_root().unwrap().expect("root");
+
+        // The root is stored but its commit block is not.
+        let broken: Arc<dyn RepoStorage> =
+            Arc::new(MemoryBlockstore::from_blocks(BlockMap::new(), Some(root.clone())));
+        assert!(load_or_create(broken.clone(), unique_did(), signer.as_ref()).is_err());
+        assert_eq!(broken.get_root().unwrap(), Some(root), "the root is untouched");
     }
 
     // ---- #505 — a commit never loses records ----

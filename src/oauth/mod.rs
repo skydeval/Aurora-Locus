@@ -16,6 +16,7 @@
 //! - https://atproto.com/specs/oauth
 
 pub mod atproto;
+pub mod dpop_nonce;
 pub mod flow_state_adapter;
 pub mod models;
 pub mod scope;

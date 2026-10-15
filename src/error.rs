@@ -184,6 +184,14 @@ pub enum PdsError {
     #[error("The sign-in code is invalid or has expired")]
     InvalidAuthFactorToken,
 
+    /// A DPoP proof without a current server nonce (RFC 9449 §8, §9; #486).
+    /// On API requests: HTTP 401 with `WWW-Authenticate: DPoP
+    /// error="use_dpop_nonce"`; the response's `DPoP-Nonce` header has the
+    /// nonce to retry with. The authorization server's endpoints answer it
+    /// as an OAuth error body with HTTP 400 instead.
+    #[error("A DPoP nonce from this server is required")]
+    UseDpopNonce,
+
     /// Arc 14 §7.3.5 — sync-namespace handler called against a DID
     /// with no actor row. Distinct from the generic `NotFound` so
     /// the wire-emitted `error` name is `"RepoNotFound"` per spec.
@@ -853,6 +861,26 @@ pub struct PerCidFailure {
 /// Convert PdsError to HTTP response
 impl IntoResponse for PdsError {
     fn into_response(self) -> Response {
+        // RFC 9449 §9: a resource server asks for a DPoP nonce with this
+        // challenge; the nonce itself is added by the DPoP-Nonce layer (#486).
+        if matches!(self, PdsError::UseDpopNonce) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    r#"DPoP algs="ES256", error="use_dpop_nonce", error_description="Resource server requires nonce in DPoP proof""#,
+                )],
+                Json(XrpcErrorResponse {
+                    error: "use_dpop_nonce".to_string(),
+                    message: self.to_string(),
+                    cid: None,
+                    public_reason: None,
+                    per_cid_failures: None,
+                }),
+            )
+                .into_response();
+        }
+
         // chainlink #104 Fix 2a: capture the underlying error Display
         // BEFORE the match consumes self, so 5xx responses can log it
         // server-side. The HTTP body intentionally strips this detail
@@ -927,6 +955,12 @@ impl IntoResponse for PdsError {
             PdsError::InvalidAuthFactorToken => (
                 StatusCode::UNAUTHORIZED,
                 "InvalidToken",
+                self.to_string(),
+            ),
+            // Answered above with its challenge header; kept for completeness.
+            PdsError::UseDpopNonce => (
+                StatusCode::UNAUTHORIZED,
+                "use_dpop_nonce",
                 self.to_string(),
             ),
             PdsError::DidTombstoned(_) => (

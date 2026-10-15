@@ -204,14 +204,15 @@ flate2 = "1.1.5"
 # (Phase 3.8 / chainlink #105 / docs/AURORA_ADMIN_UI_DESIGN.md §8.7).
 tar = "0.4"
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+# HMAC-SHA256 for the stateless DPoP server nonces (src/oauth/dpop_nonce.rs,
+# #486). Also used by the service_auth.rs algorithm-confusion negative tests
+# (§5.4.1) to forge an HS256 attacker token. Already in the build graph
+# through the RustCrypto stack.
+hmac = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
-# HMAC-SHA256 used in service_auth.rs algorithm-confusion negative
-# tests (§5.4.1) to forge a realistic HS256 attacker token signed
-# with the ES256K public key as secret. Test-only.
-hmac = "0.12"
 # Capture tracing log lines in AdminAuthContext extractor tests
 # (§5.4.2 / §5.3.5) so per-cause logging assertions are first-class.
 tracing-test = "0.2"

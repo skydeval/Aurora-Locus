@@ -67,6 +67,12 @@ pub struct DPopClaims {
     /// (no access token exists yet).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ath: Option<String>,
+
+    /// Server-issued nonce (RFC 9449 §8), echoed from the last `DPoP-Nonce`
+    /// response header. Aurora requires it on its own OAuth endpoints and
+    /// DPoP-authenticated requests (#486).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<String>,
 }
 
 /// JWK (JSON Web Key) representation from DPoP proof header
@@ -662,6 +668,7 @@ mod tests {
             iat: Utc::now().timestamp(),
             exp: Some(Utc::now().timestamp() + 60),
             ath: None,
+            nonce: None,
         };
 
         let json = serde_json::to_string(&claims).unwrap();
@@ -681,6 +688,7 @@ mod tests {
             iat: 0,
             exp: Some(60),
             ath: Some("EXPECTED_ATH_VALUE".to_string()),
+            nonce: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(json.contains("\"ath\":\"EXPECTED_ATH_VALUE\""));
@@ -700,6 +708,7 @@ mod tests {
             iat: 0,
             exp: Some(60),
             ath: None,
+            nonce: None,
         };
         let json = serde_json::to_string(&claims).unwrap();
         assert!(!json.contains("ath"), "serialized: {}", json);
@@ -1009,6 +1018,7 @@ mod tests {
             // clients send.
             exp: None,
             ath,
+            nonce: None,
         }
     }
 
