@@ -1231,9 +1231,11 @@ impl IntoResponse for PdsError {
                 "KryphocronCascadeWriteRejected",
                 self.to_string(),
             ),
+            // The lexicons' error name for a failed swap (putRecord,
+            // deleteRecord, applyWrites and the kryphocron procedures).
             PdsError::SwapCidMismatch(_) => (
                 StatusCode::CONFLICT,
-                "SwapCidMismatch",
+                "InvalidSwap",
                 self.to_string(),
             ),
             PdsError::KryphocronBindPipelineOutsideScope => (

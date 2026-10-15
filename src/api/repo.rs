@@ -47,12 +47,31 @@ struct CreateRecordRequest {
     swap_commit: Option<String>,
 }
 
-/// Response from creating a record
+/// Response from creating a record: the record's URI and CID (the stored
+/// record's, not the commit's), and the commit that wrote it.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateRecordResponse {
     uri: String,
     cid: String,
+    commit: CommitMeta,
+}
+
+/// `com.atproto.repo.defs#commitMeta`: the commit a write landed in.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitMeta {
+    cid: String,
+    rev: String,
+}
+
+impl CommitMeta {
+    fn of(outcome: &crate::actor_store::repository::CommitOutcome) -> Self {
+        Self {
+            cid: outcome.commit_cid.clone(),
+            rev: outcome.rev.clone(),
+        }
+    }
 }
 
 /// Request to update a record
@@ -74,12 +93,13 @@ struct PutRecordRequest {
     swap_record: Option<String>,
 }
 
-/// Response from updating a record
+/// Response from updating a record: as [`CreateRecordResponse`].
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PutRecordResponse {
     uri: String,
     cid: String,
+    commit: CommitMeta,
 }
 
 /// Request to delete a record
@@ -481,7 +501,7 @@ async fn create_record(
     // rather than by this handler — see the `.with_blob_store(...)`
     // builder call above.
     tracing::debug!("create_record: Calling repo_mgr.create_record");
-    let (uri, cid, _rev) = repo_mgr
+    let outcome = repo_mgr
         .create_record(
             &req.collection,
             req.rkey.as_deref(),
@@ -494,6 +514,8 @@ async fn create_record(
             tracing::error!("create_record: Failed to create record: {}", e);
             e
         })?;
+    let cid = outcome.single_record_cid()?;
+    let uri = outcome.results[0].uri.clone();
 
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
@@ -515,7 +537,11 @@ async fn create_record(
         }
     }
 
-    Ok(Json(CreateRecordResponse { uri, cid }))
+    Ok(Json(CreateRecordResponse {
+        uri,
+        cid,
+        commit: CommitMeta::of(&outcome),
+    }))
 }
 
 /// Update an existing record, or create if it doesn't exist
@@ -593,7 +619,7 @@ async fn put_record(
     // Step 2: blob-ref add/drop is computed in Phase B via
     // `read_existing_refs` + set differences; see the
     // `.with_blob_store(...)` builder call above.
-    let (cid, _rev) = repo_mgr
+    let outcome = repo_mgr
         .put_record(
             &req.collection,
             &req.rkey,
@@ -609,7 +635,11 @@ async fn put_record(
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
 
-    Ok(Json(PutRecordResponse { uri, cid }))
+    Ok(Json(PutRecordResponse {
+        uri,
+        cid: outcome.single_record_cid()?,
+        commit: CommitMeta::of(&outcome),
+    }))
 }
 
 /// Delete a record (`com.atproto.repo.deleteRecord`).
@@ -682,14 +712,18 @@ async fn delete_record(
     // (#450). Arc 16e §9.5.4 Step 2: blob refs for the record are
     // unreferenced in Phase B via the wired `blob_store`; see the
     // `.with_blob_store(...)` builder call above.
-    repo_mgr
+    let commit = repo_mgr
         .delete_record(&req.collection, &req.rkey, req.swap_record, signer)
         .await?;
 
     // Invalidate read-after-write cache for this user
     ctx.cache_invalidator.invalidate_did(auth_did).await;
 
-    Ok(Json(serde_json::json!({})))
+    // The commit the delete landed in; none when the record was already gone.
+    Ok(Json(match commit {
+        Some((cid, rev)) => serde_json::json!({ "commit": { "cid": cid, "rev": rev } }),
+        None => serde_json::json!({}),
+    }))
 }
 
 /// Get a record
@@ -1094,20 +1128,43 @@ async fn apply_writes(
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
 
     // Apply batch atomically (includes validation)
-    let (commit_cid, rev) = repo_mgr.apply_batch_writes(prepared, signer).await?;
+    let outcome = repo_mgr.apply_batch_writes_detailed(prepared, signer).await?;
 
     tracing::info!(
         "Successfully committed batch for {} (rev: {})",
         auth_did,
-        rev
+        outcome.rev
     );
 
-    Ok(Json(serde_json::json!({
-        "commit": {
-            "cid": commit_cid,
-            "rev": rev,
-        }
-    })))
+    Ok(Json(apply_writes_body(&outcome)))
+}
+
+/// The `applyWrites` answer: the commit, and one result per write in the
+/// order given, each create and update with the stored record's CID.
+fn apply_writes_body(outcome: &crate::actor_store::repository::CommitOutcome) -> serde_json::Value {
+    let results: Vec<serde_json::Value> = outcome
+        .results
+        .iter()
+        .map(|result| match result.action {
+            WriteOpAction::Create => serde_json::json!({
+                "$type": "com.atproto.repo.applyWrites#createResult",
+                "uri": result.uri,
+                "cid": result.cid,
+            }),
+            WriteOpAction::Update => serde_json::json!({
+                "$type": "com.atproto.repo.applyWrites#updateResult",
+                "uri": result.uri,
+                "cid": result.cid,
+            }),
+            WriteOpAction::Delete => serde_json::json!({
+                "$type": "com.atproto.repo.applyWrites#deleteResult",
+            }),
+        })
+        .collect();
+    serde_json::json!({
+        "commit": CommitMeta::of(outcome),
+        "results": results,
+    })
 }
 
 /// Query parameters for listMissingBlobs
@@ -1461,6 +1518,44 @@ mod apply_writes_shape_tests {
             .expect("deserialize WriteOpInput")
             .into_write_op()
             .expect("normalize to WriteOp")
+    }
+
+    #[test]
+    fn apply_writes_answers_a_result_per_write_with_record_cids() {
+        use crate::actor_store::repository::{CommitOutcome, WriteResult};
+        let outcome = CommitOutcome {
+            commit_cid: "bafycommit".to_string(),
+            rev: "3rev".to_string(),
+            results: vec![
+                WriteResult {
+                    action: WriteOpAction::Create,
+                    uri: "at://did:plc:a/app.bsky.feed.post/1".to_string(),
+                    cid: Some("bafyrecord1".to_string()),
+                },
+                WriteResult {
+                    action: WriteOpAction::Update,
+                    uri: "at://did:plc:a/app.bsky.actor.profile/self".to_string(),
+                    cid: Some("bafyrecord2".to_string()),
+                },
+                WriteResult {
+                    action: WriteOpAction::Delete,
+                    uri: "at://did:plc:a/app.bsky.feed.like/2".to_string(),
+                    cid: None,
+                },
+            ],
+        };
+        let body = apply_writes_body(&outcome);
+        assert_eq!(body["commit"], serde_json::json!({"cid": "bafycommit", "rev": "3rev"}));
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["$type"], "com.atproto.repo.applyWrites#createResult");
+        assert_eq!(results[0]["cid"], "bafyrecord1");
+        assert_eq!(results[1]["$type"], "com.atproto.repo.applyWrites#updateResult");
+        assert_eq!(results[1]["uri"], "at://did:plc:a/app.bsky.actor.profile/self");
+        assert_eq!(
+            results[2],
+            serde_json::json!({"$type": "com.atproto.repo.applyWrites#deleteResult"})
+        );
     }
 
     #[test]

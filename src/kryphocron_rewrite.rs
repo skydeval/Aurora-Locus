@@ -517,6 +517,7 @@ async fn prepare_record_rewrite(
         swap_cid: None,
         kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
             capability_class: CapabilityClass::User,
+            prior: None,
         }),
     }))
 }

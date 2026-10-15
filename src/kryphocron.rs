@@ -163,6 +163,33 @@ pub fn build_deny_map() -> HashMap<(String, WriteOpAction), KryphocronDenyVarian
             ),
         },
     );
+    // A-9 / A-4: a private post's audience changes through updatePostPrivate;
+    // an audience is updated through manageAudience and deleted through
+    // deleteAudience.
+    for (nsid, action, procedure) in [
+        (
+            crate::api::kryphocron_endpoints::NSID_POST_PRIVATE,
+            WriteOpAction::Update,
+            crate::api::kryphocron_endpoints::PROC_UPDATE_POST_PRIVATE,
+        ),
+        (
+            crate::api::kryphocron_endpoints::NSID_AUDIENCE,
+            WriteOpAction::Update,
+            crate::api::kryphocron_endpoints::PROC_MANAGE_AUDIENCE,
+        ),
+        (
+            crate::api::kryphocron_endpoints::NSID_AUDIENCE,
+            WriteOpAction::Delete,
+            crate::api::kryphocron_endpoints::PROC_DELETE_AUDIENCE,
+        ),
+    ] {
+        map.insert(
+            (nsid.to_string(), action),
+            KryphocronDenyVariant::RequiresDedicatedEndpoint {
+                suggested_endpoint: Some(procedure.to_string()),
+            },
+        );
+    }
     // graph.block Create/Delete → dedicated endpoints (Arc H §7.2.5 / #281).
     // Generic createRecord/deleteRecord on graph.block now returns 400 with the
     // dedicated procedure suggested (mirrors postPrivate). Update stays at the
@@ -318,8 +345,13 @@ pub enum KryphocronWriteAuthorization {
     /// endpoint (arc 2 step 5). Bind pipeline has been invoked (or
     /// skipped explicitly for Public-tier records) and authorized this
     /// write. `capability_class` matches the operation's class for
-    /// audit-emit payload rendering.
-    DedicatedEndpoint { capability_class: CapabilityClass },
+    /// audit-emit payload rendering. `prior` is the record an update or
+    /// delete replaces, as the endpoint read it (`None` for a create), so
+    /// the audience audit can name what changed (A-4).
+    DedicatedEndpoint {
+        capability_class: CapabilityClass,
+        prior: Option<serde_json::Value>,
+    },
 
     /// The write is a cascade from another authorized operation
     /// (e.g., bsky-side delete cascading to kryphocron companion,
@@ -519,6 +551,70 @@ fn reject_cascade_write(
     ))
 }
 
+/// What an audience write changed, for its `KryphocronAudienceUpdated` audit.
+#[derive(Debug, PartialEq, Eq)]
+struct AudienceChange {
+    members_added: Vec<String>,
+    members_removed: Vec<String>,
+    members_total_after: i64,
+    mode_before: Option<String>,
+    mode_after: String,
+    name: Option<String>,
+}
+
+/// Compare an audience record before a write (`None` for a create) with the
+/// record after it (`None` for a delete). A record without `mode` reads as
+/// `list`. A delete reports every member as removed, no member after, and
+/// the deleted record's mode and name.
+fn audience_change(
+    before: Option<&serde_json::Value>,
+    after: Option<&serde_json::Value>,
+) -> AudienceChange {
+    fn members(record: Option<&serde_json::Value>) -> Vec<String> {
+        record
+            .and_then(|v| v.get("members"))
+            .and_then(|m| m.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn field(record: Option<&serde_json::Value>, key: &str) -> Option<String> {
+        record
+            .and_then(|v| v.get(key))
+            .and_then(|m| m.as_str())
+            .map(String::from)
+    }
+    let mode = |record: Option<&serde_json::Value>| {
+        record.map(|_| field(record, "mode").unwrap_or_else(|| "list".to_string()))
+    };
+
+    let before_members = members(before);
+    let after_members = members(after);
+    let members_added = after_members
+        .iter()
+        .filter(|m| !before_members.contains(m))
+        .cloned()
+        .collect();
+    let members_removed = before_members
+        .iter()
+        .filter(|m| !after_members.contains(m))
+        .cloned()
+        .collect();
+    AudienceChange {
+        members_added,
+        members_removed,
+        members_total_after: after_members.len() as i64,
+        mode_before: mode(before),
+        mode_after: mode(after)
+            .or_else(|| mode(before))
+            .unwrap_or_else(|| "list".to_string()),
+        name: field(after, "name").or_else(|| field(before, "name")),
+    }
+}
+
 pub async fn bind_pipeline(
     write_op: &crate::actor_store::repository::WriteOp,
     shared_tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -567,7 +663,10 @@ pub async fn bind_pipeline(
     };
 
     match auth {
-        KryphocronWriteAuthorization::DedicatedEndpoint { capability_class } => {
+        KryphocronWriteAuthorization::DedicatedEndpoint {
+            capability_class,
+            prior,
+        } => {
             tracing::info!(
                 target: "aurora_locus::kryphocron",
                 event = "kryphocron_bind_pipeline_authorized",
@@ -622,48 +721,21 @@ pub async fn bind_pipeline(
                     }
                 };
 
-                // Arc 2 step 7 ships a minimal payload — the
-                // mode / member-diff / cascade-field extraction
-                // requires walking the record body and the
-                // resume-state table. Post-arc-2 cycles can
-                // tighten this without re-shaping the event
-                // surface (the payload struct's shape is the
-                // design's §4 shape). Members are emitted as the
-                // raw `did:plc:...` list from the record body if
-                // present; mode is read from the record's
-                // top-level `mode` field if present, defaulting
-                // to `"list"`.
-                let value = write_op.value.as_ref();
-                let mode_after = value
-                    .and_then(|v| v.get("mode"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("list")
-                    .to_string();
-                let members_added = value
-                    .and_then(|v| v.get("members"))
-                    .and_then(|m| m.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let members_total_after = members_added.len() as i64;
-                let name = value
-                    .and_then(|v| v.get("name"))
-                    .and_then(|m| m.as_str())
-                    .map(String::from);
+                // The record after the write (`None` for a delete) and the
+                // one it replaces (`None` for a create), as the endpoint
+                // read it. Members are compared as the raw DID lists.
+                let change = audience_change(prior.as_ref(), write_op.value.as_ref());
 
                 let payload = crate::kryphocron_audit::AudienceUpdatedPayload {
                     audience_uri,
                     owner_did: did.to_string(),
                     operation,
-                    members_added,
-                    members_removed: vec![],
-                    members_total_after,
-                    mode_before: None,
-                    mode_after,
-                    name,
+                    members_added: change.members_added,
+                    members_removed: change.members_removed,
+                    members_total_after: change.members_total_after,
+                    mode_before: change.mode_before,
+                    mode_after: change.mode_after,
+                    name: change.name,
                     origin: crate::kryphocron_audit::AudienceOrigin::User,
                     cascade_id: None,
                     cascade_reassigned_to: None,
@@ -1064,6 +1136,7 @@ mod bind_pipeline_tests {
             "tools.kryphocron.feed.postPrivate",
             KryphocronWriteAuthorization::DedicatedEndpoint {
                 capability_class: CapabilityClass::User,
+                prior: None,
             },
         );
 
@@ -1610,8 +1683,8 @@ mod deny_map_step_5_tests {
     use super::*;
     use crate::api::kryphocron_endpoints::{
         NSID_AUDIENCE, NSID_BLOCK, NSID_POST_PRIVATE, PROC_CREATE_BLOCK,
-        PROC_CREATE_POST_PRIVATE, PROC_DELETE_BLOCK, PROC_DELETE_POST_PRIVATE,
-        PROC_MANAGE_AUDIENCE,
+        PROC_CREATE_POST_PRIVATE, PROC_DELETE_AUDIENCE, PROC_DELETE_BLOCK,
+        PROC_DELETE_POST_PRIVATE, PROC_MANAGE_AUDIENCE, PROC_UPDATE_POST_PRIVATE,
     };
 
     fn assert_dedicated_endpoint(
@@ -1681,12 +1754,29 @@ mod deny_map_step_5_tests {
         );
     }
 
-    /// Update action on postPrivate has no dedicated endpoint in
-    /// arc 2 — must stay at NotYetSupported.
+    /// A-9 / A-4: an update of a private post, and an update or delete of
+    /// an audience, point at their procedures.
     #[test]
-    fn post_private_update_stays_not_yet_supported() {
+    fn updates_and_audience_delete_route_to_their_procs() {
         let map = build_deny_map();
-        assert_not_yet_supported(&map, NSID_POST_PRIVATE, WriteOpAction::Update);
+        assert_dedicated_endpoint(
+            &map,
+            NSID_POST_PRIVATE,
+            WriteOpAction::Update,
+            PROC_UPDATE_POST_PRIVATE,
+        );
+        assert_dedicated_endpoint(
+            &map,
+            NSID_AUDIENCE,
+            WriteOpAction::Update,
+            PROC_MANAGE_AUDIENCE,
+        );
+        assert_dedicated_endpoint(
+            &map,
+            NSID_AUDIENCE,
+            WriteOpAction::Delete,
+            PROC_DELETE_AUDIENCE,
+        );
     }
 
     /// Adjacent registered NSID (`tools.kryphocron.feed.like`)
@@ -1718,5 +1808,59 @@ mod deny_map_step_5_tests {
         assert_dedicated_endpoint(&map, NSID_BLOCK, WriteOpAction::Create, PROC_CREATE_BLOCK);
         assert_dedicated_endpoint(&map, NSID_BLOCK, WriteOpAction::Delete, PROC_DELETE_BLOCK);
         assert_not_yet_supported(&map, NSID_BLOCK, WriteOpAction::Update);
+    }
+}
+
+#[cfg(test)]
+mod audience_change_tests {
+    //! A-4: the audience audit names what a write changed.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_create_adds_every_member() {
+        let after = json!({ "mode": "list", "members": ["did:plc:a", "did:plc:b"], "name": "n" });
+        let change = audience_change(None, Some(&after));
+        assert_eq!(change.members_added, vec!["did:plc:a", "did:plc:b"]);
+        assert!(change.members_removed.is_empty());
+        assert_eq!(change.members_total_after, 2);
+        assert_eq!(change.mode_before, None);
+        assert_eq!(change.mode_after, "list");
+        assert_eq!(change.name.as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn an_update_names_who_was_added_and_removed() {
+        let before = json!({ "mode": "list", "members": ["did:plc:a", "did:plc:b"], "name": "old" });
+        let after = json!({ "mode": "list", "members": ["did:plc:b", "did:plc:c"], "name": "new" });
+        let change = audience_change(Some(&before), Some(&after));
+        assert_eq!(change.members_added, vec!["did:plc:c"]);
+        assert_eq!(change.members_removed, vec!["did:plc:a"]);
+        assert_eq!(change.members_total_after, 2);
+        assert_eq!(change.mode_before.as_deref(), Some("list"));
+        assert_eq!(change.name.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_mode_change_is_recorded_both_ways() {
+        let before = json!({ "mode": "followers" });
+        let after = json!({ "members": ["did:plc:a"] });
+        let change = audience_change(Some(&before), Some(&after));
+        assert_eq!(change.mode_before.as_deref(), Some("followers"));
+        // A record without `mode` reads as `list`.
+        assert_eq!(change.mode_after, "list");
+        assert_eq!(change.members_added, vec!["did:plc:a"]);
+    }
+
+    #[test]
+    fn a_delete_removes_every_member_and_keeps_the_mode() {
+        let before = json!({ "mode": "list", "members": ["did:plc:a"], "name": "gone" });
+        let change = audience_change(Some(&before), None);
+        assert!(change.members_added.is_empty());
+        assert_eq!(change.members_removed, vec!["did:plc:a"]);
+        assert_eq!(change.members_total_after, 0);
+        assert_eq!(change.mode_before.as_deref(), Some("list"));
+        assert_eq!(change.mode_after, "list");
+        assert_eq!(change.name.as_deref(), Some("gone"));
     }
 }
