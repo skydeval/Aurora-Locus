@@ -601,9 +601,17 @@ async fn delete_post_private(
 /// post that does not exist, an audience that does not admit the writer, a
 /// block, and a mismatched audience are the same response.
 ///
+/// **The thread check (#515).** The reply must belong to a thread under the
+/// audience it names: walking up from its parent, a post by the audience's
+/// owner is reached within a few posts, every post on the way names the
+/// audience, and `reply.root` is that thread's root, by the owner. Posts held
+/// elsewhere are fetched from their PDS within a fixed budget
+/// ([`crate::kryphocron_thread`]). A reply that fails it gets the same 403.
+///
 /// **Audiences held elsewhere.** When the audience's owner is not an account
-/// on this PDS its record cannot be read; the write is allowed and a warning
-/// is logged so the unchecked write is visible to the operator.
+/// on this PDS its record cannot be read, so who may write under it is not
+/// checked here (a warning is logged). The thread check still runs, so such a
+/// reply must still hang off the owner's thread.
 async fn participate_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -636,20 +644,50 @@ async fn participate_private(
         }
         ParticipateAudienceOutcome::Denied(payload) => {
             ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
-            let mut tx = ctx
-                .account_db
-                .begin()
-                .await
-                .map_err(PdsError::Database)?;
-            crate::kryphocron_audit::emit_audience_check_denied_in_tx(
-                &mut tx, auth_did.value(), payload,
-            )
-            .await?;
-            tx.commit().await.map_err(PdsError::Database)?;
-            return Err(PdsError::Authorization(
-                "Audience check denied".to_string(),
-            ));
+            return Err(refuse_participation(&ctx, auth_did.value(), payload).await);
         }
+    }
+
+    // #515 — the reply must belong to a thread under the audience it names:
+    // its chain reaches a post by the audience's owner, and its root is that
+    // thread's root. Same refusal as the audience check.
+    let owner = audience_owner(&audience_uri)
+        .ok_or_else(|| PdsError::Validation("invalid audience URI".to_string()))?;
+    if let Err(reason) = crate::kryphocron_thread::check_reply_thread(
+        &ctx,
+        auth_did.value(),
+        &req.record,
+        &audience_uri,
+        owner,
+    )
+    .await
+    {
+        if reason == crate::kryphocron_thread::Unanchored::RateLimited {
+            return Err(PdsError::RateLimitExceeded {
+                retry_after: std::time::Duration::from_secs(60),
+            });
+        }
+        tracing::warn!(
+            target: "aurora_locus::kryphocron",
+            event = "participate_private_thread_unanchored",
+            requester_did = %auth_did.value(),
+            parent_uri = %parent_uri,
+            audience_uri = %audience_uri,
+            reason = ?reason,
+            "reply refused: it is not part of a thread under its audience",
+        );
+        ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
+        let payload = AudienceCheckDeniedPayload {
+            capability_attempted: "ParticipatePrivate".to_string(),
+            subject_uri: parent_uri.clone(),
+            requester_did: auth_did.value().to_string(),
+            audience_uri: Some(audience_uri.clone()),
+            audience_mode: "unknown".to_string(),
+            audience_check_result: AudienceCheckResult::NoAudienceConfigured,
+            trace_id: crate::kryphocron_audit::synthesize_trace_id(),
+            payload_completeness: crate::kryphocron_audit::PayloadCompleteness::Full,
+        };
+        return Err(refuse_participation(&ctx, auth_did.value(), payload).await);
     }
 
     // #236 — encode-on-write floor (same seam as create_post_private),
@@ -675,6 +713,27 @@ async fn participate_private(
     )
     .await?;
     Ok(Json(resp))
+}
+
+/// Write the `KryphocronAudienceCheckDenied` event in its own short tx on the
+/// shared account DB and give the one refusal `participatePrivate` gives,
+/// whatever the cause. A failure to record the event is that error instead.
+async fn refuse_participation(
+    ctx: &AppContext,
+    writer_did: &str,
+    payload: AudienceCheckDeniedPayload,
+) -> PdsError {
+    let recorded = async {
+        let mut tx = ctx.account_db.begin().await.map_err(PdsError::Database)?;
+        crate::kryphocron_audit::emit_audience_check_denied_in_tx(&mut tx, writer_did, payload)
+            .await?;
+        tx.commit().await.map_err(PdsError::Database)
+    }
+    .await;
+    match recorded {
+        Ok(()) => PdsError::Authorization("Audience check denied".to_string()),
+        Err(e) => e,
+    }
 }
 
 /// Read what `participatePrivate` needs from the record: the parent post's
@@ -800,8 +859,9 @@ async fn check_participate_audience(
 
 /// Read and decode one stored record. `None` when the record or its block is
 /// absent, or when the block does not decode (logged): to the audience check
-/// each of those is a record that is not there.
-async fn load_record_json(
+/// and the thread check ([`crate::kryphocron_thread`]) each of those is a
+/// record that is not there.
+pub(crate) async fn load_record_json(
     ctx: &AppContext,
     did: &str,
     uri: &str,
@@ -1650,6 +1710,73 @@ mod procedure_tests {
             let err = update(&ctx, &alice, rkey, audience_list, None).await.unwrap_err();
             assert!(matches!(err, PdsError::Validation(_)), "{rkey} {audience_list}: {err:?}");
         }
+    }
+
+    async fn participate(
+        ctx: &AppContext,
+        did: &str,
+        record: serde_json::Value,
+    ) -> PdsResult<WriteResponse> {
+        participate_private(
+            State(ctx.clone()),
+            session(did),
+            Json(CreateLikeRequest {
+                repo: did.to_string(),
+                rkey: None,
+                validate: None,
+                record,
+            }),
+        )
+        .await
+        .map(|Json(resp)| resp)
+    }
+
+    fn reply_record(audience_uri: &str, root: &WriteResponse, parent_uri: &str) -> serde_json::Value {
+        let mut record = post_record(audience_uri);
+        record["reply"] = json!({
+            "root": { "uri": root.uri, "cid": root.cid },
+            "parent": { "uri": parent_uri, "cid": root.cid },
+        });
+        record
+    }
+
+    /// #515: a reply must hang off the audience owner's thread.
+    #[tokio::test]
+    async fn a_reply_must_belong_to_the_owners_thread() {
+        let mut ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        // Nothing elsewhere resolves: no test reaches the network.
+        ctx.identity_resolver =
+            std::sync::Arc::new(crate::identity::resolver::test_doubles::MockIdentityResolver::new());
+        let alice = account(&ctx, "alice").await;
+        let bob = account(&ctx, "bob").await;
+        let open = audience(&ctx, &alice, "aud", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let root = post(&ctx, &alice, post_record(&open.uri)).await;
+
+        // A reply to the owner's post is anchored.
+        let first = participate(&ctx, &bob, reply_record(&open.uri, &root, &root.uri))
+            .await
+            .expect("a reply in the owner's thread");
+        // So is a reply to that reply.
+        participate(&ctx, &alice, reply_record(&open.uri, &root, &first.uri))
+            .await
+            .expect("a reply further down the owner's thread");
+
+        // An invented parent on another PDS is refused.
+        let invented = format!("at://did:plc:elsewhere/{NSID_POST_PRIVATE}/3abc");
+        let err = participate(&ctx, &bob, reply_record(&open.uri, &root, &invented))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+
+        // A real parent paired with a root that is not its thread's.
+        let other_root = post(&ctx, &alice, post_record(&open.uri)).await;
+        let err = participate(&ctx, &bob, reply_record(&open.uri, &other_root, &first.uri))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
     }
 
     #[tokio::test]

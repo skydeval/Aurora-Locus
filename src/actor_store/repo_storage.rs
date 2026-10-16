@@ -912,59 +912,61 @@ mod step_3_5_tests {
         let actor_tx_2 = actor_pool.begin().await.expect("begin actor tx 2");
         let shared_tx_2 = shared_pool.begin().await.expect("begin shared tx 2");
 
-        let started_at = std::time::Instant::now();
-        let first_release = Arc::new(tokio::sync::Notify::new());
-        let first_release_notify = first_release.clone();
+        // The order of events, not their timing, is the property: the
+        // second scope must not begin before the first scope has ended.
+        // Timing thresholds failed whenever the build host was busy.
+        let first_entered = Arc::new(tokio::sync::Notify::new());
+        let first_entered_signal = first_entered.clone();
+        let first_exit: Arc<std::sync::Mutex<Option<std::time::Instant>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let first_exit_record = first_exit.clone();
 
         let storage_1 = storage.clone();
         let first = tokio::spawn(async move {
             let (a, s, r) = storage_1
                 .with_lent_txns(actor_tx_1, shared_tx_1, |_| async move {
+                    // The first scope holds the lent slot: the second call
+                    // starts only now, and holds on for a while so that it
+                    // would win the slot were the lend not serialized.
+                    first_entered_signal.notify_one();
                     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    *first_exit_record.lock().unwrap() = Some(std::time::Instant::now());
                     Ok::<_, PdsError>(())
                 })
                 .await
                 .expect("first with_lent_txns");
             r.expect("first scope ok");
-            first_release_notify.notify_one();
             (a.commit().await, s.commit().await)
         });
 
-        // Briefly yield so the first task gets to install its txns.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        first_entered.notified().await;
 
         let storage_2 = storage.clone();
         let second = tokio::spawn(async move {
-            let install_start = std::time::Instant::now();
             let (a, s, r) = storage_2
                 .with_lent_txns(actor_tx_2, shared_tx_2, |_| async move {
-                    Ok::<_, PdsError>(())
+                    Ok::<_, PdsError>(std::time::Instant::now())
                 })
                 .await
                 .expect("second with_lent_txns");
-            r.expect("second scope ok");
-            let install_done = install_start.elapsed();
-            (install_done, a.commit().await, s.commit().await)
+            let second_entry = r.expect("second scope ok");
+            (second_entry, a.commit().await, s.commit().await)
         });
 
         let (commit_a_1, commit_s_1) = first.await.expect("first joined");
-        let (second_install_elapsed, commit_a_2, commit_s_2) = second.await.expect("second joined");
+        let (second_entry, commit_a_2, commit_s_2) = second.await.expect("second joined");
         commit_a_1.expect("first actor commit ok");
         commit_s_1.expect("first shared commit ok");
         commit_a_2.expect("second actor commit ok");
         commit_s_2.expect("second shared commit ok");
 
-        let _ = first_release; // Keep the Notify alive
-        let total = started_at.elapsed();
+        let first_exit = first_exit
+            .lock()
+            .unwrap()
+            .expect("the first scope ran to its end");
         assert!(
-            total >= std::time::Duration::from_millis(140),
-            "concurrent lends must serialize — total elapsed {:?} < first scope's 150ms hold",
-            total,
-        );
-        assert!(
-            second_install_elapsed >= std::time::Duration::from_millis(120),
-            "second install must wait until first scope releases — observed {:?}",
-            second_install_elapsed,
+            second_entry >= first_exit,
+            "the second lend's scope began before the first lend's scope ended",
         );
     }
 
