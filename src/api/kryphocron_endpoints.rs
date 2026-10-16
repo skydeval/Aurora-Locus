@@ -519,42 +519,86 @@ fn require_own_audience(record: &serde_json::Value, writer_did: &str) -> PdsResu
     }
 }
 
-/// A reply written with `createPostPrivate` is in the writer's own thread and
-/// names its root's current audience. A record without a `reply` passes.
+/// Where a reply written with `createPostPrivate` may sit. A record without a
+/// `reply` passes. Otherwise it is one of:
+///
+/// - **a branch root** (A-13): its parent is a public post, so it starts a
+///   private branch under the writer's own audience (checked by
+///   [`require_own_audience`]); `reply.root` must then be public too (the
+///   public thread's root). Nothing is walked.
+/// - **a reply in the writer's own private thread or branch**, naming its
+///   root's (or branch root's) current audience ([`crate::kryphocron_thread`]).
+///
+/// A reply in another account's thread or branch goes through
+/// `participatePrivate`.
 async fn require_own_thread(
     ctx: &AppContext,
     record: &serde_json::Value,
     writer_did: &str,
 ) -> PdsResult<()> {
+    use crate::kryphocron_thread::{is_private, reply_uri, Unanchored};
     if record.get("reply").is_none_or(|reply| reply.is_null()) {
         return Ok(());
     }
-    let root_author = record
-        .get("reply")
-        .and_then(|reply| reply.get("root"))
-        .and_then(|root| root.get("uri"))
-        .and_then(|uri| uri.as_str())
-        .and_then(parse_record_uri)
-        .map(|uri| uri.did);
-    if root_author != Some(writer_did) {
-        return Err(PdsError::Validation(format!(
-            "{PROC_CREATE_POST_PRIVATE} replies only in the writer's own thread; to reply \
-             in another account's thread use {PROC_PARTICIPATE_PRIVATE}"
-        )));
+    let (Some(parent_uri), Some(root_uri)) = (reply_uri(record, "parent"), reply_uri(record, "root"))
+    else {
+        return Err(PdsError::Validation(
+            "record.reply needs parent.uri and root.uri, each an at:// record URI".to_string(),
+        ));
+    };
+    if !is_private(&parent_uri) {
+        if is_private(&root_uri) {
+            return Err(PdsError::Validation(
+                "a reply to a public post sits in a public thread: its reply.root is that \
+                 thread's public root"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    }
+    // Someone else's private thread: refused before anything is read.
+    if is_private(&root_uri) && parse_record_uri(&root_uri).map(|uri| uri.did) != Some(writer_did) {
+        return Err(not_own_thread());
     }
     let AudienceRef::Uri(audience_uri) = audience_reference(record) else {
         return Err(PdsError::Validation(
-            "a reply names its thread's audience: the root's current audienceList".to_string(),
+            "a reply names its thread's audience: the current audienceList of its root \
+             (or of its branch's root)"
+                .to_string(),
         ));
     };
-    crate::kryphocron_thread::check_reply_thread(ctx, writer_did, record, &audience_uri)
-        .await
-        .map_err(|reason| {
-            PdsError::Validation(format!(
-                "a reply in the writer's own thread must name the root's current \
-                 audienceList, under a root that exists and is not itself a reply ({reason:?})"
-            ))
-        })
+    // Every refusal past this point is the same answer: the walk may read
+    // other accounts' private posts (a branch is found by walking up to it),
+    // and a reason would tell the caller whether such a post exists or which
+    // public post it sits under. The reason is logged instead.
+    match crate::kryphocron_thread::check_reply_thread(ctx, writer_did, record, &audience_uri).await
+    {
+        Ok(anchor) if anchor.author == writer_did => Ok(()),
+        Err(Unanchored::RateLimited) => Err(PdsError::RateLimitExceeded {
+            retry_after: std::time::Duration::from_secs(60),
+        }),
+        outcome => {
+            tracing::info!(
+                target: "aurora_locus::kryphocron",
+                event = "create_post_private_reply_refused",
+                writer_did = %writer_did,
+                outcome = ?outcome,
+                "createPostPrivate reply refused: not in the writer's own thread or branch \
+                 under its current audience",
+            );
+            Err(not_own_thread())
+        }
+    }
+}
+
+/// The one refusal for a `createPostPrivate` reply that is not in the
+/// writer's own thread or branch, under its root's current audience.
+fn not_own_thread() -> PdsError {
+    PdsError::Validation(format!(
+        "{PROC_CREATE_POST_PRIVATE} replies only in the writer's own thread or branch, naming \
+         its root's current audienceList; to reply in another account's use \
+         {PROC_PARTICIPATE_PRIVATE}"
+    ))
 }
 
 /// `tools.kryphocron.feed.createPostPrivate` — create a
@@ -709,6 +753,12 @@ async fn participate_private(
             return Err(PdsError::RateLimitExceeded {
                 retry_after: std::time::Duration::from_secs(60),
             });
+        }
+        if reason == crate::kryphocron_thread::Unanchored::BranchRoot {
+            return Err(PdsError::Validation(format!(
+                "a private reply to a public post starts a private branch under one of the \
+                 writer's own audiences; write it with {PROC_CREATE_POST_PRIVATE}"
+            )));
         }
         tracing::warn!(
             target: "aurora_locus::kryphocron",
@@ -1001,8 +1051,10 @@ async fn delete_audience(
 /// answer carries the new record CID.
 ///
 /// Refused with 400 `InvalidRequest`: no such post; a reply (a reply's
-/// audience is its thread's); an `audienceList` that is not one of the
-/// writer's own audience records, or names one that does not exist.
+/// audience is its thread's), except a branch root, a private reply to a
+/// public post, which anchors its branch as a root anchors its thread
+/// (A-13); an `audienceList` that is not one of the writer's own audience
+/// records, or names one that does not exist.
 /// `swapRecord` must be the post's current CID (409 `InvalidSwap`).
 ///
 /// The change applies downthread (A-12): replies already written keep their
@@ -1039,9 +1091,15 @@ async fn update_post_private(
             req.rkey
         )));
     };
-    if current.value.get("reply").is_some_and(|reply| !reply.is_null()) {
+    // A branch root (A-13: a private reply whose parent is public) anchors its
+    // branch as a root anchors its thread, so its author may move it; any
+    // other reply's audience is its thread's or branch's.
+    let is_branch_root = crate::kryphocron_thread::reply_uri(&current.value, "parent")
+        .is_some_and(|parent| !crate::kryphocron_thread::is_private(&parent));
+    if current.value.get("reply").is_some_and(|reply| !reply.is_null()) && !is_branch_root {
         return Err(PdsError::Validation(
-            "a reply's audience is its thread's and cannot be changed".to_string(),
+            "a reply's audience is its thread's (or its branch's) and cannot be changed"
+                .to_string(),
         ));
     }
     let path = format!("{NSID_POST_PRIVATE}/{}", req.rkey);
@@ -1889,6 +1947,188 @@ mod procedure_tests {
         )
         .await
         .expect("the root's author replies under the current audience");
+    }
+
+    /// Write a stock record into `did`'s repository.
+    async fn stock_record(
+        ctx: &AppContext,
+        did: &str,
+        collection: &str,
+        record: serde_json::Value,
+    ) -> String {
+        let outcome = RepositoryManager::for_writer(ctx, did.to_string())
+            .create_record(
+                collection,
+                None,
+                record,
+                Some(false),
+                create_actor_signer(&ctx.account_manager, did).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        outcome.results[0].uri.clone()
+    }
+
+    async fn follow(ctx: &AppContext, from: &str, to: &str) {
+        stock_record(
+            ctx,
+            from,
+            "app.bsky.graph.follow",
+            json!({ "$type": "app.bsky.graph.follow", "subject": to,
+                    "createdAt": "2026-10-16T00:00:00Z" }),
+        )
+        .await;
+    }
+
+    /// A-13, Horizon's "done when": private branches under a public post.
+    #[tokio::test]
+    async fn a_private_branch_hangs_off_a_public_post() {
+        let mut ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        ctx.identity_resolver =
+            std::sync::Arc::new(crate::identity::resolver::test_doubles::MockIdentityResolver::new());
+        let alice = account(&ctx, "alice").await;
+        let bob = account(&ctx, "bob").await;
+        let carol = account(&ctx, "carol").await;
+        let dave = account(&ctx, "dave").await;
+
+        // A's public post.
+        let public = stock_record(
+            &ctx,
+            &alice,
+            "app.bsky.feed.post",
+            json!({ "$type": "app.bsky.feed.post", "text": "hello",
+                    "createdAt": "2026-10-16T00:00:00Z" }),
+        )
+        .await;
+        let public_ref = WriteResponse {
+            uri: public.clone(),
+            cid: "bafypublic".to_string(),
+        };
+
+        // B replies privately under B's followers audience: a branch root.
+        let followers = audience(&ctx, &bob, "followers", json!({ "mode": "followers" }), None)
+            .await
+            .unwrap();
+        let branch_root = post(&ctx, &bob, reply_record(&followers.uri, &public_ref, &public)).await;
+
+        // C follows B and replies in the branch; D does not follow B.
+        follow(&ctx, &carol, &bob).await;
+
+        // Starting a branch is its author's own write: even an admitted
+        // follower cannot start one under B's audience.
+        let err = participate(&ctx, &carol, reply_record(&followers.uri, &public_ref, &public))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+        let carols = participate(&ctx, &carol, reply_record(&followers.uri, &public_ref, &branch_root.uri))
+            .await
+            .expect("a follower of the branch's author replies in it");
+
+        // Only a branch root may be moved; a reply inside the branch may not.
+        let carols_own = audience(&ctx, &carol, "own", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let err = update(&ctx, &carol, rkey_of(&carols.uri), &carols_own.uri, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+        let err = participate(&ctx, &dave, reply_record(&followers.uri, &public_ref, &branch_root.uri))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+
+        // B moves the branch root to a list with D but not C.
+        let close = audience(&ctx, &bob, "close", json!({ "mode": "list", "members": [dave] }), None)
+            .await
+            .unwrap();
+        update(&ctx, &bob, rkey_of(&branch_root.uri), &close.uri, None)
+            .await
+            .expect("a branch root can be moved");
+
+        participate(&ctx, &dave, reply_record(&close.uri, &public_ref, &branch_root.uri))
+            .await
+            .expect("a member added by the move replies in the branch");
+
+        // A member whose reply does not hang off the branch (it claims another
+        // public root) gets the one 403.
+        let other_public = WriteResponse {
+            uri: format!("at://{alice}/app.bsky.feed.post/3other22"),
+            cid: "bafyother".to_string(),
+        };
+        let err = participate(&ctx, &dave, reply_record(&close.uri, &other_public, &branch_root.uri))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+        for audience_uri in [&close.uri, &followers.uri] {
+            let err = participate(&ctx, &carol, reply_record(audience_uri, &public_ref, &branch_root.uri))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::Authorization(_)), "{audience_uri}: {err:?}");
+        }
+
+        // B replies in B's own branch with createPostPrivate, under its
+        // current audience; under the old one it is refused.
+        let bobs = |audience_uri: &str| CreateLikeRequest {
+            repo: bob.clone(),
+            rkey: None,
+            validate: None,
+            record: reply_record(audience_uri, &public_ref, &branch_root.uri),
+        };
+        let err = create_post_private(State(ctx.clone()), session(&bob), Json(bobs(&followers.uri)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+        let _stored = create_post_private(State(ctx.clone()), session(&bob), Json(bobs(&close.uri)))
+            .await
+            .expect("the branch's author replies in it");
+
+        // Someone else's branch is not the writer's own: participatePrivate.
+        // Whatever the walk found, the refusal is the same words, so it tells
+        // nothing about other accounts' private posts.
+        let daves_own = audience(&ctx, &dave, "own", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let daves = |parent_uri: &str| CreateLikeRequest {
+            repo: dave.clone(),
+            rkey: None,
+            validate: None,
+            record: reply_record(&daves_own.uri, &public_ref, parent_uri),
+        };
+        let missing = format!("at://{bob}/{NSID_POST_PRIVATE}/3nosuchpost22");
+        let mut refusals = Vec::new();
+        for parent in [branch_root.uri.as_str(), missing.as_str(), carols.uri.as_str()] {
+            let err = create_post_private(State(ctx.clone()), session(&dave), Json(daves(parent)))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::Validation(_)), "{parent}: {err:?}");
+            refusals.push(err.to_string());
+        }
+        assert!(
+            refusals.windows(2).all(|pair| pair[0] == pair[1]),
+            "one refusal, whatever the cause: {refusals:?}"
+        );
+
+        // A reply to a public post sits in a public thread: its root is public.
+        let private_root = WriteResponse {
+            uri: branch_root.uri.clone(),
+            cid: branch_root.cid.clone(),
+        };
+        let mut misplaced = reply_record(&daves_own.uri, &private_root, &public);
+        misplaced["reply"]["parent"]["uri"] = json!(public);
+        let err = create_post_private(
+            State(ctx.clone()),
+            session(&dave),
+            Json(CreateLikeRequest {
+                repo: dave.clone(),
+                rkey: None,
+                validate: None,
+                record: misplaced,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
     }
 
     #[tokio::test]
