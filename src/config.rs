@@ -1258,22 +1258,64 @@ pub struct KryphocronConfig {
     /// state is behaviorally indistinguishable from "not compiled in"
     /// for clients.
     pub enabled: bool,
+
+    /// How far up a private reply's chain the write check walks to find its
+    /// anchor: a post by the thread root's author, or the branch root
+    /// (`PDS_KRYPHOCRON_MAX_CHAIN`, #515 / A-13). A reply deeper than this
+    /// below its anchor is refused. Default [`DEFAULT_PRIVATE_MAX_CHAIN`],
+    /// at most [`MAX_PRIVATE_MAX_CHAIN`]; set it to the AppView's read-side
+    /// bound so what is stored is what is served.
+    #[serde(default = "default_private_max_chain")]
+    pub private_max_chain: usize,
+}
+
+/// The default walk bound for private replies: the AppView's default too.
+pub const DEFAULT_PRIVATE_MAX_CHAIN: usize = 16;
+
+/// The largest walk bound for private replies an operator may set.
+pub const MAX_PRIVATE_MAX_CHAIN: usize = 100;
+
+fn default_private_max_chain() -> usize {
+    DEFAULT_PRIVATE_MAX_CHAIN
 }
 
 impl Default for KryphocronConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            private_max_chain: DEFAULT_PRIVATE_MAX_CHAIN,
+        }
     }
 }
 
-
 impl KryphocronConfig {
     /// Build a [`KryphocronConfig`] from already-extracted env values.
-    /// Single-knob in arc 1; later arcs add fields here.
-    pub fn from_env_values(enabled: Option<String>) -> PdsResult<Self> {
+    ///
+    /// # Errors
+    ///
+    /// `PdsError::Validation` when a value does not parse, or the walk bound
+    /// is outside 1..=[`MAX_PRIVATE_MAX_CHAIN`].
+    pub fn from_env_values(
+        enabled: Option<String>,
+        private_max_chain: Option<String>,
+    ) -> PdsResult<Self> {
         let defaults = Self::default();
         let enabled = parse_bool_env("PDS_KRYPHOCRON_ENABLED", enabled, defaults.enabled)?;
-        Ok(Self { enabled })
+        let private_max_chain = parse_usize_env(
+            "PDS_KRYPHOCRON_MAX_CHAIN",
+            private_max_chain,
+            defaults.private_max_chain,
+        )?;
+        if !(1..=MAX_PRIVATE_MAX_CHAIN).contains(&private_max_chain) {
+            return Err(PdsError::Validation(format!(
+                "PDS_KRYPHOCRON_MAX_CHAIN must be between 1 and {MAX_PRIVATE_MAX_CHAIN} \
+                 (got: {private_max_chain})"
+            )));
+        }
+        Ok(Self {
+            enabled,
+            private_max_chain,
+        })
     }
 }
 
@@ -2000,6 +2042,7 @@ impl ServerConfig {
         // PDS_KRYPHOCRON_ENABLED=false to opt out.
         let kryphocron = KryphocronConfig::from_env_values(
             env::var("PDS_KRYPHOCRON_ENABLED").ok(),
+            env::var("PDS_KRYPHOCRON_MAX_CHAIN").ok(),
         )?;
 
         // Arc 12 §5.3.2 Gap 1: public_url override via env var.
@@ -2914,6 +2957,32 @@ mod env_example_lint_tests {
                  component path can uncomment. See chainlink #94.",
                 key,
                 active_line,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod kryphocron_config_tests {
+    use super::*;
+
+    #[test]
+    fn the_private_walk_bound_defaults_to_the_appviews_default() {
+        let config = KryphocronConfig::from_env_values(None, None).unwrap();
+        assert_eq!(config.private_max_chain, DEFAULT_PRIVATE_MAX_CHAIN);
+        assert_eq!(KryphocronConfig::default().private_max_chain, 16);
+    }
+
+    #[test]
+    fn the_private_walk_bound_is_one_to_a_hundred() {
+        for ok in ["1", "16", "100"] {
+            let config = KryphocronConfig::from_env_values(None, Some(ok.to_string())).unwrap();
+            assert_eq!(config.private_max_chain.to_string(), ok);
+        }
+        for refused in ["0", "101", "-1", "many"] {
+            assert!(
+                KryphocronConfig::from_env_values(None, Some(refused.to_string())).is_err(),
+                "{refused}"
             );
         }
     }

@@ -24,8 +24,8 @@
 //!   exists, names an audience of the root's author (the current one, or one
 //!   the thread had before a move), and agrees on the thread's root (a reply
 //!   names `reply.root` as its root; a post that is not a reply is that
-//!   root); and a post by the root's author is reached within [`MAX_CHAIN`]
-//!   posts.
+//!   root); and a post by the root's author is reached within the walk bound
+//!   (`PDS_KRYPHOCRON_MAX_CHAIN` posts, default 16, at most 100).
 //!
 //! A reply by the root's author is not walked (they may write anywhere in
 //! their own thread, and the AppView serves their posts without the walk),
@@ -51,14 +51,10 @@ use crate::{
     kryphocron_audience::{audience_owner, audience_reference, parse_record_uri, AudienceRef},
 };
 
-/// The most posts walked from the parent looking for the anchor (the thread
-/// root's author's post, or the branch root). skydeval, 2026-10-16: deep
-/// enough for any conversation; the AppView applies the same bound on reads.
-pub(crate) const MAX_CHAIN: usize = 100;
-
 /// The most records fetched from other PDSes for one reply. Posts held here
-/// cost a local read and are bounded by [`MAX_CHAIN`] alone; a chain that
-/// needs more remote posts than this is refused.
+/// cost a local read and are bounded by the walk bound alone
+/// (`PDS_KRYPHOCRON_MAX_CHAIN`, [`crate::config::KryphocronConfig`]); a chain
+/// that needs more remote posts than this is refused.
 pub(crate) const REMOTE_FETCH_BUDGET: usize = 16;
 
 /// The longest one check may take, remote fetches included.
@@ -87,7 +83,7 @@ pub(crate) enum Unanchored {
     /// The chain ended at a post that is not a reply, before the root
     /// author's post.
     NoOwnerPost,
-    /// [`MAX_CHAIN`] posts were walked without reaching the root author's post.
+    /// The walk bound was reached without reaching the anchor.
     TooDeep,
     /// A post on the walk is not in the thread of `reply.root`.
     RootMismatch,
@@ -144,7 +140,13 @@ pub(crate) async fn check_reply_thread(
     };
     let verdict = tokio::time::timeout(
         CHECK_DEADLINE,
-        check_thread(&mut source, record, audience_uri, Some(writer_did)),
+        check_thread(
+            &mut source,
+            record,
+            audience_uri,
+            Some(writer_did),
+            ctx.config.kryphocron.private_max_chain,
+        ),
     )
     .await
     .map_err(|_| Unanchored::TimedOut)?;
@@ -156,13 +158,15 @@ pub(crate) async fn check_reply_thread(
     }
 }
 
-/// The chain rule, over any [`RecordSource`]. `writer_did`, when given, lets
-/// a private thread's root author skip the walk.
+/// The chain rule, over any [`RecordSource`], walking at most `max_chain`
+/// posts. `writer_did`, when given, lets a private thread's root author skip
+/// the walk.
 pub(crate) async fn check_thread(
     source: &mut dyn RecordSource,
     record: &serde_json::Value,
     audience_uri: &str,
     writer_did: Option<&str>,
+    max_chain: usize,
 ) -> Result<Anchor, Unanchored> {
     let parent_uri = reply_uri(record, "parent").ok_or(Unanchored::MissingRefs)?;
     let root_uri = reply_uri(record, "root").ok_or(Unanchored::MissingRefs)?;
@@ -171,9 +175,18 @@ pub(crate) async fn check_thread(
     }
     let mut posts: HashMap<String, serde_json::Value> = HashMap::new();
     if is_private(&root_uri) {
-        check_in_thread(source, &mut posts, &parent_uri, &root_uri, audience_uri, writer_did).await
+        check_in_thread(
+            source,
+            &mut posts,
+            &parent_uri,
+            &root_uri,
+            audience_uri,
+            writer_did,
+            max_chain,
+        )
+        .await
     } else {
-        check_in_branch(source, &mut posts, &parent_uri, &root_uri, audience_uri).await
+        check_in_branch(source, &mut posts, &parent_uri, &root_uri, audience_uri, max_chain).await
     }
 }
 
@@ -185,6 +198,7 @@ async fn check_in_thread(
     root_uri: &str,
     audience_uri: &str,
     writer_did: Option<&str>,
+    max_chain: usize,
 ) -> Result<Anchor, Unanchored> {
     let root_author = author(root_uri).ok_or(Unanchored::MissingRefs)?.to_string();
 
@@ -210,7 +224,7 @@ async fn check_in_thread(
     // the thread's root: a reply names `root_uri` as its root, and a post
     // that is not a reply is `root_uri` itself.
     let mut current = parent_uri.to_string();
-    for _ in 0..MAX_CHAIN {
+    for _ in 0..max_chain {
         let post = load(source, posts, &current).await?;
         require_audience_of(&post, &current, &root_author)?;
         let agrees_on_root = if is_reply(&post) {
@@ -234,7 +248,7 @@ async fn check_in_thread(
 /// A reply inside a private branch (A-13): its root is a public post, and
 /// the branch's root is the topmost private post above it, whose own parent
 /// is public. The branch root is named nowhere in the reply, so it is found
-/// by walking up to it, within [`MAX_CHAIN`] posts. Every post on the way
+/// by walking up to it, within `max_chain` posts. Every post on the way
 /// agrees on the public `reply.root` and names an audience of the branch
 /// root's author; the reply names the branch root's current audience.
 async fn check_in_branch(
@@ -243,11 +257,12 @@ async fn check_in_branch(
     parent_uri: &str,
     root_uri: &str,
     audience_uri: &str,
+    max_chain: usize,
 ) -> Result<Anchor, Unanchored> {
     let mut walked: Vec<String> = Vec::new();
     let mut current = parent_uri.to_string();
     let mut branch_root = None;
-    for _ in 0..MAX_CHAIN {
+    for _ in 0..max_chain {
         let post = load(source, posts, &current).await?;
         if reply_uri(&post, "root").as_deref() != Some(root_uri) {
             return Err(Unanchored::RootMismatch);
@@ -566,6 +581,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The walk bound the tests use: the default.
+    const MAX_CHAIN: usize = crate::config::DEFAULT_PRIVATE_MAX_CHAIN;
+
     const OWNER: &str = "did:plc:owner";
     const MEMBER: &str = "did:plc:member";
     const OTHER: &str = "did:plc:other";
@@ -609,7 +627,7 @@ mod tests {
     }
 
     async fn check(source: &mut Posts, reply: &serde_json::Value) -> Result<(), Unanchored> {
-        check_thread(source, reply, &audience(), None).await.map(|_| ())
+        check_thread(source, reply, &audience(), None, MAX_CHAIN).await.map(|_| ())
     }
 
     #[tokio::test]
@@ -743,7 +761,7 @@ mod tests {
         // A reply to the reply written before the move, naming the new audience.
         let reply = post(&moved_to, Some((&root, &before_move)));
         assert_eq!(
-            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
+            check_thread(&mut source, &reply, &moved_to, None, MAX_CHAIN).await.map(|_| ()),
             Ok(())
         );
         // Naming the old audience, anywhere in the thread, is refused.
@@ -785,11 +803,11 @@ mod tests {
         let mut source = posts(vec![(root.clone(), post(&moved_to, None))]);
         // Not walked: the parent is never read.
         let reply = post(&moved_to, Some((&root, &deep)));
-        assert_eq!(check_thread(&mut source, &reply, &moved_to, Some(OWNER)).await.map(|_| ()), Ok(()));
+        assert_eq!(check_thread(&mut source, &reply, &moved_to, Some(OWNER), MAX_CHAIN).await.map(|_| ()), Ok(()));
         assert_eq!(source.fetches, 1, "only the root");
         let reply = post(&audience(), Some((&root, &deep)));
         assert_eq!(
-            check_thread(&mut source, &reply, &audience(), Some(OWNER)).await.map(|_| ()),
+            check_thread(&mut source, &reply, &audience(), Some(OWNER), MAX_CHAIN).await.map(|_| ()),
             Err(Unanchored::NotThreadAudience)
         );
     }
@@ -811,7 +829,7 @@ mod tests {
         ]);
         let reply = post(&moved_to, Some((&root, &after)));
         assert_eq!(
-            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
+            check_thread(&mut source, &reply, &moved_to, None, MAX_CHAIN).await.map(|_| ()),
             Ok(())
         );
     }
@@ -916,7 +934,7 @@ mod tests {
         let mut source = posts(vec![]);
         let branch_root = post(&member_audience(), Some((&public, &public)));
         assert_eq!(
-            check_thread(&mut source, &branch_root, &member_audience(), None).await,
+            check_thread(&mut source, &branch_root, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::BranchRoot)
         );
         assert_eq!(source.fetches, 0);
@@ -936,7 +954,7 @@ mod tests {
         for parent in [&branch_root, &inside] {
             let reply = post(&member_audience(), Some((&public, parent)));
             assert_eq!(
-                check_thread(&mut source, &reply, &member_audience(), None).await,
+                check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
                 Ok(Anchor {
                     author: MEMBER.to_string()
                 }),
@@ -959,12 +977,12 @@ mod tests {
         ]);
         let reply = post(&moved_to, Some((&public, &before_move)));
         assert_eq!(
-            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
+            check_thread(&mut source, &reply, &moved_to, None, MAX_CHAIN).await.map(|_| ()),
             Ok(())
         );
         let reply = post(&member_audience(), Some((&public, &before_move)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await,
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::NotThreadAudience)
         );
     }
@@ -981,7 +999,7 @@ mod tests {
         ]);
         let reply = post(&member_audience(), Some((&public, &planted)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await,
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::OtherAudience(planted))
         );
     }
@@ -997,7 +1015,7 @@ mod tests {
         )]);
         let reply = post(&member_audience(), Some((&public, &branch_root)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await,
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::RootMismatch)
         );
     }
@@ -1020,7 +1038,7 @@ mod tests {
         let mut source = posts(entries);
         let reply = post(&member_audience(), Some((&public, &parent)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await.map(|_| ()),
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await.map(|_| ()),
             Ok(())
         );
         assert_eq!(source.fetches, MAX_CHAIN);
@@ -1039,7 +1057,7 @@ mod tests {
         ]);
         let reply = post(&member_audience(), Some((&public, &a)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await,
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::TooDeep)
         );
         assert_eq!(source.fetches, 2, "each post is read once");
@@ -1062,7 +1080,7 @@ mod tests {
         for parent in [&thread_reply, &thread_root] {
             let reply = post(&member_audience(), Some((&public, parent)));
             assert_eq!(
-                check_thread(&mut source, &reply, &member_audience(), None).await,
+                check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
                 Err(Unanchored::RootMismatch),
                 "{parent}"
             );
@@ -1088,7 +1106,7 @@ mod tests {
         let mut source = posts(entries);
         let reply = post(&member_audience(), Some((&public, &parent)));
         assert_eq!(
-            check_thread(&mut source, &reply, &member_audience(), None).await,
+            check_thread(&mut source, &reply, &member_audience(), None, MAX_CHAIN).await,
             Err(Unanchored::TooDeep)
         );
     }
