@@ -51,12 +51,15 @@ use crate::{
     kryphocron_audience::{audience_owner, audience_reference, parse_record_uri, AudienceRef},
 };
 
-/// The most posts walked from the parent looking for the owner's post.
-pub(crate) const MAX_CHAIN: usize = 8;
+/// The most posts walked from the parent looking for the anchor (the thread
+/// root's author's post, or the branch root). skydeval, 2026-10-16: deep
+/// enough for any conversation; the AppView applies the same bound on reads.
+pub(crate) const MAX_CHAIN: usize = 100;
 
-/// The most records fetched from other PDSes for one reply: the chain and
-/// the root.
-pub(crate) const REMOTE_FETCH_BUDGET: usize = MAX_CHAIN + 1;
+/// The most records fetched from other PDSes for one reply. Posts held here
+/// cost a local read and are bounded by [`MAX_CHAIN`] alone; a chain that
+/// needs more remote posts than this is refused.
+pub(crate) const REMOTE_FETCH_BUDGET: usize = 16;
 
 /// The longest one check may take, remote fetches included.
 pub(crate) const CHECK_DEADLINE: Duration = Duration::from_secs(3);
@@ -68,8 +71,12 @@ pub(crate) const MAX_RECORD_BYTES: usize = 64 * 1024;
 /// refusal the audience check gives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Unanchored {
-    /// `reply.parent` or `reply.root` is missing, or is not a private-post URI.
+    /// `reply.parent` or `reply.root` is missing, or is not a record URI.
     MissingRefs,
+    /// The parent is a public post: the record starts a private branch (A-13)
+    /// rather than replying inside one. Only its author writes it, with
+    /// `createPostPrivate`.
+    BranchRoot,
     /// A post in the chain, or the root, does not exist.
     NotFound(String),
     /// A post in the chain, or the root, is not a private post naming an
@@ -106,20 +113,29 @@ pub(crate) trait RecordSource: Send {
 /// How many checks that need another PDS one account may start per minute.
 const REMOTE_CHECKS_PER_MINUTE: u32 = 30;
 
+/// What anchors a reply: the author of its thread's root, or of its branch's
+/// root. The thread or branch is that author's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Anchor {
+    pub(crate) author: String,
+}
+
 /// Check that `record`, a reply by `writer_did` naming `audience_uri`,
-/// belongs to a thread whose audience is `audience_uri`. Reads from the
-/// store and from other PDSes as the module describes, within
-/// [`CHECK_DEADLINE`]. For a reply by the root's author only the root is
-/// checked: it exists, starts the thread, and names `audience_uri`; the walk
-/// is not needed, since the author may write anywhere in their own thread.
+/// belongs to a private thread or branch whose audience is `audience_uri`,
+/// and answer whose it is. Reads from the store and from other PDSes as the
+/// module describes, within [`CHECK_DEADLINE`].
+///
+/// A reply whose parent is public is a branch root, not a reply inside
+/// anything: [`Unanchored::BranchRoot`]. For a reply by a private thread's
+/// root author only the root is checked: it exists, starts the thread, and
+/// names `audience_uri`; the walk is not needed, since the author may write
+/// anywhere in their own thread.
 pub(crate) async fn check_reply_thread(
     ctx: &AppContext,
     writer_did: &str,
     record: &serde_json::Value,
     audience_uri: &str,
-) -> Result<(), Unanchored> {
-    let root_author = reply_ref(record, "root").and_then(|root| author(&root).map(str::to_string));
-    let walk = root_author.as_deref() != Some(writer_did);
+) -> Result<Anchor, Unanchored> {
     let mut source = StoreOrRemote {
         ctx,
         writer_did,
@@ -128,7 +144,7 @@ pub(crate) async fn check_reply_thread(
     };
     let verdict = tokio::time::timeout(
         CHECK_DEADLINE,
-        check_thread(&mut source, record, audience_uri, walk),
+        check_thread(&mut source, record, audience_uri, Some(writer_did)),
     )
     .await
     .map_err(|_| Unanchored::TimedOut)?;
@@ -140,40 +156,65 @@ pub(crate) async fn check_reply_thread(
     }
 }
 
-/// The chain rule, over any [`RecordSource`].
+/// The chain rule, over any [`RecordSource`]. `writer_did`, when given, lets
+/// a private thread's root author skip the walk.
 pub(crate) async fn check_thread(
     source: &mut dyn RecordSource,
     record: &serde_json::Value,
     audience_uri: &str,
-    walk: bool,
-) -> Result<(), Unanchored> {
-    let parent_uri = reply_ref(record, "parent").ok_or(Unanchored::MissingRefs)?;
-    let root_uri = reply_ref(record, "root").ok_or(Unanchored::MissingRefs)?;
-    let root_author = author(&root_uri).ok_or(Unanchored::MissingRefs)?.to_string();
+    writer_did: Option<&str>,
+) -> Result<Anchor, Unanchored> {
+    let parent_uri = reply_uri(record, "parent").ok_or(Unanchored::MissingRefs)?;
+    let root_uri = reply_uri(record, "root").ok_or(Unanchored::MissingRefs)?;
+    if !is_private(&parent_uri) {
+        return Err(Unanchored::BranchRoot);
+    }
     let mut posts: HashMap<String, serde_json::Value> = HashMap::new();
+    if is_private(&root_uri) {
+        check_in_thread(source, &mut posts, &parent_uri, &root_uri, audience_uri, writer_did).await
+    } else {
+        check_in_branch(source, &mut posts, &parent_uri, &root_uri, audience_uri).await
+    }
+}
+
+/// A reply inside a private thread: its root is private (A-12).
+async fn check_in_thread(
+    source: &mut dyn RecordSource,
+    posts: &mut HashMap<String, serde_json::Value>,
+    parent_uri: &str,
+    root_uri: &str,
+    audience_uri: &str,
+    writer_did: Option<&str>,
+) -> Result<Anchor, Unanchored> {
+    let root_author = author(root_uri).ok_or(Unanchored::MissingRefs)?.to_string();
 
     // The thread's audience is the root's current one, an audience of the
     // root's author; the reply must name exactly it.
-    let root = load(source, &mut posts, &root_uri, &root_author).await?;
+    let root = load(source, posts, root_uri).await?;
+    require_audience_of(&root, root_uri, &root_author)?;
     if is_reply(&root) {
         return Err(Unanchored::RootIsReply);
     }
     if audience_reference(&root) != AudienceRef::Uri(audience_uri.to_string()) {
         return Err(Unanchored::NotThreadAudience);
     }
-    if !walk {
-        return Ok(());
+    let anchor = Anchor {
+        author: root_author.clone(),
+    };
+    if writer_did == Some(root_author.as_str()) {
+        return Ok(anchor);
     }
 
     // Walk up from the parent. Every post on the way names an audience of the
     // root's author (one the thread had before a move counts) and agrees on
     // the thread's root: a reply names `root_uri` as its root, and a post
     // that is not a reply is `root_uri` itself.
-    let mut current = parent_uri;
+    let mut current = parent_uri.to_string();
     for _ in 0..MAX_CHAIN {
-        let post = load(source, &mut posts, &current, &root_author).await?;
+        let post = load(source, posts, &current).await?;
+        require_audience_of(&post, &current, &root_author)?;
         let agrees_on_root = if is_reply(&post) {
-            reply_ref(&post, "root").as_deref() == Some(root_uri.as_str())
+            reply_uri(&post, "root").as_deref() == Some(root_uri)
         } else {
             current == root_uri
         };
@@ -181,20 +222,68 @@ pub(crate) async fn check_thread(
             return Err(Unanchored::RootMismatch);
         }
         if author(&current) == Some(root_author.as_str()) {
-            return Ok(());
+            return Ok(anchor);
         }
-        current = reply_ref(&post, "parent").ok_or(Unanchored::NoOwnerPost)?;
+        current = reply_uri(&post, "parent")
+            .filter(|parent| is_private(parent))
+            .ok_or(Unanchored::NoOwnerPost)?;
     }
     Err(Unanchored::TooDeep)
 }
 
-/// Read a post once per check, and require it to exist, be a private post,
-/// and name an audience of `audience_holder`'s.
+/// A reply inside a private branch (A-13): its root is a public post, and
+/// the branch's root is the topmost private post above it, whose own parent
+/// is public. The branch root is named nowhere in the reply, so it is found
+/// by walking up to it, within [`MAX_CHAIN`] posts. Every post on the way
+/// agrees on the public `reply.root` and names an audience of the branch
+/// root's author; the reply names the branch root's current audience.
+async fn check_in_branch(
+    source: &mut dyn RecordSource,
+    posts: &mut HashMap<String, serde_json::Value>,
+    parent_uri: &str,
+    root_uri: &str,
+    audience_uri: &str,
+) -> Result<Anchor, Unanchored> {
+    let mut walked: Vec<String> = Vec::new();
+    let mut current = parent_uri.to_string();
+    let mut branch_root = None;
+    for _ in 0..MAX_CHAIN {
+        let post = load(source, posts, &current).await?;
+        if reply_uri(&post, "root").as_deref() != Some(root_uri) {
+            return Err(Unanchored::RootMismatch);
+        }
+        let parent = reply_uri(&post, "parent").ok_or(Unanchored::NoOwnerPost)?;
+        walked.push(current.clone());
+        if !is_private(&parent) {
+            branch_root = Some(current);
+            break;
+        }
+        current = parent;
+    }
+    let branch_root = branch_root.ok_or(Unanchored::TooDeep)?;
+    let branch_author = author(&branch_root).ok_or(Unanchored::MissingRefs)?.to_string();
+    for uri in &walked {
+        let post = posts
+            .get(uri)
+            .ok_or_else(|| Unanchored::NotFound(uri.clone()))?;
+        require_audience_of(post, uri, &branch_author)?;
+    }
+    let root = posts
+        .get(&branch_root)
+        .ok_or_else(|| Unanchored::NotFound(branch_root.clone()))?;
+    if audience_reference(root) != AudienceRef::Uri(audience_uri.to_string()) {
+        return Err(Unanchored::NotThreadAudience);
+    }
+    Ok(Anchor {
+        author: branch_author,
+    })
+}
+
+/// Read a post once per check, and require it to exist and be a private post.
 async fn load(
     source: &mut dyn RecordSource,
     posts: &mut HashMap<String, serde_json::Value>,
     uri: &str,
-    audience_holder: &str,
 ) -> Result<serde_json::Value, Unanchored> {
     let post = match posts.get(uri) {
         Some(post) => post.clone(),
@@ -209,22 +298,33 @@ async fn load(
         }
     };
     let declared_type = post.get("$type").and_then(|t| t.as_str());
-    let names_holders_audience = match audience_reference(&post) {
-        AudienceRef::Uri(audience) => audience_owner(&audience) == Some(audience_holder),
-        AudienceRef::None | AudienceRef::Malformed => false,
-    };
-    if declared_type.is_some_and(|t| t != NSID_POST_PRIVATE) || !names_holders_audience {
+    if declared_type.is_some_and(|t| t != NSID_POST_PRIVATE) {
         return Err(Unanchored::OtherAudience(uri.to_string()));
     }
     Ok(post)
 }
 
-/// `reply.<which>.uri` of a post, when it is a private-post URI.
-fn reply_ref(post: &serde_json::Value, which: &str) -> Option<String> {
+/// Require `post` (at `uri`) to name an audience of `audience_holder`'s.
+fn require_audience_of(
+    post: &serde_json::Value,
+    uri: &str,
+    audience_holder: &str,
+) -> Result<(), Unanchored> {
+    match audience_reference(post) {
+        AudienceRef::Uri(audience) if audience_owner(&audience) == Some(audience_holder) => Ok(()),
+        _ => Err(Unanchored::OtherAudience(uri.to_string())),
+    }
+}
+
+/// `reply.<which>.uri` of a post, when it is a record URI (private or not).
+pub(crate) fn reply_uri(post: &serde_json::Value, which: &str) -> Option<String> {
     let uri = post.get("reply")?.get(which)?.get("uri")?.as_str()?;
-    parse_record_uri(uri)
-        .filter(|parsed| parsed.collection == NSID_POST_PRIVATE)
-        .map(|_| uri.to_string())
+    parse_record_uri(uri).map(|_| uri.to_string())
+}
+
+/// Whether a record URI names a private post.
+pub(crate) fn is_private(uri: &str) -> bool {
+    parse_record_uri(uri).is_some_and(|parsed| parsed.collection == NSID_POST_PRIVATE)
 }
 
 /// Whether a post is a reply (carries a non-null `reply`).
@@ -509,7 +609,7 @@ mod tests {
     }
 
     async fn check(source: &mut Posts, reply: &serde_json::Value) -> Result<(), Unanchored> {
-        check_thread(source, reply, &audience(), true).await
+        check_thread(source, reply, &audience(), None).await.map(|_| ())
     }
 
     #[tokio::test]
@@ -643,7 +743,7 @@ mod tests {
         // A reply to the reply written before the move, naming the new audience.
         let reply = post(&moved_to, Some((&root, &before_move)));
         assert_eq!(
-            check_thread(&mut source, &reply, &moved_to, true).await,
+            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
             Ok(())
         );
         // Naming the old audience, anywhere in the thread, is refused.
@@ -685,11 +785,11 @@ mod tests {
         let mut source = posts(vec![(root.clone(), post(&moved_to, None))]);
         // Not walked: the parent is never read.
         let reply = post(&moved_to, Some((&root, &deep)));
-        assert_eq!(check_thread(&mut source, &reply, &moved_to, false).await, Ok(()));
+        assert_eq!(check_thread(&mut source, &reply, &moved_to, Some(OWNER)).await.map(|_| ()), Ok(()));
         assert_eq!(source.fetches, 1, "only the root");
         let reply = post(&audience(), Some((&root, &deep)));
         assert_eq!(
-            check_thread(&mut source, &reply, &audience(), false).await,
+            check_thread(&mut source, &reply, &audience(), Some(OWNER)).await.map(|_| ()),
             Err(Unanchored::NotThreadAudience)
         );
     }
@@ -711,7 +811,7 @@ mod tests {
         ]);
         let reply = post(&moved_to, Some((&root, &after)));
         assert_eq!(
-            check_thread(&mut source, &reply, &moved_to, true).await,
+            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
             Ok(())
         );
     }
@@ -789,12 +889,208 @@ mod tests {
             post(&audience(), None),
             json!({ "audienceList": audience(), "reply": { "parent": { "uri": root } } }),
             json!({ "audienceList": audience(),
-                    "reply": { "root": { "uri": root },
-                               "parent": { "uri": format!("at://{OWNER}/app.bsky.feed.post/x") } } }),
+                    "reply": { "root": { "uri": root }, "parent": { "uri": "not a uri" } } }),
         ] {
             assert_eq!(check(&mut source, &reply).await, Err(Unanchored::MissingRefs));
         }
         assert_eq!(source.fetches, 0);
+    }
+
+    // ---- private branches (A-13) ----
+
+    const PUBLIC: &str = "did:plc:public";
+
+    fn public_uri(rkey: &str) -> String {
+        format!("at://{PUBLIC}/app.bsky.feed.post/{rkey}")
+    }
+
+    fn member_audience() -> String {
+        format!("at://{MEMBER}/tools.kryphocron.policy.audience/aud")
+    }
+
+    /// A reply whose parent is public starts a branch; it is not a reply
+    /// inside anything, and nothing is read.
+    #[tokio::test]
+    async fn a_private_reply_to_a_public_post_is_a_branch_root() {
+        let public = public_uri("p1");
+        let mut source = posts(vec![]);
+        let branch_root = post(&member_audience(), Some((&public, &public)));
+        assert_eq!(
+            check_thread(&mut source, &branch_root, &member_audience(), None).await,
+            Err(Unanchored::BranchRoot)
+        );
+        assert_eq!(source.fetches, 0);
+    }
+
+    /// Replies inside a branch are anchored by the branch root, found by
+    /// walking up to the first private post whose parent is public.
+    #[tokio::test]
+    async fn a_reply_inside_a_branch_is_anchored_by_its_branch_root() {
+        let public = public_uri("p1");
+        let branch_root = post_uri(MEMBER, "b0");
+        let inside = post_uri(OTHER, "b1");
+        let mut source = posts(vec![
+            (branch_root.clone(), post(&member_audience(), Some((&public, &public)))),
+            (inside.clone(), post(&member_audience(), Some((&public, &branch_root)))),
+        ]);
+        for parent in [&branch_root, &inside] {
+            let reply = post(&member_audience(), Some((&public, parent)));
+            assert_eq!(
+                check_thread(&mut source, &reply, &member_audience(), None).await,
+                Ok(Anchor {
+                    author: MEMBER.to_string()
+                }),
+                "{parent}"
+            );
+        }
+    }
+
+    /// The branch root's author moved it to another audience: the branch
+    /// follows, downthread, as a thread does (A-12).
+    #[tokio::test]
+    async fn a_moved_branch_follows_its_roots_audience() {
+        let public = public_uri("p1");
+        let branch_root = post_uri(MEMBER, "b0");
+        let before_move = post_uri(OTHER, "b1");
+        let moved_to = format!("at://{MEMBER}/tools.kryphocron.policy.audience/close");
+        let mut source = posts(vec![
+            (branch_root.clone(), post(&moved_to, Some((&public, &public)))),
+            (before_move.clone(), post(&member_audience(), Some((&public, &branch_root)))),
+        ]);
+        let reply = post(&moved_to, Some((&public, &before_move)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &moved_to, None).await.map(|_| ()),
+            Ok(())
+        );
+        let reply = post(&member_audience(), Some((&public, &before_move)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await,
+            Err(Unanchored::NotThreadAudience)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_post_under_another_authors_audience_breaks_it() {
+        let public = public_uri("p1");
+        let branch_root = post_uri(MEMBER, "b0");
+        let planted = post_uri(OTHER, "b1");
+        let other_audience = format!("at://{OTHER}/tools.kryphocron.policy.audience/aud");
+        let mut source = posts(vec![
+            (branch_root.clone(), post(&member_audience(), Some((&public, &public)))),
+            (planted.clone(), post(&other_audience, Some((&public, &branch_root)))),
+        ]);
+        let reply = post(&member_audience(), Some((&public, &planted)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await,
+            Err(Unanchored::OtherAudience(planted))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_post_must_agree_on_the_public_root() {
+        let public = public_uri("p1");
+        let elsewhere = public_uri("p2");
+        let branch_root = post_uri(MEMBER, "b0");
+        let mut source = posts(vec![(
+            branch_root.clone(),
+            post(&member_audience(), Some((&elsewhere, &elsewhere))),
+        )]);
+        let reply = post(&member_audience(), Some((&public, &branch_root)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await,
+            Err(Unanchored::RootMismatch)
+        );
+    }
+
+    /// The branch root may be the 8th post walked, the last within reach.
+    #[tokio::test]
+    async fn a_branch_root_at_the_bound_anchors() {
+        let public = public_uri("p1");
+        let branch_root = post_uri(MEMBER, "b0");
+        let mut entries = vec![(
+            branch_root.clone(),
+            post(&member_audience(), Some((&public, &public))),
+        )];
+        let mut parent = branch_root.clone();
+        for i in 0..MAX_CHAIN - 1 {
+            let uri = post_uri(OTHER, &format!("r{i}"));
+            entries.push((uri.clone(), post(&member_audience(), Some((&public, &parent)))));
+            parent = uri;
+        }
+        let mut source = posts(entries);
+        let reply = post(&member_audience(), Some((&public, &parent)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await.map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(source.fetches, MAX_CHAIN);
+    }
+
+    /// Two branch posts naming each other as parent: the walk ends at the
+    /// bound, reading each once.
+    #[tokio::test]
+    async fn a_cycle_in_a_branch_ends_at_the_bound() {
+        let public = public_uri("p1");
+        let a = post_uri(MEMBER, "a");
+        let b = post_uri(OTHER, "b");
+        let mut source = posts(vec![
+            (a.clone(), post(&member_audience(), Some((&public, &b)))),
+            (b.clone(), post(&member_audience(), Some((&public, &a)))),
+        ]);
+        let reply = post(&member_audience(), Some((&public, &a)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await,
+            Err(Unanchored::TooDeep)
+        );
+        assert_eq!(source.fetches, 2, "each post is read once");
+    }
+
+    /// A post from a private thread, or a top-level private post, met while
+    /// walking a branch does not belong to it.
+    #[tokio::test]
+    async fn a_thread_post_met_in_a_branch_breaks_it() {
+        let public = public_uri("p1");
+        let thread_root = post_uri(MEMBER, "t0");
+        let thread_reply = post_uri(OTHER, "t1");
+        let mut source = posts(vec![
+            (thread_root.clone(), post(&member_audience(), None)),
+            (
+                thread_reply.clone(),
+                post(&member_audience(), Some((&thread_root, &thread_root))),
+            ),
+        ]);
+        for parent in [&thread_reply, &thread_root] {
+            let reply = post(&member_audience(), Some((&public, parent)));
+            assert_eq!(
+                check_thread(&mut source, &reply, &member_audience(), None).await,
+                Err(Unanchored::RootMismatch),
+                "{parent}"
+            );
+        }
+    }
+
+    /// The branch root is not named in any record, so it must be within reach
+    /// of the walk.
+    #[tokio::test]
+    async fn a_branch_root_beyond_the_bound_is_refused() {
+        let public = public_uri("p1");
+        let branch_root = post_uri(MEMBER, "b0");
+        let mut entries = vec![(
+            branch_root.clone(),
+            post(&member_audience(), Some((&public, &public))),
+        )];
+        let mut parent = branch_root.clone();
+        for i in 0..MAX_CHAIN {
+            let uri = post_uri(OTHER, &format!("r{i}"));
+            entries.push((uri.clone(), post(&member_audience(), Some((&public, &parent)))));
+            parent = uri;
+        }
+        let mut source = posts(entries);
+        let reply = post(&member_audience(), Some((&public, &parent)));
+        assert_eq!(
+            check_thread(&mut source, &reply, &member_audience(), None).await,
+            Err(Unanchored::TooDeep)
+        );
     }
 
     #[test]
