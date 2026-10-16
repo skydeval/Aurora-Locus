@@ -519,15 +519,55 @@ fn require_own_audience(record: &serde_json::Value, writer_did: &str) -> PdsResu
     }
 }
 
+/// A reply written with `createPostPrivate` is in the writer's own thread and
+/// names its root's current audience. A record without a `reply` passes.
+async fn require_own_thread(
+    ctx: &AppContext,
+    record: &serde_json::Value,
+    writer_did: &str,
+) -> PdsResult<()> {
+    if record.get("reply").is_none_or(|reply| reply.is_null()) {
+        return Ok(());
+    }
+    let root_author = record
+        .get("reply")
+        .and_then(|reply| reply.get("root"))
+        .and_then(|root| root.get("uri"))
+        .and_then(|uri| uri.as_str())
+        .and_then(parse_record_uri)
+        .map(|uri| uri.did);
+    if root_author != Some(writer_did) {
+        return Err(PdsError::Validation(format!(
+            "{PROC_CREATE_POST_PRIVATE} replies only in the writer's own thread; to reply \
+             in another account's thread use {PROC_PARTICIPATE_PRIVATE}"
+        )));
+    }
+    let AudienceRef::Uri(audience_uri) = audience_reference(record) else {
+        return Err(PdsError::Validation(
+            "a reply names its thread's audience: the root's current audienceList".to_string(),
+        ));
+    };
+    crate::kryphocron_thread::check_reply_thread(ctx, writer_did, record, &audience_uri)
+        .await
+        .map_err(|reason| {
+            PdsError::Validation(format!(
+                "a reply in the writer's own thread must name the root's current \
+                 audienceList, under a root that exists and is not itself a reply ({reason:?})"
+            ))
+        })
+}
+
 /// `tools.kryphocron.feed.createPostPrivate` — create a
 /// `tools.kryphocron.feed.postPrivate` record under the
 /// `EditPrivatePost` (user-class) capability. The bind pipeline
 /// runs during `apply_writes`'s validate loop.
 ///
 /// The record may name only an audience in the writer's own repository
-/// ([`require_own_audience`]). It may carry a `reply`: an author replying in
-/// their own thread, or anyone replying under their own audience, writes
-/// through this procedure.
+/// ([`require_own_audience`]). It may carry a `reply` only in the writer's
+/// own thread (the writer wrote its root), and must then name the root's
+/// current audience: a thread's audience is its root's, downthread (A-12).
+/// Replies in another account's thread go through `participatePrivate`,
+/// which checks the writer against that thread's audience.
 async fn create_post_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -537,6 +577,7 @@ async fn create_post_private(
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
     private_post_preconditions(&ctx, auth_did.value(), &req.record).await?;
     require_own_audience(&req.record, auth_did.value())?;
+    require_own_thread(&ctx, &req.record, auth_did.value()).await?;
 
     // #236 — encode-on-write floor. Fix the rkey up-front (so the
     // at-rest content context's rkey matches the stored record), then
@@ -594,24 +635,26 @@ async fn delete_post_private(
 ///
 /// **The audience check.** The writer is checked against the audience the
 /// reply itself names ([`check_participate_audience`]): that is the audience
-/// whose readers will be served the reply. When the parent post is held
-/// here, the reply must name the parent's audience. On refusal the handler
-/// writes `KryphocronAudienceCheckDenied` in its own short tx on the shared
-/// account DB and answers 403 with one fixed message, whatever the cause: a
-/// post that does not exist, an audience that does not admit the writer, a
-/// block, and a mismatched audience are the same response.
+/// whose readers will be served the reply. On refusal the handler writes
+/// `KryphocronAudienceCheckDenied` in its own short tx on the shared account
+/// DB and answers 403 with one fixed message, whatever the cause: a post that
+/// does not exist, an audience that does not admit the writer, a block, and a
+/// reply outside its thread are the same response.
 ///
-/// **The thread check (#515).** The reply must belong to a thread under the
-/// audience it names: walking up from its parent, a post by the audience's
-/// owner is reached within a few posts, every post on the way names the
-/// audience, and `reply.root` is that thread's root, by the owner. Posts held
-/// elsewhere are fetched from their PDS within a fixed budget
-/// ([`crate::kryphocron_thread`]). A reply that fails it gets the same 403.
+/// **The thread check (#515, A-12).** A thread's audience is its root's
+/// current one: an audience change applies downthread. The reply must name
+/// exactly that audience, and must belong to the thread: walking up from its
+/// parent, every post names an audience of the root's author (one the thread
+/// had before a move counts) and agrees on the root, and a post by the root's
+/// author is reached within a few posts. Posts held elsewhere are fetched
+/// from their PDS within a fixed budget ([`crate::kryphocron_thread`]). So a
+/// member added by a move may reply anywhere in the thread, and a member
+/// removed by it nowhere. A reply that fails gets the same 403.
 ///
 /// **Audiences held elsewhere.** When the audience's owner is not an account
 /// on this PDS its record cannot be read, so who may write under it is not
 /// checked here (a warning is logged). The thread check still runs, so such a
-/// reply must still hang off the owner's thread.
+/// reply must still name the root's current audience and hang off its thread.
 async fn participate_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -648,17 +691,17 @@ async fn participate_private(
         }
     }
 
-    // #515 — the reply must belong to a thread under the audience it names:
-    // its chain reaches a post by the audience's owner, and its root is that
-    // thread's root. Same refusal as the audience check.
-    let owner = audience_owner(&audience_uri)
-        .ok_or_else(|| PdsError::Validation("invalid audience URI".to_string()))?;
+    // #515, A-12 — the reply must belong to a thread under the audience it
+    // names, and that audience must be the thread's: the root's current one.
+    // Its chain reaches a post by the root's author through posts under that
+    // author's audiences. Same refusal as the audience check. Run second: the
+    // audience check is local and cheap, and a writer it refuses never makes
+    // this PDS fetch from another.
     if let Err(reason) = crate::kryphocron_thread::check_reply_thread(
         &ctx,
         auth_did.value(),
         &req.record,
         &audience_uri,
-        owner,
     )
     .await
     {
@@ -782,15 +825,16 @@ enum ParticipateAudienceOutcome {
 /// Host-side audience check for `participatePrivate` (#495).
 ///
 /// `audience_uri` is the audience the reply names; `parent_uri` is the post
-/// it replies to. Both have been syntax-checked by [`participation_refs`].
+/// it replies to (the denial's subject). Both have been syntax-checked by
+/// [`participation_refs`]. Whether the reply belongs to the parent's thread,
+/// and names that thread's audience, is the thread check's question
+/// ([`crate::kryphocron_thread`]); this one asks only who may write under
+/// the audience.
 ///
-/// 1. When the parent's owner is an account here, the parent must exist and
-///    name the same audience as the reply. Otherwise the reply is denied.
-///    Nothing is read from a parent held elsewhere.
-/// 2. The audience's owner may always write under its own audience.
-/// 3. When the audience's owner is not an account here the check cannot run:
+/// 1. The audience's owner may always write under its own audience.
+/// 2. When the audience's owner is not an account here the check cannot run:
 ///    [`ParticipateAudienceOutcome::DeferredCrossDid`].
-/// 4. Otherwise the audience record decides, by its mode
+/// 3. Otherwise the audience record decides, by its mode
 ///    ([`crate::kryphocron_audience::resolve_write`]). A missing or
 ///    undecodable audience record denies.
 ///
@@ -804,9 +848,6 @@ async fn check_participate_audience(
     audience_uri: &str,
     writer_did: &str,
 ) -> PdsResult<ParticipateAudienceOutcome> {
-    let parent_owner = parse_record_uri(parent_uri)
-        .map(|uri| uri.did)
-        .ok_or_else(|| PdsError::Validation("invalid parent URI".to_string()))?;
     let owner_did = audience_owner(audience_uri)
         .ok_or_else(|| PdsError::Validation("invalid audience URI".to_string()))?;
     let denied = |mode: &str, result: AudienceCheckResult| {
@@ -821,17 +862,6 @@ async fn check_participate_audience(
             payload_completeness: crate::kryphocron_audit::PayloadCompleteness::Full,
         })
     };
-
-    if ctx.actor_store.exists(parent_owner).await {
-        let names_same_audience = load_record_json(ctx, parent_owner, parent_uri)
-            .await?
-            .is_some_and(|parent| {
-                audience_reference(&parent) == AudienceRef::Uri(audience_uri.to_string())
-            });
-        if !names_same_audience {
-            return Ok(denied("unknown", AudienceCheckResult::NoAudienceConfigured));
-        }
-    }
 
     if owner_did == writer_did {
         return Ok(ParticipateAudienceOutcome::Allowed);
@@ -975,9 +1005,10 @@ async fn delete_audience(
 /// writer's own audience records, or names one that does not exist.
 /// `swapRecord` must be the post's current CID (409 `InvalidSwap`).
 ///
-/// Replies already written keep their own `audienceList`. A new reply to
-/// this post must name the new audience: `participatePrivate` requires a
-/// reply to name its local parent's audience.
+/// The change applies downthread (A-12): replies already written keep their
+/// own `audienceList` but are read under the root's new audience, and every
+/// new reply anywhere in the thread must name the new audience, which
+/// `participatePrivate` and `createPostPrivate` both require.
 async fn update_post_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -1310,55 +1341,6 @@ mod participate_audience_tests {
             assert_eq!(refused.audience_mode, word, "{mode}");
             assert_allowed(check(&ctx, &post, &audience, OWNER).await);
         }
-    }
-
-    #[tokio::test]
-    async fn a_reply_must_name_its_local_parents_audience() {
-        let (ctx, post) = thread(json!("everyone")).await;
-        // The writer's own audience, and the third account's open one.
-        seed(&ctx, WRITER, NSID_AUDIENCE, "aud", json!({ "mode": "everyone" })).await;
-        seed(&ctx, THIRD, NSID_AUDIENCE, "aud", json!({ "mode": "everyone" })).await;
-        for other in [audience_uri(WRITER), audience_uri(THIRD)] {
-            let refused = denial(check(&ctx, &post, &other, WRITER).await);
-            assert_eq!(
-                refused.audience_check_result,
-                AudienceCheckResult::NoAudienceConfigured
-            );
-            assert_eq!(refused.audience_mode, "unknown");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_missing_or_unreadable_parent_is_refused_alike() {
-        let (ctx, _post) = thread(json!("everyone")).await;
-        let audience = audience_uri(OWNER);
-        seed(&ctx, OWNER, NSID_POST_PRIVATE, "noaud", json!({ "text": "x" })).await;
-        seed(&ctx, OWNER, NSID_POST_PRIVATE, "junk", json!({ "audienceList": "garbage" })).await;
-        seed_bytes(&ctx, OWNER, NSID_POST_PRIVATE, "broken", b"not cbor").await;
-        for rkey in ["absent", "noaud", "junk", "broken"] {
-            let refused = denial(check(&ctx, &post_uri(OWNER, rkey), &audience, WRITER).await);
-            assert_eq!(
-                refused.audience_check_result,
-                AudienceCheckResult::NoAudienceConfigured,
-                "{rkey}"
-            );
-            assert_eq!(refused.audience_mode, "unknown", "{rkey}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_parent_naming_its_audience_as_an_object_is_matched() {
-        let ctx = ctx_with_repos(&[OWNER, WRITER]).await;
-        seed(&ctx, OWNER, NSID_AUDIENCE, "aud", json!({ "mode": "everyone" })).await;
-        let post = seed(
-            &ctx,
-            OWNER,
-            NSID_POST_PRIVATE,
-            "p1",
-            json!({ "audienceList": { "uri": audience_uri(OWNER) } }),
-        )
-        .await;
-        assert_allowed(check(&ctx, &post, &audience_uri(OWNER), WRITER).await);
     }
 
     #[tokio::test]
@@ -1750,6 +1732,7 @@ mod procedure_tests {
             std::sync::Arc::new(crate::identity::resolver::test_doubles::MockIdentityResolver::new());
         let alice = account(&ctx, "alice").await;
         let bob = account(&ctx, "bob").await;
+        let dave = account(&ctx, "dave").await;
         let open = audience(&ctx, &alice, "aud", json!({ "mode": "everyone" }), None)
             .await
             .unwrap();
@@ -1759,10 +1742,33 @@ mod procedure_tests {
         let first = participate(&ctx, &bob, reply_record(&open.uri, &root, &root.uri))
             .await
             .expect("a reply in the owner's thread");
-        // So is a reply to that reply.
-        participate(&ctx, &alice, reply_record(&open.uri, &root, &first.uri))
+        // So is a third member's reply to that reply, walked through Bob's.
+        participate(&ctx, &dave, reply_record(&open.uri, &root, &first.uri))
             .await
             .expect("a reply further down the owner's thread");
+
+        // A thread planted by Dave under Alice's audience, written around the
+        // procedures: neither a member nor Alice herself (the audience's
+        // owner, not this root's author) may reply into it.
+        let planted = crate::kryphocron_audience::test_support::seed(
+            &ctx,
+            &dave,
+            NSID_POST_PRIVATE,
+            "3planted22",
+            json!({ "$type": NSID_POST_PRIVATE, "audienceList": open.uri,
+                    "createdAt": "2026-10-16T00:00:00Z" }),
+        )
+        .await;
+        let planted_ref = WriteResponse {
+            uri: planted.clone(),
+            cid: "bafyplanted".to_string(),
+        };
+        for writer in [&bob, &alice] {
+            let err = participate(&ctx, writer, reply_record(&open.uri, &planted_ref, &planted))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::Authorization(_)), "{writer}: {err:?}");
+        }
 
         // An invented parent on another PDS is refused.
         let invented = format!("at://did:plc:elsewhere/{NSID_POST_PRIVATE}/3abc");
@@ -1777,6 +1783,112 @@ mod procedure_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+    }
+
+    /// A-12, Horizon's "done when": an audience change applies downthread.
+    #[tokio::test]
+    async fn a_move_takes_the_whole_thread_with_it() {
+        let mut ctx =
+            crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        ctx.identity_resolver =
+            std::sync::Arc::new(crate::identity::resolver::test_doubles::MockIdentityResolver::new());
+        let alice = account(&ctx, "alice").await;
+        let bob = account(&ctx, "bob").await;
+        let carol = account(&ctx, "carol").await;
+        let followers = audience(&ctx, &alice, "followers", json!({ "mode": "followers" }), None)
+            .await
+            .unwrap();
+        let close = audience(
+            &ctx,
+            &alice,
+            "close",
+            json!({ "mode": "list", "members": [carol] }),
+            None,
+        )
+        .await
+        .unwrap();
+        // Bob follows Alice.
+        RepositoryManager::for_writer(&ctx, bob.clone())
+            .create_record(
+                "app.bsky.graph.follow",
+                None,
+                json!({ "$type": "app.bsky.graph.follow", "subject": alice,
+                        "createdAt": "2026-10-16T00:00:00Z" }),
+                Some(false),
+                create_actor_signer(&ctx.account_manager, &bob).await.unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let root = post(&ctx, &alice, post_record(&followers.uri)).await;
+        let bobs = participate(&ctx, &bob, reply_record(&followers.uri, &root, &root.uri))
+            .await
+            .expect("a follower replies under followers");
+
+        // Alice moves the root to a list with Carol but not Bob.
+        update(&ctx, &alice, rkey_of(&root.uri), &close.uri, None)
+            .await
+            .unwrap();
+
+        // Carol replies to Bob's reply, written before the move, naming the list.
+        participate(&ctx, &carol, reply_record(&close.uri, &root, &bobs.uri))
+            .await
+            .expect("a member added by the move replies anywhere in the thread");
+
+        // Bob, removed by the move, is refused under either audience.
+        for audience_uri in [&close.uri, &followers.uri] {
+            for parent in [&root.uri, &bobs.uri] {
+                let err = participate(&ctx, &bob, reply_record(audience_uri, &root, parent))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, PdsError::Authorization(_)),
+                    "{audience_uri} {parent}: {err:?}"
+                );
+            }
+        }
+
+        // Nor can Bob get in through createPostPrivate under his own audience.
+        let bobs_own = audience(&ctx, &bob, "own", json!({ "mode": "everyone" }), None)
+            .await
+            .unwrap();
+        let err = create_post_private(
+            State(ctx.clone()),
+            session(&bob),
+            Json(CreateLikeRequest {
+                repo: bob.clone(),
+                rkey: None,
+                validate: None,
+                record: reply_record(&bobs_own.uri, &root, &bobs.uri),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+
+        // Alice replies in her own thread through createPostPrivate: under the
+        // root's current audience, not the old one.
+        let alices_reply = |audience_uri: &str| CreateLikeRequest {
+            repo: alice.clone(),
+            rkey: None,
+            validate: None,
+            record: reply_record(audience_uri, &root, &bobs.uri),
+        };
+        let err = create_post_private(
+            State(ctx.clone()),
+            session(&alice),
+            Json(alices_reply(&followers.uri)),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
+        let _stored = create_post_private(
+            State(ctx.clone()),
+            session(&alice),
+            Json(alices_reply(&close.uri)),
+        )
+        .await
+        .expect("the root's author replies under the current audience");
     }
 
     #[tokio::test]
