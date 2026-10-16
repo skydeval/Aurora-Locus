@@ -311,7 +311,7 @@ tune the recovery override and the file-tier YAML path.
 | Variable | Default | Type | Purpose |
 |---|---|---|---|
 | `PDS_RUNTIME_FILE` | `{PDS_DATA_DIRECTORY}/runtime.yaml` | path | File-tier YAML path. Unknown keys warn-and-skip; invalid values warn-and-skip; malformed YAML produces a clear startup error with the file path. |
-| `AURORA_RECOVERY_MODE` | `false` | boolean | Recovery-mode override. When `true`, bypasses the tier hierarchy for emergency operator action (read-only on `moderation-mode`). |
+| `AURORA_RECOVERY_MODE` | `false` | boolean | Recovery-mode override (exactly `true` or `1`; anything else is off). It bypasses the tier hierarchy for emergency operator action (read-only on `moderation-mode`). It also lets `tools.kryphocron.*` records be written through `createRecord`, `putRecord` and `applyWrites` without the dedicated procedures and their checks: no audience check, no thread check for private replies, no content encoding. AppViews cannot tell those records from ones a procedure checked, and serve them as such. Turn it on only for the repair it is needed for, and off again as soon as that is done. |
 
 For the per-key value formats accepted by runtime settings, see
 [file-tier-config.md](file-tier-config.md).

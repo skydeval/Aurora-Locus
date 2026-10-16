@@ -27,6 +27,7 @@ mod identity;
 mod jobs;
 mod kryphocron;
 mod kryphocron_audience;
+mod kryphocron_thread;
 mod kryphocron_audit;
 mod kryphocron_content;
 mod kryphocron_oracle_activity;
