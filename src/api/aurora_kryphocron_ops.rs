@@ -1192,7 +1192,7 @@ pub async fn set_account_override(
     let now = chrono::Utc::now().to_rfc3339();
 
     let _guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     crate::kryphocron_override::upsert_override_in_tx(
         &mut tx,
         &input.did,

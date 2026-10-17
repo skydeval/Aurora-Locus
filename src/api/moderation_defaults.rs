@@ -215,7 +215,7 @@ pub async fn apply_report_default(ctx: &AppContext, report: &Report) -> PdsResul
             // the chain guard across the commit per LB-1.
             let server = server_did(ctx);
             let _chain_guard = AppendChainGuard::acquire().await;
-            let mut tx = ctx.account_db.begin().await?;
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await?;
 
             let applied = LabelManager::apply_label_in_tx(
                 &mut tx,
@@ -355,7 +355,7 @@ pub async fn scan_stale_hide_pending(ctx: &AppContext) -> PdsResult<usize> {
 
         // Removal (negative label) + audit entry atomically.
         let _chain_guard = AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await?;
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await?;
         LabelManager::remove_label_in_tx(
             &mut tx,
             &server,

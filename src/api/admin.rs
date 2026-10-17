@@ -1713,7 +1713,7 @@ async fn set_session_lifetime(
     // LB-1 / #122: override + chain in one transaction so a crash between the
     // two leaves neither, not a config change without an audit breadcrumb.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
     crate::admin::security_config::AdminSecurityStore::set_session_lifetime_in_tx(
@@ -1843,7 +1843,7 @@ async fn enroll_totp(
         did: auth.did.clone(),
     };
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal_error)?;
     crate::admin::security_config::AdminSecurityStore::set_totp_pending_in_tx(
         &mut tx,
         &auth.did,
@@ -1935,7 +1935,7 @@ async fn confirm_totp(
         did: auth.did.clone(),
     };
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal_error)?;
     let confirmed =
         crate::admin::security_config::AdminSecurityStore::confirm_totp_in_tx(&mut tx, &auth.did)
             .await
@@ -1987,7 +1987,7 @@ async fn disable_totp(
         did: auth.did.clone(),
     };
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal_error)?;
     crate::admin::security_config::AdminSecurityStore::clear_totp_in_tx(&mut tx, &auth.did)
         .await
         .map_err(internal_error)?;
@@ -2072,7 +2072,7 @@ async fn set_ip_binding(
         did: auth.did.clone(),
     };
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal_error)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal_error)?;
     crate::admin::security_config::AdminSecurityStore::set_ip_binding_in_tx(
         &mut tx,
         &auth.did,
@@ -2946,7 +2946,7 @@ async fn revoke_session(
 
     // Flip + audit atomically (LB-1 pattern; mirrors revoke_role).
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
     OperatorSessionStore::revoke_in_tx(&mut tx, &req.sid, &auth.did, rationale, now)
@@ -3052,7 +3052,7 @@ async fn revoke_operator_sessions(
     let now = chrono::Utc::now();
 
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(|e| {
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(|e| {
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "InternalServerError", e.to_string())
     })?;
     let count = OperatorSessionStore::revoke_all_for_did_in_tx(
@@ -13391,7 +13391,7 @@ mod tests {
         seed_test_account(&ctx, "did:plc:victimT", "vt.test", None).await;
         {
             let _guard = audit_chain::AppendChainGuard::acquire().await;
-            let mut tx = ctx.account_db.begin().await.unwrap();
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
             ModerationManager::apply_action_in_tx(
                 &mut tx,
                 ApplyActionParams {
@@ -13460,7 +13460,7 @@ mod tests {
         seed_test_account(&ctx, "did:plc:hh", "hh.test", None).await;
         {
             let _guard = audit_chain::AppendChainGuard::acquire().await;
-            let mut tx = ctx.account_db.begin().await.unwrap();
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
             crate::account::AccountManager::update_handle_in_tx(
                 &mut tx,
                 "did:plc:hh",
@@ -14166,7 +14166,7 @@ mod tests {
         // Neither row should land.
         {
             let _guard = audit_chain::AppendChainGuard::acquire().await;
-            let mut tx = ctx.account_db.begin().await.unwrap();
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
             crate::account::AccountManager::update_email_in_tx(
                 &mut tx,
                 "did:plc:atomictest",

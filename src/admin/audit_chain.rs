@@ -82,22 +82,20 @@
 //! `pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)` for cross-process
 //! serialization in multi-instance deployments.
 //!
-//! ## BEGIN IMMEDIATE on SQLite — known limitation
+//! ## BEGIN IMMEDIATE on SQLite
 //!
-//! v07_audit_coherence.md §6.1 specifies `BEGIN IMMEDIATE` for
-//! SQLite chain-writing transactions. sqlx 0.8's Any-backed
-//! `Pool::begin()` does not expose transaction-mode options for
-//! SQLite, so `BEGIN IMMEDIATE` cannot be set without abandoning
-//! the typed `Transaction` wrapper. AppendChainGuard (in-process
-//! mutex held across the caller's `tx.commit()`) plus SQLite's
-//! DB-level write lock provides equivalent single-writer-at-a-time
-//! serialization for single-instance SQLite deployments — the
-//! v0.6 deployment posture. Multi-instance SQLite is not a
-//! supported posture; multi-instance deployments use Postgres,
-//! where the advisory lock provides true cross-process
-//! serialization. A future sqlx upgrade exposing per-transaction
-//! BEGIN modes (or a refactor to backend-specific drivers for
-//! chain writes) would let this defense-in-depth land cleanly.
+//! v07_audit_coherence.md §6.1 specifies `BEGIN IMMEDIATE` for SQLite
+//! chain-writing transactions, and [`begin_chain_tx`] opens them that way
+//! (#519; sqlx 0.8's `Pool::begin_with` passes the statement through the Any
+//! driver). Without it, a chain write began deferred: it read the previous
+//! entry, then tried to upgrade to a write; if another connection had
+//! written in between (any account-DB writer, not only chain writers),
+//! SQLite in WAL mode refused the upgrade at once with `SQLITE_BUSY`, which
+//! the busy timeout cannot wait out, and the chain entry was lost. Taking
+//! the write lock at `BEGIN` makes the busy timeout apply instead.
+//! AppendChainGuard still serializes chain writers in-process; multi-instance
+//! deployments use Postgres, where the advisory lock serializes across
+//! processes.
 //!
 
 use crate::{admin::defs::Subject, error::PdsError};
@@ -571,10 +569,11 @@ impl AppendChainGuard {
 /// is skipped (the function does not exist on SQLite); the
 /// caller-acquired [`AppendChainGuard`] plus SQLite's DB-level write
 /// lock serialize chain writers in single-instance deployments. See the
-/// module-level "BEGIN IMMEDIATE on SQLite — known limitation" note
-/// for the multi-instance-SQLite caveat.
+/// module-level "BEGIN IMMEDIATE on SQLite" note.
 ///
 /// Caller contract:
+/// - Open the transaction with [`begin_chain_tx`], so on SQLite it holds
+///   the write lock from `BEGIN`.
 /// - Hold an [`AppendChainGuard`] across the caller's `tx.commit()`.
 /// - Pass the active [`crate::config::DatabaseBackend`] (typically
 ///   `ctx.config.database.backend`).
@@ -613,9 +612,8 @@ pub async fn insert_chain_entry(
         }
         crate::config::DatabaseBackend::Sqlite => {
             // No advisory-lock equivalent. Serialization via
-            // AppendChainGuard (caller-acquired) + SQLite's
-            // DB-write lock. See module-level note for the
-            // BEGIN IMMEDIATE limitation.
+            // AppendChainGuard (caller-acquired) + SQLite's write lock,
+            // taken at BEGIN by `begin_chain_tx` (module note).
         }
     }
     write_chain_entry_inner(tx, params).await
@@ -791,13 +789,32 @@ async fn write_chain_entry_inner(
 /// callers mutating other tables should open their own transaction
 /// and call [`insert_chain_entry`] directly so the chain entry lands
 /// atomically with the mutation.
+/// Open a transaction that will append to the audit chain. On SQLite it
+/// begins `IMMEDIATE`, taking the write lock up front so a concurrent writer
+/// is waited out by the busy timeout instead of failing the chain write
+/// (#519; see the module note). On Postgres it is a plain `BEGIN`; the
+/// advisory lock in [`insert_chain_entry`] serializes chain writers.
+///
+/// # Errors
+///
+/// The pool or the database failed to start the transaction.
+pub async fn begin_chain_tx(
+    db: &AnyPool,
+    backend: crate::config::DatabaseBackend,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
+    match backend {
+        crate::config::DatabaseBackend::Sqlite => db.begin_with("BEGIN IMMEDIATE").await,
+        crate::config::DatabaseBackend::Postgres => db.begin().await,
+    }
+}
+
 pub async fn insert_chain_entry_pool(
     db: &AnyPool,
     backend: crate::config::DatabaseBackend,
     params: AppendEntryParams<'_>,
 ) -> Result<i64, PdsError> {
     let _guard = AppendChainGuard::acquire().await;
-    let mut tx = db.begin().await?;
+    let mut tx = begin_chain_tx(db, backend).await?;
     let id = insert_chain_entry(&mut tx, backend, params).await?;
     tx.commit().await?;
     Ok(id)
@@ -2379,6 +2396,69 @@ mod tests {
         .await
         .unwrap();
         pool
+    }
+
+    /// #519: a chain write that read first and wrote second lost to any
+    /// other writer in between (WAL refuses the upgrade at once; the busy
+    /// timeout cannot help), and the chain entry was dropped. A transaction
+    /// from `begin_chain_tx` holds the write lock from `BEGIN`, so the other
+    /// writer waits for it instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_chain_write_waits_out_a_concurrent_writer() {
+        let pool = open_concurrent_test_pool(2).await;
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE other_writes (x INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let read = "SELECT COUNT(*) FROM audit_chain_entry";
+
+        // The failure, as it happened: a deferred transaction reads, another
+        // connection writes, and the deferred one cannot then write.
+        let mut deferred = pool.begin().await.unwrap();
+        sqlx::query(read).fetch_one(&mut *deferred).await.unwrap();
+        sqlx::query("INSERT INTO other_writes VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let upgrade = sqlx::query("INSERT INTO other_writes VALUES (2)")
+            .execute(&mut *deferred)
+            .await;
+        assert!(upgrade.is_err(), "a deferred read-then-write loses the race");
+        drop(deferred);
+
+        // The fix: the chain transaction holds the lock; the other writer
+        // waits for its commit, and both writes land.
+        let mut chain = begin_chain_tx(&pool, crate::config::DatabaseBackend::Sqlite)
+            .await
+            .unwrap();
+        sqlx::query(read).fetch_one(&mut *chain).await.unwrap();
+        let other = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                sqlx::query("INSERT INTO other_writes VALUES (3)")
+                    .execute(&pool)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sqlx::query("INSERT INTO other_writes VALUES (4)")
+            .execute(&mut *chain)
+            .await
+            .expect("the chain transaction keeps its write lock");
+        chain.commit().await.unwrap();
+        other
+            .await
+            .unwrap()
+            .expect("the other writer waited and then wrote");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM other_writes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
