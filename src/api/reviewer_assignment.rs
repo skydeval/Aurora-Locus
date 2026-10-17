@@ -783,7 +783,7 @@ mod tests {
             .bind(resolved.id).execute(&ctx.account_db).await.unwrap();
 
         let _guard = audit_chain::AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await.unwrap();
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
         handle_operator_removal_in_tx(
             &mut tx,
             ctx.config.database.backend,

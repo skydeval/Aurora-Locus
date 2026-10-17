@@ -138,7 +138,7 @@ async fn perform_grant(
 ) -> PdsResult<GrantOutcome> {
     let _chain_guard = AppendChainGuard::acquire().await;
 
-    let mut tx = ctx.account_db.begin().await?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await?;
 
     let existing = sqlx::query(
         "SELECT role, revoked FROM admin_roles WHERE did = $1",

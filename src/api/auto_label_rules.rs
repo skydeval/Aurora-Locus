@@ -260,7 +260,7 @@ async fn apply_and_audit(
     let server = server_did(ctx);
     let backend = ctx.config.database.backend;
     let _guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await?;
     let app = LabelManager::apply_label_in_tx(
         &mut tx,
         &server,

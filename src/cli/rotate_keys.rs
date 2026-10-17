@@ -338,7 +338,7 @@ async fn rotate_key_for_did(
         "entry_point": "cli",
     });
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(PdsError::Database)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(PdsError::Database)?;
     audit_chain::insert_chain_entry(
         &mut tx,
         ctx.config.database.backend,

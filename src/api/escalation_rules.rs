@@ -573,7 +573,7 @@ async fn apply_escalation(
 
     for attempt in 0..CAS_MAX_RETRIES {
         let _guard = AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await?;
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await?;
         if !acquire_eval_lock_in_tx(&mut tx, backend, item_id).await {
             let _ = tx.rollback().await;
             drop(_guard);
@@ -855,7 +855,7 @@ pub async fn clear_escalation(
     let subject = Subject::Repo { did: account.clone() };
 
     let _guard = AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     if mode == "manual" {
         // Preserve the assignee; just exit the escalation episode.
         sqlx::query("UPDATE report SET status = 'acknowledged', assignment_source = 'manual_override' WHERE id = $1")

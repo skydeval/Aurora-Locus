@@ -744,7 +744,7 @@ pub async fn emit_event(
     let action_str = action_kind_str(&input.action);
     let details = build_event_details(&input, &metadata);
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
 
     let mut effects = DispatchEffects::default();
     for (idx, subject) in input.subjects.iter().enumerate() {
@@ -1761,7 +1761,7 @@ pub async fn batch_takedown_accounts(
     // The chain entry, moderation_event row, and every per-subject
     // takedown_account_in_tx call land together or none of them do.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let event_id = insert_batch_account_moderations_in_tx(
         &mut tx,
         &auth.did,
@@ -1869,7 +1869,7 @@ pub async fn batch_suspend_accounts(
     // moderation_event row IS the suspension record), so no
     // savepoints / failures[] needed.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let event_id = insert_batch_account_moderations_in_tx(
         &mut tx,
         &auth.did,
@@ -1943,7 +1943,7 @@ pub async fn batch_restore_accounts(
     // Genuine driver errors (constraint violations, connection drops)
     // propagate as 500.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let event_id = insert_batch_account_moderations_in_tx(
         &mut tx,
         &auth.did,
@@ -2028,7 +2028,7 @@ pub async fn batch_takedown_records(
     // Record-takedown is intentionally all-or-nothing — per-row
     // failures abort the whole batch (no failures[] surface).
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
     for uri in &input.uris {
@@ -2137,7 +2137,7 @@ pub async fn batch_apply_label(
     // Label-apply is intentionally all-or-nothing — per-row
     // failures abort the whole batch (no failures[] surface).
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     let server_did = format!("did:web:{}", ctx.config.service.hostname);
     for subject in &input.subjects {
@@ -2288,7 +2288,7 @@ pub async fn batch_remove_label(
     // response and are not part of the chain entry's
     // cascade_subjects.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let now = chrono::Utc::now().to_rfc3339();
     for (_subject, uri, cid, _snap) in &applied_subjects {
         sqlx::query(
@@ -2461,7 +2461,7 @@ pub async fn trigger_password_reset(
     // Mailer failure no longer leaves the operator with a token that
     // wasn't audited.
     let _chain_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let token = crate::account::AccountManager::generate_password_reset_token_in_tx(
         &mut tx,
         &input.did,
@@ -5596,7 +5596,7 @@ async fn write_runtime_setting_audited_with_tx(
             runtime_setting_row_writes(tx, ctx, key, &value_json, &now, actor_did, rationale).await
         }
         None => {
-            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
             let audit_entry_id = runtime_setting_row_writes(
                 &mut tx, ctx, key, &value_json, &now, actor_did, rationale,
             )
@@ -5715,7 +5715,7 @@ pub async fn delete_runtime_setting(
         // Restart-required key: delete + audit + marker(s) atomically. The guard
         // is held by THIS caller from before begin() until after commit (§3.5).
         let _guard = audit_chain::AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
         let id = delete_runtime_setting_with_tx(
             &ctx,
             &input.key,
@@ -5798,7 +5798,7 @@ async fn delete_runtime_setting_with_tx(
     match outer_tx {
         Some(tx) => delete_runtime_setting_row_writes(tx, ctx, key, actor_did, rationale).await,
         None => {
-            let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+            let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
             let id = delete_runtime_setting_row_writes(&mut tx, ctx, key, actor_did, rationale).await?;
             tx.commit().await.map_err(internal)?;
             Ok(id)
@@ -5908,7 +5908,7 @@ async fn save_runtime_setting_with_restart_marker(
     marker_payload: &str,
 ) -> Result<i64, (StatusCode, Json<serde_json::Value>)> {
     let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut outer_tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
     let audit_entry_id = write_runtime_setting_audited_with_tx(
         ctx,
         key,
@@ -5952,7 +5952,7 @@ async fn save_service_public_url_with_bulk_update(
     let started_at = chrono::Utc::now().to_rfc3339();
 
     let _audit_guard = audit_chain::AppendChainGuard::acquire().await;
-    let mut outer_tx = ctx.account_db.begin().await.map_err(internal)?;
+    let mut outer_tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
 
     let audit_entry_id = write_runtime_setting_audited_with_tx(
         ctx,
@@ -6050,7 +6050,7 @@ pub async fn trigger_restart(
     // Record the operator's restart intent in the audit chain.
     let audit_entry_id = {
         let _guard = audit_chain::AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await.map_err(internal)?;
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.map_err(internal)?;
         let id = audit_chain::insert_chain_entry(
             &mut tx,
             ctx.config.database.backend,
@@ -6639,7 +6639,7 @@ mod tests {
         let key = "test.c3.commit";
         // Caller owns the guard (acquired BEFORE begin) and the transaction.
         let _guard = audit_chain::AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await.unwrap();
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
         write_runtime_setting_audited_with_tx(
             &ctx,
             key,
@@ -6697,7 +6697,7 @@ mod tests {
         let ctx = create_test_context().await;
         let key = "test.c3.rollback";
         let _guard = audit_chain::AppendChainGuard::acquire().await;
-        let mut tx = ctx.account_db.begin().await.unwrap();
+        let mut tx = crate::admin::audit_chain::begin_chain_tx(&ctx.account_db, ctx.config.database.backend).await.unwrap();
         write_runtime_setting_audited_with_tx(
             &ctx,
             key,
