@@ -138,6 +138,27 @@ impl CommitOutcome {
     }
 }
 
+/// The most writes one commit may carry (the atproto limit).
+const MAX_WRITES_PER_COMMIT: usize = 200;
+
+/// A record the index holds but the repository's tree has lost (#505).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LostRecord {
+    pub collection: String,
+    pub rkey: String,
+    /// The record's CID, as the index holds it.
+    pub cid: String,
+}
+
+/// What [`RepositoryManager::restore_missing_to_tree`] did: the records it
+/// put back, and the commits that did it (none when nothing was lost; more
+/// than one only past [`MAX_WRITES_PER_COMMIT`] records).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRestore {
+    pub restored: Vec<LostRecord>,
+    pub commits: Vec<CommitOutcome>,
+}
+
 /// Per-record bookkeeping captured during commit prep so we can update
 /// the SQLite `record` table after the proto-blue commit lands and so
 /// Phase B (Arc 16e §9.5.3.2.2) can compute per-record STRICT / unref
@@ -998,7 +1019,7 @@ impl RepositoryManager {
         mut cascade_context: Option<&mut crate::cascade::CascadeContext>,
     ) -> PdsResult<CommitOutcome> {
         // ATProto spec: max 200 writes per commit.
-        if writes.len() > 200 {
+        if writes.len() > MAX_WRITES_PER_COMMIT {
             return Err(PdsError::Validation(
                 "Too many writes in batch. Maximum: 200 operations per commit".to_string(),
             ));
@@ -2209,6 +2230,127 @@ impl RepositoryManager {
         Ok(())
     }
 
+    /// The records this repository's index holds that its current record
+    /// tree does not (#505), in key order.
+    ///
+    /// proto-blue-repo 0.3.3's tree delete could drop neighbouring records
+    /// from the tree while the index kept them. Read-only.
+    pub async fn records_missing_from_tree(&self) -> PdsResult<Vec<LostRecord>> {
+        let storage: Arc<dyn RepoStorage> = self.make_storage();
+        let in_tree: BTreeSet<String> = tokio::task::spawn_blocking(move || {
+            Repo::load(storage).map(|repo| {
+                repo.mst()
+                    .leaves()
+                    .into_iter()
+                    .map(|leaf| leaf.key)
+                    .collect::<BTreeSet<String>>()
+            })
+        })
+        .await
+        .map_err(|e| PdsError::Internal(format!("tree read task failed: {e}")))?
+        .map_err(|e| PdsError::Internal(format!("could not load repository {}: {e}", self.did)))?;
+
+        let mut lost: Vec<LostRecord> = self
+            .store
+            .list_all_records(&self.did)
+            .await?
+            .into_iter()
+            .filter(|record| !in_tree.contains(&format!("{}/{}", record.collection, record.rkey)))
+            .map(|record| LostRecord {
+                collection: record.collection,
+                rkey: record.rkey,
+                cid: record.cid,
+            })
+            .collect();
+        lost.sort_by(|a, b| (&a.collection, &a.rkey).cmp(&(&b.collection, &b.rkey)));
+        Ok(lost)
+    }
+
+    /// Put every record the tree has lost back into it, in signed commits of
+    /// at most [`MAX_WRITES_PER_COMMIT`] records each (#505). Answers the
+    /// restored records and the commits.
+    ///
+    /// Each record goes back as the block the index already points at: the
+    /// block is decoded and re-encoded, and the restore is refused before
+    /// anything is written if that would give any record a different CID.
+    /// The commit goes through the ordinary write path, so the #505 check
+    /// verifies the new tree, and the firehose announces each record as a
+    /// create. Re-indexing an indexed record and re-linking its blobs are
+    /// both no-ops.
+    ///
+    /// # Errors
+    ///
+    /// - [`PdsError::Validation`] when a lost record is in the private tier
+    ///   (`tools.kryphocron.*`): those are written only through their
+    ///   dedicated endpoints, and the generic write path refuses them.
+    /// - [`PdsError::Internal`] when a record's block is missing, does not
+    ///   decode, or would not re-encode to its CID.
+    /// - Any error of [`Self::apply_writes_detailed`].
+    pub async fn restore_missing_to_tree(
+        &self,
+        signer: Arc<dyn Signer>,
+    ) -> PdsResult<TreeRestore> {
+        let lost = self.records_missing_from_tree().await?;
+        if let Some(private) = lost
+            .iter()
+            .find(|record| record.collection.starts_with("tools.kryphocron."))
+        {
+            return Err(PdsError::Validation(format!(
+                "{}/{} is a private-tier record and cannot be restored by this tool",
+                private.collection, private.rkey
+            )));
+        }
+
+        let mut writes = Vec::with_capacity(lost.len());
+        for record in &lost {
+            let key = format!("{}/{}", record.collection, record.rkey);
+            let bytes = self
+                .store
+                .get_block(&self.did, &record.cid)
+                .await?
+                .ok_or_else(|| PdsError::Internal(format!("{key}: block {} is missing", record.cid)))?;
+            let value = proto_blue::lex_json::lex_to_json(
+                &proto_blue::lex_cbor::decode(&bytes)
+                    .map_err(|e| PdsError::Internal(format!("{key}: block does not decode: {e}")))?,
+            );
+            let round_trip = cid_for_lex(&json_to_lex(&value))
+                .map_err(|e| PdsError::Internal(format!("{key}: CID computation failed: {e}")))?;
+            if round_trip.to_string() != record.cid {
+                return Err(PdsError::Internal(format!(
+                    "{key}: re-encoding gives {round_trip}, not the stored {}",
+                    record.cid
+                )));
+            }
+            writes.push(WriteOp {
+                action: WriteOpAction::Create,
+                collection: record.collection.clone(),
+                rkey: record.rkey.clone(),
+                value: Some(value),
+                validate: Some(false),
+                swap_cid: None,
+                kryphocron_authorization: None,
+            });
+        }
+
+        let mut commits = Vec::new();
+        let mut pending = writes.into_iter().peekable();
+        while pending.peek().is_some() {
+            let batch: Vec<WriteOp> = pending.by_ref().take(MAX_WRITES_PER_COMMIT).collect();
+            commits.push(
+                self.apply_writes_detailed(
+                    batch,
+                    signer.clone(),
+                    Arc::new(crate::blob_store::StrictPromoter),
+                )
+                .await?,
+            );
+        }
+        Ok(TreeRestore {
+            restored: lost,
+            commits,
+        })
+    }
+
     /// Apply batch writes atomically
     pub async fn apply_batch_writes(
         &self,
@@ -2623,6 +2765,129 @@ mod tests {
             let held: BTreeSet<String> = stored_keys(&repo_mgr, &keys).await.into_iter().collect();
             assert_eq!(held, expected, "after deleting {collection}/{rkey}");
         }
+    }
+
+    // ---- #505 — restoring records a tree lost ----
+
+    /// Index `value` at `collection/rkey`, storing its block under `cid` (its
+    /// own CID when `None`), without touching the tree.
+    async fn index_only(
+        repo_mgr: &RepositoryManager,
+        collection: &str,
+        rkey: &str,
+        value: serde_json::Value,
+        cid: Option<String>,
+    ) -> String {
+        let lex = json_to_lex(&value);
+        let cid = cid.unwrap_or_else(|| cid_for_lex(&lex).unwrap().to_string());
+        let bytes = proto_blue::lex_cbor::encode(&lex).unwrap();
+        repo_mgr.store.put_block(&repo_mgr.did, &cid, &bytes).await.unwrap();
+        let uri = format!("at://{}/{collection}/{rkey}", repo_mgr.did);
+        repo_mgr
+            .store
+            .put_record(&repo_mgr.did, &uri, &cid, collection, rkey, "r")
+            .await
+            .unwrap();
+        cid
+    }
+
+    async fn new_repo_with(keys: &[(&str, &str)]) -> (RepositoryManager, TempDir) {
+        let (store, tmp) = test_store();
+        let repo_mgr = RepositoryManager::new(unique_did(), store);
+        repo_mgr.initialize().await.unwrap();
+        for (i, (collection, rkey)) in keys.iter().enumerate() {
+            repo_mgr
+                .create_record(collection, Some(rkey), serde_json::json!({ "n": i }), Some(false), test_signer())
+                .await
+                .expect("create");
+        }
+        (repo_mgr, tmp)
+    }
+
+    /// A tree that lost records the index kept, as #505 left two live
+    /// repositories: the restore puts each back with its CID unchanged, in
+    /// one commit, and a second run finds nothing to do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lost_records_go_back_with_their_cids() {
+        let keys: [(&str, &str); 5] = [
+            ("app.bsky.graph.follow", "3mxuds436km2k"),
+            ("app.bsky.graph.list", "3mxukozoc522u"),
+            ("app.bsky.graph.starterpack", "3mxukp22ax22u"),
+            ("app.bsky.labeler.service", "self"),
+            ("app.bsky.actor.profile", "self"),
+        ];
+        let (repo_mgr, _tmp) = new_repo_with(&keys).await;
+        assert!(repo_mgr.records_missing_from_tree().await.unwrap().is_empty());
+
+        // Drop two records from the tree only, as the faulty delete did.
+        let storage: Arc<dyn RepoStorage> = repo_mgr.make_storage();
+        tokio::task::spawn_blocking(move || {
+            let mut repo = Repo::load(storage).unwrap();
+            let drop = [("app.bsky.graph.list", "3mxukozoc522u"), ("app.bsky.labeler.service", "self")]
+                .map(|(c, r)| RepoWrite::Delete { collection: c.to_string(), rkey: r.to_string() });
+            repo.apply_writes(&drop, test_signer().as_ref()).unwrap();
+        })
+        .await
+        .unwrap();
+        let held = stored_keys(&repo_mgr, &keys).await;
+        let lost = repo_mgr.records_missing_from_tree().await.unwrap();
+        let lost_keys: Vec<String> = lost.iter().map(|r| format!("{}/{}", r.collection, r.rkey)).collect();
+        assert!(lost_keys.contains(&"app.bsky.graph.list/3mxukozoc522u".to_string()));
+        assert!(lost_keys.contains(&"app.bsky.labeler.service/self".to_string()));
+        assert_eq!(held.len() + lost.len(), keys.len(), "lost is exactly what the tree lacks");
+
+        let restore = repo_mgr.restore_missing_to_tree(test_signer()).await.unwrap();
+        assert_eq!(restore.restored, lost);
+        assert_eq!(restore.commits.len(), 1);
+        for (record, result) in lost.iter().zip(&restore.commits[0].results) {
+            assert_eq!(result.cid.as_deref(), Some(record.cid.as_str()), "CID unchanged");
+            let uri = format!("at://{}/{}/{}", repo_mgr.did, record.collection, record.rkey);
+            assert_eq!(store_record_cid(&repo_mgr, &uri).await, record.cid);
+        }
+        assert_eq!(stored_keys(&repo_mgr, &keys).await.len(), keys.len());
+        assert!(repo_mgr.records_missing_from_tree().await.unwrap().is_empty());
+
+        let again = repo_mgr.restore_missing_to_tree(test_signer()).await.unwrap();
+        assert!(again.restored.is_empty() && again.commits.is_empty(), "nothing left to do");
+    }
+
+    /// A record whose stored block would re-encode to another CID is not
+    /// restored, and neither is anything else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_that_would_change_cid_stops_the_restore() {
+        let (repo_mgr, _tmp) = new_repo_with(&[("app.bsky.actor.profile", "self")]).await;
+        index_only(&repo_mgr, "app.bsky.feed.post", "3mxaaaaaaaa2k", serde_json::json!({ "n": 1 }), None).await;
+        let other = cid_for_lex(&json_to_lex(&serde_json::json!({ "n": 2 }))).unwrap().to_string();
+        index_only(&repo_mgr, "app.bsky.feed.post", "3mxbbbbbbbb2k", serde_json::json!({ "n": 3 }), Some(other)).await;
+
+        let err = repo_mgr.restore_missing_to_tree(test_signer()).await.unwrap_err();
+        assert!(err.to_string().contains("3mxbbbbbbbb2k"), "{err}");
+        assert_eq!(repo_mgr.records_missing_from_tree().await.unwrap().len(), 2, "nothing restored");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn private_tier_records_are_not_restored() {
+        let (repo_mgr, _tmp) = new_repo_with(&[("app.bsky.actor.profile", "self")]).await;
+        index_only(&repo_mgr, "tools.kryphocron.feed.postPrivate", "3mxdddddddd2k", serde_json::json!({ "n": 1 }), None).await;
+
+        let err = repo_mgr.restore_missing_to_tree(test_signer()).await.unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "{err}");
+        assert_eq!(repo_mgr.records_missing_from_tree().await.unwrap().len(), 1);
+    }
+
+    /// Past the per-commit limit the restore splits into several commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_restore_spans_commits() {
+        let (repo_mgr, _tmp) = new_repo_with(&[("app.bsky.actor.profile", "self")]).await;
+        for i in 0..(MAX_WRITES_PER_COMMIT + 3) {
+            index_only(&repo_mgr, "app.bsky.feed.like", &format!("3mx{i:010}"), serde_json::json!({ "n": i }), None).await;
+        }
+
+        let restore = repo_mgr.restore_missing_to_tree(test_signer()).await.unwrap();
+        assert_eq!(restore.restored.len(), MAX_WRITES_PER_COMMIT + 3);
+        let sizes: Vec<usize> = restore.commits.iter().map(|c| c.results.len()).collect();
+        assert_eq!(sizes, vec![MAX_WRITES_PER_COMMIT, 3]);
+        assert!(repo_mgr.records_missing_from_tree().await.unwrap().is_empty());
     }
 
     // ---- #449 — putRecord upsert semantics ----
