@@ -21,6 +21,7 @@ pub mod keygen;
 pub mod metrics;
 pub mod migrate_oauth;
 pub mod publish_identity;
+pub mod repair_tree;
 pub mod rotate_keys;
 pub mod service_token;
 pub mod validate_config;
@@ -269,6 +270,22 @@ pub enum Commands {
         /// Override `gc_sweep.page_size`.
         #[arg(long)]
         page_size: Option<usize>,
+    },
+
+    /// Put back the records a repository's tree lost while its index kept
+    /// them (#505), in signed commits through the ordinary write path, and
+    /// record the repair in the audit chain. Safe to run while serving.
+    RepairTree {
+        /// DID of the repository
+        did: String,
+
+        /// List the missing records without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Optional rationale recorded in the audit entry
+        #[arg(long)]
+        rationale: Option<String>,
     },
 
     /// Debug utilities

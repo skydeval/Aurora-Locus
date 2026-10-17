@@ -328,6 +328,14 @@ async fn main() -> PdsResult<()> {
             .await?;
         }
 
+        Some(Commands::RepairTree {
+            did,
+            dry_run,
+            rationale,
+        }) => {
+            cli::repair_tree::run(&ctx, &did, dry_run, rationale.as_deref()).await?;
+        }
+
         Some(Commands::Debug { subcommand }) => {
             use cli::DebugCommands;
             match subcommand {
