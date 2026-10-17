@@ -4352,8 +4352,7 @@ dependencies = [
 [[package]]
 name = "proto-blue"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0496f1e47a65960577f967268e709b2149d8348753f316450c1ce8104463a93"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "proto-blue-api",
  "proto-blue-common",
@@ -4373,8 +4372,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-api"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2d4678f5669058609c2ac0386d5036ccc1b0bc6cd71fb1634ca057b700852ab"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "chrono",
  "once_cell",
@@ -4394,8 +4392,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-common"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a097408ed41aeefb44f1a25e8b43d7072ddd1dcb6d58304dc7bff02eea3b1e7"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4423,8 +4420,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-crypto"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30d359b27dc973a16c849ad9fa62fef1e4da271a3d33b91cf9a1acd37ce3dc"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "base64 0.22.1",
  "bs58",
@@ -4441,8 +4437,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-identity"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f343ad4e5a0fc271a91173350f39aefe23dcc449aa8081da0088a2da0772aac0"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "futures",
  "hickory-resolver",
@@ -4458,8 +4453,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-cbor"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3401aceb571e86b15ed0b67f8acb3a34353f27bcda6ea4be1bc07f5f3930821"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "ciborium",
  "proto-blue-lex-data",
@@ -4470,8 +4464,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-data"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d1cbe6b58f9f8fcd303478f482d41472e92ae2c4f72249d537f9acfe9e13bd6"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "multibase",
  "serde",
@@ -4483,8 +4476,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lex-json"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d979414e5232ce0e934ed05775a5c119e1d51a221df1f90932b18216d290c3b4"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "base64 0.22.1",
  "proto-blue-lex-data",
@@ -4495,8 +4487,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-lexicon"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf281ccbf0fc30f1d075ececdc85c5ec793a41c989e4b346e04f98ecedf2a07b"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "proto-blue-common",
  "proto-blue-lex-data",
@@ -4509,8 +4500,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-oauth"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68f63e577caeebcc9bd517dc8a273c5caf11142cb6644514749f3a863682ae0"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4534,8 +4524,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-repo"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a854867c28fbf24ed09402dcb9f2b8745917639120f596b449b0e81b0ea6802"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "futures",
  "proto-blue-common",
@@ -4556,8 +4545,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-syntax"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a90d01d1c84072229bfed56be3062fe605ace06bebb5b9ca011f069c374048f"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "chrono",
  "once_cell",
@@ -4569,8 +4557,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-ws"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fda321b044859f23d9ca2726549b7faacaeb13dfb154f8e012ead4cb0c7345f"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "async-trait",
  "futures",
@@ -4588,8 +4575,7 @@ dependencies = [
 [[package]]
 name = "proto-blue-xrpc"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d4b312395ef65853d2577517814b13015a438962f344e88ba6f3fbf682cd548"
+source = "git+https://github.com/dollspace-gay/proto-blue?rev=7a3fb57#7a3fb57063594a93473deb64b1aac97450e53190"
 dependencies = [
  "axum 0.8.9",
  "chrono",

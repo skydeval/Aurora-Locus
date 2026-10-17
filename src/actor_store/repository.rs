@@ -2675,9 +2675,8 @@ mod tests {
     }
 
     /// The tree a live repository lost six records from (#505): the same
-    /// keys, so the same tree shape. Deleting the feed generator either
-    /// succeeds and leaves the other six, or is refused and leaves all seven;
-    /// it never stores a tree that lost the others.
+    /// keys, so the same tree shape. With the fixed proto-blue-repo, deleting
+    /// the feed generator succeeds and leaves the other six.
     #[tokio::test(flavor = "multi_thread")]
     async fn deleting_one_record_never_loses_its_neighbours() {
         let keys: [(&str, &str); 7] = [
@@ -2707,17 +2706,13 @@ mod tests {
         }
         assert_eq!(stored_keys(&repo_mgr, &keys).await.len(), 7);
 
-        let result = repo_mgr
+        repo_mgr
             .delete_record("app.bsky.feed.generator", "3mxukp2fzvk2u", None, signer.clone())
-            .await;
+            .await
+            .expect("the delete is accepted");
         let held = stored_keys(&repo_mgr, &keys).await;
-        match result {
-            Ok(_) => {
-                assert_eq!(held.len(), 6, "deleted one, kept the rest: {held:?}");
-                assert!(!held.contains(&"app.bsky.feed.generator/3mxukp2fzvk2u".to_string()));
-            }
-            Err(e) => assert_eq!(held.len(), 7, "refused ({e}) and lost nothing: {held:?}"),
-        }
+        assert_eq!(held.len(), 6, "deleted one, kept the rest: {held:?}");
+        assert!(!held.contains(&"app.bsky.feed.generator/3mxukp2fzvk2u".to_string()));
     }
 
     /// Many records created and deleted in a scrambled order: after every
@@ -2755,13 +2750,11 @@ mod tests {
         order.sort_by_key(|i| (i * 31) % keys.len());
         for i in order {
             let (collection, rkey) = keys[i];
-            if repo_mgr
+            repo_mgr
                 .delete_record(collection, rkey, None, signer.clone())
                 .await
-                .is_ok()
-            {
-                expected.remove(&format!("{collection}/{rkey}"));
-            }
+                .unwrap_or_else(|e| panic!("deleting {collection}/{rkey}: {e}"));
+            expected.remove(&format!("{collection}/{rkey}"));
             let held: BTreeSet<String> = stored_keys(&repo_mgr, &keys).await.into_iter().collect();
             assert_eq!(held, expected, "after deleting {collection}/{rkey}");
         }
