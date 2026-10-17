@@ -225,3 +225,24 @@ serde_urlencoded = "0.7"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 webauthn-authenticator-rs = { version = "0.5.5", features = ["softpasskey"] }
+
+# #505: proto-blue-repo 0.3.3 can drop records when deleting one. The fix is
+# merged upstream (dollspace-gay/proto-blue PR #13) but not yet published, so
+# the whole proto-blue workspace comes from that merge until it is. All of it,
+# not just proto-blue-repo, so every crate shares one copy of the common
+# types. Remove this section once a fixed release is out.
+[patch.crates-io]
+proto-blue = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-api = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-common = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-crypto = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-identity = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-lex-cbor = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-lex-data = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-lex-json = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-lexicon = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-oauth = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-repo = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-syntax = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-ws = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
+proto-blue-xrpc = { git = "https://github.com/dollspace-gay/proto-blue", rev = "7a3fb57" }
