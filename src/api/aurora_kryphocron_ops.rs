@@ -855,7 +855,13 @@ pub async fn get_audience_aggregate(
                 // deployment-wide aggregate (see `walk_nsid_counts`).
                 let Ok(records) = ctx
                     .actor_store
-                    .list_records(&account.did, NSID_AUDIENCE, RECORD_PAGE, record_cursor.as_deref())
+                    .list_records(
+                        &account.did,
+                        NSID_AUDIENCE,
+                        RECORD_PAGE,
+                        record_cursor.as_deref(),
+                        crate::actor_store::RkeyOrder::Ascending,
+                    )
                     .await
                 else {
                     break;
@@ -990,7 +996,13 @@ pub async fn list_audiences(
     loop {
         let records = ctx
             .actor_store
-            .list_records(&did, NSID_AUDIENCE, RECORD_PAGE, record_cursor.as_deref())
+            .list_records(
+                &did,
+                NSID_AUDIENCE,
+                RECORD_PAGE,
+                record_cursor.as_deref(),
+                crate::actor_store::RkeyOrder::Ascending,
+            )
             .await
             .map_err(internal)?;
         if records.is_empty() {

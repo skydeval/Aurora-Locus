@@ -741,7 +741,13 @@ pub(crate) async fn run_block_cascade(
     'walk: loop {
         let records = match ctx
             .actor_store
-            .list_records(blocker_did, NSID_AUDIENCE, AUDIENCE_PAGE, cursor.as_deref())
+            .list_records(
+                blocker_did,
+                NSID_AUDIENCE,
+                AUDIENCE_PAGE,
+                cursor.as_deref(),
+                crate::actor_store::RkeyOrder::Ascending,
+            )
             .await
         {
             Ok(r) => r,

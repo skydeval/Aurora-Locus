@@ -32,6 +32,14 @@ impl Default for ActorStoreConfig {
     }
 }
 
+/// The order in which [`ActorStore::list_records`] lists records, by record
+/// key. Record keys are mostly TIDs, so ascending is oldest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RkeyOrder {
+    Ascending,
+    Descending,
+}
+
 /// Actor Store - Manages per-user repositories
 #[derive(Clone)]
 pub struct ActorStore {
@@ -303,38 +311,44 @@ impl ActorStore {
         }
     }
 
-    /// List records in a collection
+    /// List up to `limit` records of a collection in `order` of record key,
+    /// starting after `cursor` (a record key) in that order.
     pub async fn list_records(
         &self,
         did: &str,
         collection: &str,
         limit: i64,
         cursor: Option<&str>,
+        order: RkeyOrder,
     ) -> PdsResult<Vec<Record>> {
         let pool = self.open_db(did).await?;
 
-        let query = if let Some(cursor) = cursor {
-            sqlx::query(
+        let (after, direction) = match order {
+            RkeyOrder::Ascending => (">", "ASC"),
+            RkeyOrder::Descending => ("<", "DESC"),
+        };
+        let sql = if cursor.is_some() {
+            format!(
                 "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
                  FROM record
-                 WHERE collection = ?1 AND rkey > ?2
-                 ORDER BY rkey ASC
-                 LIMIT ?3",
+                 WHERE collection = ?1 AND rkey {after} ?2
+                 ORDER BY rkey {direction}
+                 LIMIT ?3"
             )
-            .bind(collection)
-            .bind(cursor)
-            .bind(limit)
         } else {
-            sqlx::query(
+            format!(
                 "SELECT uri, cid, collection, rkey, repo_rev, indexed_at, takedown_ref
                  FROM record
                  WHERE collection = ?1
-                 ORDER BY rkey ASC
-                 LIMIT ?2",
+                 ORDER BY rkey {direction}
+                 LIMIT ?2"
             )
-            .bind(collection)
-            .bind(limit)
         };
+        let mut query = sqlx::query(&sql).bind(collection);
+        if let Some(cursor) = cursor {
+            query = query.bind(cursor);
+        }
+        let query = query.bind(limit);
 
         let rows = query.fetch_all(&pool).await?;
 

@@ -385,7 +385,13 @@ impl RewriteJob {
         loop {
             let records = ctx
                 .actor_store
-                .list_records(did, NSID_POST_PRIVATE, RECORD_PAGE, record_cursor.as_deref())
+                .list_records(
+                    did,
+                    NSID_POST_PRIVATE,
+                    RECORD_PAGE,
+                    record_cursor.as_deref(),
+                    crate::actor_store::RkeyOrder::Ascending,
+                )
                 .await?;
             if records.is_empty() {
                 break;
