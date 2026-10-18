@@ -151,10 +151,13 @@ struct ListRecordsQuery {
     limit: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement reverse ordering
-    reverse: Option<bool>,
+    /// Oldest first instead of newest first.
+    #[serde(default)]
+    reverse: bool,
 }
+
+/// The `limit` bounds of `com.atproto.repo.listRecords`.
+const LIST_RECORDS_LIMIT: std::ops::RangeInclusive<i64> = 1..=100;
 
 fn default_limit() -> i64 {
     50
@@ -890,12 +893,22 @@ pub(crate) async fn assert_readable_by(
 }
 
 
-/// List records in a collection
+/// List records in a collection (`com.atproto.repo.listRecords`), as the
+/// reference PDS does: newest first by record key, oldest first with
+/// `reverse=true`, and `cursor` (a record key) continuing in the same order.
 async fn list_records(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
     Query(query): Query<ListRecordsQuery>,
 ) -> PdsResult<Json<ListRecordsResponse>> {
+    if !LIST_RECORDS_LIMIT.contains(&query.limit) {
+        return Err(PdsError::Validation(format!(
+            "limit must be between {} and {}",
+            LIST_RECORDS_LIMIT.start(),
+            LIST_RECORDS_LIMIT.end()
+        )));
+    }
+
     // Get the DID
     let did = &resolve_repo(&ctx, &query.repo).await?;
 
@@ -912,8 +925,13 @@ async fn list_records(
 
     // Fetch limit + 1 to determine if there are more records
     let fetch_limit = query.limit + 1;
+    let order = if query.reverse {
+        crate::actor_store::RkeyOrder::Ascending
+    } else {
+        crate::actor_store::RkeyOrder::Descending
+    };
     let records = repo_mgr
-        .list_records(&query.collection, fetch_limit, query.cursor.as_deref())
+        .list_records(&query.collection, fetch_limit, query.cursor.as_deref(), order)
         .await?;
 
     // Determine if we have more records and calculate cursor
@@ -1504,6 +1522,108 @@ mod get_record_miss_tests {
             Err(e) => panic!("listRecords absent: got {e:?}"),
             Ok(_) => panic!("listRecords served an absent repository"),
         }
+    }
+
+    // ---- listRecords order (prism's locus-listrecords-order.md) ----
+
+    const POST: &str = "app.bsky.feed.post";
+    const RKEYS: [&str; 5] = [
+        "3mxaaaaaaaa2a",
+        "3mxbbbbbbbb2b",
+        "3mxcccccccc2c",
+        "3mxdddddddd2d",
+        "3mxeeeeeeee2e",
+    ];
+
+    async fn ctx_with_posts() -> (AppContext, String) {
+        let (ctx, did) = ctx_with_repo().await;
+        for (i, rkey) in RKEYS.iter().enumerate() {
+            let lex = proto_blue::lex_json::json_to_lex(&serde_json::json!({ "n": i }));
+            let cid = proto_blue::lex_cbor::cid_for_lex(&lex).unwrap().to_string();
+            let bytes = proto_blue::lex_cbor::encode(&lex).unwrap();
+            ctx.actor_store.put_block(&did, &cid, &bytes).await.unwrap();
+            let uri = format!("at://{did}/{POST}/{rkey}");
+            ctx.actor_store
+                .put_record(&did, &uri, &cid, POST, rkey, "r")
+                .await
+                .unwrap();
+        }
+        (ctx, did)
+    }
+
+    /// One `listRecords` call, from a query string as a client sends it:
+    /// the record keys it answers, and its cursor.
+    async fn list(ctx: &AppContext, did: &str, params: &str) -> PdsResult<(Vec<String>, Option<String>)> {
+        let query: ListRecordsQuery =
+            serde_urlencoded::from_str(&format!("repo={did}&collection={POST}{params}")).unwrap();
+        let Json(page) = list_records(State(ctx.clone()), HeaderMap::new(), Query(query)).await?;
+        let rkeys = page
+            .records
+            .iter()
+            .map(|r| r.uri.rsplit('/').next().unwrap().to_string())
+            .collect();
+        Ok((rkeys, page.cursor))
+    }
+
+    /// Every page of a listing, following the cursor.
+    async fn all_pages(ctx: &AppContext, did: &str, params: &str) -> Vec<Vec<String>> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let after = cursor.as_ref().map(|c| format!("&cursor={c}")).unwrap_or_default();
+            let (rkeys, next) = list(ctx, did, &format!("{params}{after}")).await.unwrap();
+            pages.push(rkeys);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return pages,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn list_records_is_newest_first_and_pages_downward() {
+        let (ctx, did) = ctx_with_posts().await;
+        let pages = all_pages(&ctx, &did, "&limit=2").await;
+        assert_eq!(
+            pages,
+            vec![
+                vec![RKEYS[4], RKEYS[3]],
+                vec![RKEYS[2], RKEYS[1]],
+                vec![RKEYS[0]],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn list_records_reverse_is_oldest_first_and_pages_upward() {
+        let (ctx, did) = ctx_with_posts().await;
+        let pages = all_pages(&ctx, &did, "&limit=2&reverse=true").await;
+        assert_eq!(
+            pages,
+            vec![
+                vec![RKEYS[0], RKEYS[1]],
+                vec![RKEYS[2], RKEYS[3]],
+                vec![RKEYS[4]],
+            ]
+        );
+        // reverse=false is the default order.
+        let (rkeys, _) = list(&ctx, &did, "&reverse=false").await.unwrap();
+        assert_eq!(rkeys, RKEYS.iter().rev().copied().collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn list_records_refuses_a_limit_out_of_range() {
+        let (ctx, did) = ctx_with_posts().await;
+        for limit in ["0", "-1", "101"] {
+            let result = list(&ctx, &did, &format!("&limit={limit}")).await;
+            assert!(
+                matches!(result, Err(PdsError::Validation(_))),
+                "limit={limit}: got {result:?}"
+            );
+        }
+        let (rkeys, cursor) = list(&ctx, &did, "&limit=100").await.unwrap();
+        assert_eq!(rkeys.len(), RKEYS.len());
+        assert!(cursor.is_none());
     }
 }
 

@@ -18,7 +18,7 @@ pub use models::*;
 #[allow(unused_imports)]
 pub use repository::WriteOpAction;
 pub use repository::{RepositoryManager, WriteOp};
-pub use store::{ActorStore, ActorStoreConfig};
+pub use store::{ActorStore, ActorStoreConfig, RkeyOrder};
 pub use transaction::ActorTransaction;
 
 use std::path::{Path, PathBuf};

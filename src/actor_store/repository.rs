@@ -1991,16 +1991,18 @@ impl RepositoryManager {
         }
     }
 
-    /// List records in a collection
+    /// List up to `limit` records of a collection in `order` of record key,
+    /// starting after `cursor`, each with its URI, CID and value.
     pub async fn list_records(
         &self,
         collection: &str,
         limit: i64,
         cursor: Option<&str>,
+        order: crate::actor_store::RkeyOrder,
     ) -> PdsResult<Vec<serde_json::Value>> {
         let records = self
             .store
-            .list_records(&self.did, collection, limit, cursor)
+            .list_records(&self.did, collection, limit, cursor, order)
             .await?;
 
         let mut results = Vec::new();
