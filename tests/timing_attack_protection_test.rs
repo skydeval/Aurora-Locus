@@ -89,6 +89,7 @@ async fn create_test_manager() -> AccountManager {
             exempt_admin_assets: true,
             buckets_retention_days: 7,
             trust_proxy: false,
+            client_ip_header: aurora_locus::rate_limit::DEFAULT_CLIENT_IP_HEADER.to_string(),
         },
         logging: LoggingConfig {
             level: "info".to_string(),

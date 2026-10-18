@@ -1140,13 +1140,24 @@ pub struct RateLimitConfig {
     /// operator-tunable via `PDS_RATE_LIMIT_BUCKETS_RETENTION_DAYS`
     /// per V06 batch tail G7.2.
     pub buckets_retention_days: u32,
-    /// Trust `X-Forwarded-For` / `X-Real-IP` for the real client IP (#442),
-    /// from `PDS_TRUST_PROXY`. OFF by default — enable ONLY behind a trusted
-    /// reverse proxy, else a client can spoof its IP via the header. Consumed by
-    /// the rate limiter and by admin session IP-binding, which refuses to enable
-    /// while this is off (the client IP is otherwise a loopback placeholder).
+    /// Trust a forwarded client-IP header (#442, #514), from
+    /// `PDS_TRUST_PROXY`. OFF by default. Even when on, the header is believed
+    /// only on requests whose TCP peer is loopback, private or link-local (the
+    /// reverse proxy); any other request's client is its peer address.
+    /// Consumed by the rate limiter and by admin session IP-binding.
     #[serde(default)]
     pub trust_proxy: bool,
+    /// The header the trusted proxy names the client in, from
+    /// `PDS_CLIENT_IP_HEADER` (#514; default `x-forwarded-for`, rightmost
+    /// address). Behind Caddy fronted by a CDN, have Caddy resolve the
+    /// client (`trusted_proxies` + `client_ip_headers`) and pass it as
+    /// `X-Real-IP {client_ip}`, and set this to `x-real-ip`.
+    #[serde(default = "default_client_ip_header")]
+    pub client_ip_header: String,
+}
+
+fn default_client_ip_header() -> String {
+    crate::rate_limit::DEFAULT_CLIENT_IP_HEADER.to_string()
 }
 
 /// Logging configuration
@@ -1907,8 +1918,16 @@ impl ServerConfig {
             .ok()
             .map(|v| matches!(v.trim(), "true" | "1"))
             .unwrap_or(false);
+        let client_ip_header = env::var("PDS_CLIENT_IP_HEADER")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_client_ip_header);
         if trust_proxy {
-            tracing::info!("Proxy trust: ENABLED via PDS_TRUST_PROXY (forwarded client IP honored)");
+            tracing::info!(
+                header = %client_ip_header,
+                "Proxy trust: ENABLED via PDS_TRUST_PROXY (forwarded client IP honored from the proxy)"
+            );
         }
 
         let log_level = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
@@ -2145,6 +2164,7 @@ impl ServerConfig {
                 exempt_admin_assets: rate_limit_exempt_admin_assets,
                 buckets_retention_days: rate_limit_buckets_retention_days,
                 trust_proxy,
+                client_ip_header,
             },
             logging: LoggingConfig { level: log_level },
             federation: FederationConfig {

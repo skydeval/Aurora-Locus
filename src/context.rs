@@ -956,6 +956,7 @@ impl AppContext {
                 enabled: config.rate_limit.enabled,
                 exempt_admin_assets: config.rate_limit.exempt_admin_assets,
                 trust_proxy: config.rate_limit.trust_proxy,
+                client_ip_header: config.rate_limit.client_ip_header.clone(),
                 ..crate::rate_limit::RateLimitConfig::default()
             },
         ));

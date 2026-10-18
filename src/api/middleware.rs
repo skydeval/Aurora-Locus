@@ -340,7 +340,7 @@ pub async fn authenticate(
 
     if let Some(token) = extract_bearer_token(&headers) {
         // Thread the client IP so a bound admin session is enforced here (#442).
-        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        let current_ip = crate::auth::request_client_ip(&headers);
         match ctx
             .account_manager
             .validate_access_token_with_ip(&token, current_ip)
@@ -382,7 +382,7 @@ pub async fn require_auth(
         PdsError::Authentication("Missing authorization header".to_string())
     })?;
 
-    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let current_ip = crate::auth::request_client_ip(&headers);
     match ctx
         .account_manager
         .validate_access_token_with_ip(&token, current_ip)
@@ -502,7 +502,7 @@ pub async fn require_auth_unified(
     let service_did = ctx.service_did().to_string();
     // #442: thread the client IP so a bound admin session is enforced (or, for an
     // unbound session, unaffected) on this non-forwarded path.
-    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let current_ip = crate::auth::request_client_ip(&headers);
     ctx.verify_jwt_with_allowlist(&token, &[service_did.as_str()], current_ip)
         .await
 }
@@ -720,7 +720,7 @@ pub async fn require_auth_forwarded(
     // #442: thread the client IP so getSession (and the other forwarded mint-
     // pattern handlers) enforce a bound admin session against the real request IP
     // instead of fail-closing it.
-    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let current_ip = crate::auth::request_client_ip(&headers);
     ctx.verify_jwt_with_allowlist(&token, &allowlist, current_ip)
         .await
 }
@@ -740,7 +740,7 @@ pub async fn check_account_moderation(
 
     // Only check moderation for authenticated requests
     if let Some(token) = extract_bearer_token(&headers) {
-        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        let current_ip = crate::auth::request_client_ip(&headers);
         if let Ok(session) = ctx
             .account_manager
             .validate_access_token_with_ip(&token, current_ip)
@@ -1071,7 +1071,7 @@ pub async fn service_auth(
     // Check if this is a service auth request
     if let Some(token) = extract_bearer_token(&headers) {
         // Try local auth first (threading the client IP for bound sessions, #442)
-        let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+        let current_ip = crate::auth::request_client_ip(&headers);
         if ctx
             .account_manager
             .validate_access_token_with_ip(&token, current_ip)

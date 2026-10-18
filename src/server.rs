@@ -8,7 +8,7 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
     metrics,
-    rate_limit::rate_limit_middleware,
+    rate_limit::{account_rate_limit_middleware, client_ip_middleware, rate_limit_middleware},
 };
 use axum::{
     extract::Request,
@@ -53,13 +53,14 @@ fn no_store(mut resp: Response) -> Response {
 /// Response headers browser clients need to read, so they are exposed to
 /// cross-origin callers (#469). `atproto-content-labelers` /
 /// `atproto-repo-rev` come back from proxied app.bsky calls, `dpop-nonce` and
-/// `www-authenticate` drive the OAuth DPoP retry, and the `ratelimit-*` family
-/// lets clients back off.
-const CORS_EXPOSED_HEADERS: [&str; 8] = [
+/// `www-authenticate` drive the OAuth DPoP retry, and `retry-after` (#514)
+/// with the `ratelimit-*` family lets clients back off.
+const CORS_EXPOSED_HEADERS: [&str; 9] = [
     "atproto-content-labelers",
     "atproto-repo-rev",
     "dpop-nonce",
     "www-authenticate",
+    "retry-after",
     "ratelimit-limit",
     "ratelimit-remaining",
     "ratelimit-reset",
@@ -184,6 +185,13 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
             ctx.clone(),
             namespace_scope_check,
         ))
+        // #514 — per-account rate limits for requests with credentials. Inner
+        // to the OAuth gate, so an atproto-OAuth request is counted against
+        // the account the gate verified.
+        .layer(middleware::from_fn_with_state(
+            ctx.clone(),
+            account_rate_limit_middleware,
+        ))
         // Arc 2 ε.3 — atproto-OAuth bearer gate (registry-gated). Resolves a
         // `DPoP`-scheme bearer to a DID (validate + DPoP proof + registered
         // device) and stamps the trusted internal header the fn-based auth
@@ -211,7 +219,11 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         // OAuth gate and the authorization-server handlers so their nonce
         // challenges carry it too.
         .layer(middleware::from_fn_with_state(ctx.clone(), dpop_nonce_header))
-        .layer(middleware::from_fn_with_state(ctx, jwt_deprecation_headers))
+        .layer(middleware::from_fn_with_state(ctx.clone(), jwt_deprecation_headers))
+        // #514 — resolve the client address (forwarded header only from a
+        // trusted proxy) for every layer and handler inside; strips any
+        // inbound copy of the internal header first.
+        .layer(middleware::from_fn_with_state(ctx, client_ip_middleware))
         // `WWW-Authenticate` on 401s (#503, #486): outside every layer that
         // can answer 401 (the OAuth gate, moderation, the handlers), so it
         // sees all of them.
@@ -312,7 +324,12 @@ pub async fn serve(ctx: AppContext, api_router: Router<AppContext>) -> PdsResult
     // Axum 0.7: Router<()> can be passed directly to serve. The graceful-
     // shutdown future is a real `async` block whose `changed().await` is polled
     // when the future runs (not pre-awaited), per §3.1 LB-1.
-    axum::serve(listener, app)
+    // With each connection's peer address (#514), which the client-IP layer
+    // trusts a forwarded header from only when it is the reverse proxy.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             let _ = serve_shutdown_rx.changed().await;
         })

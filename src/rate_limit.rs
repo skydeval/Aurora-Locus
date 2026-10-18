@@ -6,8 +6,11 @@
 /// # Architecture
 ///
 /// The rate limiting system uses multiple layers:
-/// 1. **Global limits**: Separate limits for authenticated, unauthenticated, admin, and cross-PDS users
-/// 2. **Per-endpoint limits**: Custom limits for specific XRPC endpoints
+/// 1. **Per-caller limits**: Separate limits for authenticated, unauthenticated, admin, and
+///    cross-PDS callers, each counted per caller (#514): per account when the request is
+///    authenticated ([`account_rate_limit_middleware`]), else per client address
+///    ([`rate_limit_middleware`], with the address from [`client_ip_middleware`])
+/// 2. **Per-endpoint limits**: Custom limits for specific XRPC endpoints, per caller too
 /// 3. **IP-based limits**: Track requests per client IP address
 /// 4. **Composite key limits**: Combine multiple identifiers (e.g., user+IP, DID+endpoint)
 ///
@@ -31,7 +34,7 @@
 ///     Json(body): Json<CreateSessionRequest>,
 /// ) -> Result<Json<SessionResponse>, PdsError> {
 ///     // Extract client IP
-///     let client_ip = extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+///     let client_ip = extract_client_ip(&headers)
 ///         .ok_or(PdsError::BadRequest("Could not determine client IP".into()))?;
 ///
 ///     // Check rate limit: identifier+IP combination
@@ -79,7 +82,7 @@
 /// - createAccount: 100 requests per 5 minutes
 /// - createSession: 30 requests per 5 minutes
 /// - Password reset: 50 requests per 5 minutes
-/// - Blob upload: 50 requests per hour
+/// - Blob upload: 300 requests per hour and 3000 per day
 ///
 /// # Examples
 ///
@@ -100,16 +103,56 @@ use governor::{
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
     num::NonZeroU32,
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-/// Type alias for endpoint rate limiters (multiple limiters per endpoint)
-type EndpointLimiters =
-    Arc<HashMap<String, Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>>>>;
+/// A limiter with one bucket per caller key (#514): an account (`did:…`) or
+/// a client address (`ip:…`).
+type KeyedLimiter = GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>;
+
+/// Type alias for endpoint rate limiters (multiple limiters per endpoint),
+/// each keyed per caller.
+type EndpointLimiters = Arc<HashMap<String, Vec<Arc<KeyedLimiter>>>>;
+
+/// The internal header carrying the client address that
+/// [`client_ip_middleware`] resolved. An incoming copy is always removed
+/// first, so its value is never the client's own claim.
+pub const CLIENT_IP_HEADER: &str = "x-aurora-client-ip";
+
+/// The forwarded header believed from a trusted proxy unless configured.
+pub const DEFAULT_CLIENT_IP_HEADER: &str = "x-forwarded-for";
+
+/// The bucket key of a caller: its account when the request is
+/// authenticated, else its address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerKey {
+    Account(String),
+    Address(IpAddr),
+    /// No address could be determined (no connection information, as in
+    /// tests that call the router directly).
+    Unknown,
+}
+
+impl CallerKey {
+    fn bucket(&self) -> String {
+        match self {
+            Self::Account(did) => format!("did:{did}"),
+            Self::Address(ip) => format!("ip:{ip}"),
+            Self::Unknown => "unknown".to_string(),
+        }
+    }
+}
+
+/// The wait a rejected caller is told to observe, from a governor refusal.
+fn retry_after(not_until: governor::NotUntil<governor::clock::QuantaInstant>) -> Duration {
+    let wait = not_until.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
+    // Round up to whole seconds, at least one: Retry-After counts seconds.
+    Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(Duration::from_secs(1))
+}
 
 /// Rate limit state information for headers
 #[derive(Debug, Clone)]
@@ -146,9 +189,13 @@ pub struct RateLimitConfig {
     pub cross_pds_rps: u32,
     /// Burst size
     pub burst_size: u32,
-    /// Trust proxy headers (X-Forwarded-For, X-Real-IP) for IP extraction
-    /// Set to true if behind a reverse proxy/load balancer
+    /// Trust a forwarded client-address header from a reverse proxy in front
+    /// of this server (a loopback, private or link-local peer). Set to true
+    /// if behind a reverse proxy/load balancer.
     pub trust_proxy: bool,
+    /// The header that proxy names the client in (`PDS_CLIENT_IP_HEADER`,
+    /// default `x-forwarded-for`, whose rightmost address is taken).
+    pub client_ip_header: String,
     /// Requests per second for handle resolution (outbound HTTP/DNS)
     pub handle_resolution_rps: u32,
     /// Requests per second for DID resolution (outbound HTTP to PLC directory)
@@ -174,6 +221,7 @@ impl Default for RateLimitConfig {
             cross_pds_rps: 10,         // 10 req/sec for cross-PDS (10x stricter than local)
             burst_size: 50,            // Allow bursts up to 50 requests
             trust_proxy: false,        // Default to false for security (don't trust proxy headers)
+            client_ip_header: DEFAULT_CLIENT_IP_HEADER.to_string(),
             handle_resolution_rps: 50, // 50 req/sec for handle resolution (protect outbound)
             did_resolution_rps: 50,    // 50 req/sec for DID resolution (protect outbound)
             exempt_admin_assets: true, // Admin UI static assets bypass the limiter by default
@@ -212,16 +260,21 @@ impl EndpointRateLimit {
         }
     }
 
-    /// Create quota for this endpoint limit
+    /// Create quota for this endpoint limit: `max_requests` per
+    /// `duration_secs`, refilled evenly over the window, with up to
+    /// `burst_size` (default: all of `max_requests`) available at once.
+    ///
+    /// The refill interval is the window divided by `max_requests`; it was
+    /// the whole window, so "50 per hour" allowed a burst of 25 and then one
+    /// request an hour.
     fn to_quota(&self) -> Quota {
-        let per_period =
-            NonZeroU32::new(self.max_requests).unwrap_or(NonZeroU32::new(100).unwrap());
-        let duration = Duration::from_secs(self.duration_secs);
-        let burst = self.burst_size.unwrap_or(self.max_requests / 2);
-
-        Quota::with_period(duration)
-            .unwrap_or_else(|| Quota::per_second(per_period))
-            .allow_burst(NonZeroU32::new(burst).unwrap_or(NonZeroU32::new(10).unwrap()))
+        let max = self.max_requests.max(1);
+        let interval = Duration::from_secs(self.duration_secs.max(1)) / max;
+        let burst = NonZeroU32::new(self.burst_size.unwrap_or(max).max(1))
+            .expect("burst is at least one");
+        Quota::with_period(interval.max(Duration::from_millis(1)))
+            .expect("the interval is at least one millisecond")
+            .allow_burst(burst)
     }
 }
 
@@ -325,14 +378,15 @@ impl EndpointRateLimitConfig {
             EndpointRateLimit::new(10, 3600), // 10 per hour
         );
 
-        // Blob upload: Multiple limits to prevent storage abuse
-        // - 50 per hour: Prevent rapid uploads
-        // - 500 per day: Prevent sustained storage attacks
+        // Blob upload: Multiple limits to prevent storage abuse, per account
+        // (#514). A post carries up to 10 images plus link-card
+        // thumbnails, each its own upload, so the hourly budget fits many
+        // posts at once; the daily one bounds sustained storage use.
         config.add_limits(
             "/xrpc/com.atproto.repo.uploadBlob",
             vec![
-                EndpointRateLimit::new(50, 3600),   // Short-term: 50 per hour
-                EndpointRateLimit::new(500, 86400), // Long-term: 500 per day
+                EndpointRateLimit::new(300, 3600),   // Short-term: 300 per hour
+                EndpointRateLimit::new(3000, 86400), // Long-term: 3000 per day
             ],
         );
 
@@ -346,57 +400,99 @@ impl EndpointRateLimitConfig {
     }
 }
 
-/// IP extraction and validation helpers
+/// The client address of a request, as [`client_ip_middleware`] resolved it
+/// (#514). `None` when the request did not pass through that middleware with
+/// a known peer, as in tests that call a router directly.
+pub fn extract_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    headers
+        .get(CLIENT_IP_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| IpAddr::from_str(value).ok())
+}
+
+/// Resolve a request's client address from its TCP peer and headers.
 ///
-/// Extracts the real client IP address from request headers, handling proxies and load balancers
-pub fn extract_client_ip(headers: &HeaderMap, trust_proxy: bool) -> Option<IpAddr> {
-    if trust_proxy {
-        // Priority 1: X-Forwarded-For (standard proxy header)
-        if let Some(forwarded) = headers.get("x-forwarded-for") {
-            if let Ok(header_value) = forwarded.to_str() {
-                // X-Forwarded-For can be: "client, proxy1, proxy2"
-                // We want the first (leftmost) IP which is the original client
-                if let Some(first_ip) = header_value.split(',').next() {
-                    if let Some(ip) = parse_ip_address(first_ip.trim()) {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-
-        // Priority 2: X-Real-IP (alternative proxy header, typically single IP)
-        if let Some(real_ip) = headers.get("x-real-ip") {
-            if let Ok(header_value) = real_ip.to_str() {
-                if let Some(ip) = parse_ip_address(header_value.trim()) {
-                    return Some(ip);
-                }
-            }
+/// A forwarded header (`header`, lowercase) is believed only when
+/// `trust_proxy` is on **and** the request came from a proxy address: a
+/// loopback, private or link-local peer, which on a deployment is the
+/// reverse proxy in front of this server. Anyone else's header is ignored,
+/// and the peer itself is the client. For `x-forwarded-for`, the rightmost
+/// address is taken: the one the trusted proxy added, not those the client
+/// may have written before it.
+pub fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+    trust_proxy: bool,
+    header: &str,
+) -> Option<IpAddr> {
+    let peer = peer.map(normalize_ip);
+    if trust_proxy && peer.is_some_and(is_proxy_address) {
+        if let Some(ip) = forwarded_ip(headers, header) {
+            return Some(ip);
         }
     }
+    peer
+}
 
-    // Priority 3: Forwarded header (RFC 7239 standard)
-    if trust_proxy {
-        if let Some(forwarded) = headers.get("forwarded") {
-            if let Ok(header_value) = forwarded.to_str() {
-                // Format: "for=192.0.2.1, for=198.51.100.17"
-                for part in header_value.split(',') {
-                    if let Some(for_part) = part.split(';').find(|s| s.trim().starts_with("for=")) {
-                        let ip_str = for_part.trim().trim_start_matches("for=");
-                        // Handle quoted IPs and brackets for IPv6
-                        let ip_str = ip_str.trim_matches('"').trim_matches('[').trim_matches(']');
-                        if let Some(ip) = parse_ip_address(ip_str) {
-                            return Some(ip);
-                        }
-                    }
+/// The client address a trusted proxy wrote in `header`.
+fn forwarded_ip(headers: &HeaderMap, header: &str) -> Option<IpAddr> {
+    let value = headers.get(header)?.to_str().ok()?;
+    match header {
+        "x-forwarded-for" => value
+            .rsplit(',')
+            .map(str::trim)
+            .find(|entry| !entry.is_empty())
+            .and_then(parse_ip_address),
+        "forwarded" => value
+            .rsplit(',')
+            .flat_map(|element| element.split(';'))
+            .find_map(|pair| {
+                let pair = pair.trim();
+                let (name, address) = pair.split_once('=')?;
+                if !name.eq_ignore_ascii_case("for") {
+                    return None;
                 }
-            }
+                parse_ip_address(address.trim_matches('"'))
+            }),
+        _ => parse_ip_address(value.trim()),
+    }
+}
+
+/// Whether `ip` is where a reverse proxy in front of this server connects
+/// from: loopback, private or link-local.
+fn is_proxy_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            v6.is_loopback() || (first & 0xFE00) == 0xFC00 || (first & 0xFFC0) == 0xFE80
         }
     }
+}
 
-    // Priority 4: If no proxy headers or trust_proxy=false, use a placeholder
-    // In a real implementation, this would come from the connection itself
-    // For now, we'll return localhost as we can't access the socket in middleware
-    Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)))
+/// Resolve each request's client address ([`resolve_client_ip`]) and pass
+/// it on in [`CLIENT_IP_HEADER`], after removing any copy the client sent.
+/// Runs before every other layer that reads the address.
+pub async fn client_ip_middleware(
+    State(ctx): State<crate::context::AppContext>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    request.headers_mut().remove(CLIENT_IP_HEADER);
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    let client = resolve_client_ip(
+        request.headers(),
+        peer,
+        ctx.rate_limiter.trust_proxy,
+        &ctx.rate_limiter.client_ip_header,
+    );
+    if let Some(value) = client.and_then(|ip| axum::http::HeaderValue::from_str(&ip.to_string()).ok()) {
+        request.headers_mut().insert(CLIENT_IP_HEADER, value);
+    }
+    next.run(request).await
 }
 
 /// Parse and validate an IP address string
@@ -463,10 +559,11 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// Rate limiter manager
 #[derive(Clone)]
 pub struct RateLimiter {
-    authenticated: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    unauthenticated: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    admin: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
-    cross_pds: Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>,
+    /// Per caller (#514): one bucket per account or address, never shared.
+    authenticated: Arc<KeyedLimiter>,
+    unauthenticated: Arc<KeyedLimiter>,
+    admin: Arc<KeyedLimiter>,
+    cross_pds: Arc<KeyedLimiter>,
     /// Per-endpoint rate limiters (supports multiple simultaneous limits per endpoint)
     /// Each endpoint can have multiple rate limiters - ALL must pass for request to be allowed
     endpoint_limiters: EndpointLimiters,
@@ -474,6 +571,8 @@ pub struct RateLimiter {
     ip_limiter: Arc<GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>>,
     /// Whether to trust proxy headers for IP extraction
     pub trust_proxy: bool,
+    /// The header a trusted proxy names the client in (lowercase).
+    pub client_ip_header: String,
     /// Whether GET requests to admin static-asset paths bypass the limiter.
     /// See `is_admin_asset_exempt` for the matched path/method set.
     pub exempt_admin_assets: bool,
@@ -554,24 +653,22 @@ impl RateLimiter {
         // Create per-endpoint rate limiters (supports multiple limits per endpoint)
         let mut endpoint_limiters = HashMap::new();
         for (path, limits) in endpoint_config.endpoints.iter() {
-            let limiters: Vec<Arc<GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>>> = limits
+            let limiters: Vec<Arc<KeyedLimiter>> = limits
                 .iter()
-                .map(|limit| {
-                    let quota = limit.to_quota();
-                    Arc::new(GovernorLimiter::direct(quota))
-                })
+                .map(|limit| Arc::new(GovernorLimiter::keyed(limit.to_quota())))
                 .collect();
             endpoint_limiters.insert(path.clone(), limiters);
         }
 
         Self {
-            authenticated: Arc::new(GovernorLimiter::direct(auth_quota)),
-            unauthenticated: Arc::new(GovernorLimiter::direct(unauth_quota)),
-            admin: Arc::new(GovernorLimiter::direct(admin_quota)),
-            cross_pds: Arc::new(GovernorLimiter::direct(cross_pds_quota)),
+            authenticated: Arc::new(GovernorLimiter::keyed(auth_quota)),
+            unauthenticated: Arc::new(GovernorLimiter::keyed(unauth_quota)),
+            admin: Arc::new(GovernorLimiter::keyed(admin_quota)),
+            cross_pds: Arc::new(GovernorLimiter::keyed(cross_pds_quota)),
             endpoint_limiters: Arc::new(endpoint_limiters),
             ip_limiter: Arc::new(GovernorLimiter::keyed(ip_quota)),
             trust_proxy: config.trust_proxy,
+            client_ip_header: config.client_ip_header.to_ascii_lowercase(),
             exempt_admin_assets: config.exempt_admin_assets,
             config: config.clone(),
             request_counts: Arc::new(DashMap::new()),
@@ -587,55 +684,39 @@ impl RateLimiter {
         Self::with_endpoint_config(config, EndpointRateLimitConfig::bluesky_defaults())
     }
 
-    /// Check rate limit for authenticated user
-    pub fn check_authenticated(&self) -> PdsResult<()> {
-        if !self.config.enabled { return Ok(()); }
-        self.track_request("global:authenticated");
-        match self.authenticated.check() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(PdsError::RateLimitExceeded {
-                retry_after: std::time::Duration::from_secs(1),
-            }),
+    /// Take one request from `caller`'s bucket of `limiter`.
+    fn take(&self, limiter: &KeyedLimiter, kind: &str, caller: &CallerKey) -> PdsResult<()> {
+        if !self.config.enabled {
+            return Ok(());
         }
+        let bucket = caller.bucket();
+        self.track_request(&format!("{kind}:{bucket}"));
+        limiter
+            .check_key(&bucket)
+            .map_err(|not_until| PdsError::RateLimitExceeded {
+                retry_after: retry_after(not_until),
+            })
     }
 
-    /// Check rate limit for unauthenticated user
-    pub fn check_unauthenticated(&self) -> PdsResult<()> {
-        if !self.config.enabled { return Ok(()); }
-        self.track_request("global:unauthenticated");
-        match self.unauthenticated.check() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(PdsError::RateLimitExceeded {
-                retry_after: std::time::Duration::from_secs(1),
-            }),
-        }
+    /// Check rate limit for an authenticated caller: one bucket per account.
+    pub fn check_authenticated(&self, caller: &CallerKey) -> PdsResult<()> {
+        self.take(&self.authenticated, "authenticated", caller)
     }
 
-    /// Check rate limit for admin user
-    pub fn check_admin(&self) -> PdsResult<()> {
-        if !self.config.enabled { return Ok(()); }
-        self.track_request("global:admin");
-        match self.admin.check() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(PdsError::RateLimitExceeded {
-                retry_after: std::time::Duration::from_secs(1),
-            }),
-        }
+    /// Check rate limit for an unauthenticated caller: one bucket per address.
+    pub fn check_unauthenticated(&self, caller: &CallerKey) -> PdsResult<()> {
+        self.take(&self.unauthenticated, "unauthenticated", caller)
     }
 
-    /// Check rate limit for cross-PDS authenticated user (Phase 4)
-    ///
-    /// This is 10x stricter than local authenticated users to prevent abuse
-    /// from federated instances.
-    pub fn check_cross_pds(&self) -> PdsResult<()> {
-        if !self.config.enabled { return Ok(()); }
-        self.track_request("global:cross_pds");
-        match self.cross_pds.check() {
-            Ok(_) => Ok(()),
-            Err(_) => Err(PdsError::RateLimitExceeded {
-                retry_after: std::time::Duration::from_secs(1),
-            }),
-        }
+    /// Check rate limit for an admin caller: one bucket per account.
+    pub fn check_admin(&self, caller: &CallerKey) -> PdsResult<()> {
+        self.take(&self.admin, "admin", caller)
+    }
+
+    /// Check rate limit for a cross-PDS authenticated caller (Phase 4): one
+    /// bucket per caller, 10x stricter than local authenticated users.
+    pub fn check_cross_pds(&self, caller: &CallerKey) -> PdsResult<()> {
+        self.take(&self.cross_pds, "cross_pds", caller)
     }
 
     /// Check rate limit for handle resolution (outbound HTTP/DNS requests)
@@ -723,23 +804,39 @@ impl RateLimiter {
     /// This enables sophisticated abuse prevention like:
     /// - Short-term limit (burst protection): 30 requests per 5 minutes
     /// - Long-term limit (sustained attack protection): 300 requests per day
-    pub fn check_endpoint(&self, endpoint: &str) -> Option<PdsResult<()>> {
+    ///
+    /// Each limit is counted per caller (#514), and a refusal carries the
+    /// time until that caller's bucket has room again.
+    pub fn check_endpoint(&self, endpoint: &str, caller: &CallerKey) -> Option<PdsResult<()>> {
         if !self.config.enabled { return Some(Ok(())); }
+        let bucket = caller.bucket();
         self.endpoint_limiters.get(endpoint).map(|limiters| {
             // Check ALL limiters - if any fail, return error
             for limiter in limiters.iter() {
-                match limiter.check() {
-                    Ok(_) => continue,
-                    Err(_) => {
-                        return Err(PdsError::RateLimitExceeded {
-                            retry_after: Duration::from_secs(60), // Return 60s as retry-after for endpoint limits
-                        });
-                    }
-                }
+                limiter
+                    .check_key(&bucket)
+                    .map_err(|not_until| PdsError::RateLimitExceeded {
+                        retry_after: retry_after(not_until),
+                    })?;
             }
-            // All limiters passed
             Ok(())
         })
+    }
+
+    /// Forget the buckets of callers that have been idle long enough to be
+    /// full again, so per-caller state does not grow without bound.
+    pub fn retain_recent(&self) {
+        for limiter in [&self.authenticated, &self.unauthenticated, &self.admin, &self.cross_pds, &self.ip_limiter] {
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
+        }
+        for limiters in self.endpoint_limiters.values() {
+            for limiter in limiters {
+                limiter.retain_recent();
+                limiter.shrink_to_fit();
+            }
+        }
+        self.cleanup_old_counts();
     }
 
     /// Check if an endpoint has a specific rate limit configured
@@ -999,21 +1096,43 @@ pub fn is_admin_asset_exempt(path: &str, method: &Method) -> bool {
         || path.starts_with("/admin/login/")
 }
 
-/// Rate limiting middleware
+/// Which per-caller limit applies to a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    Unauthenticated,
+    Authenticated,
+    Admin,
+}
+
+impl Tier {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::Authenticated => "authenticated",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// How long a refused request's body is read and discarded so the 429
+/// reaches the client: a reverse proxy still sending an upload to a server
+/// that has answered and closed reports a broken pipe as 502 instead.
+const REFUSED_BODY_DRAIN: Duration = Duration::from_secs(30);
+
+/// Rate limiting for requests without credentials, per client address
+/// (#514). Requests that carry credentials pass through to
+/// [`account_rate_limit_middleware`], which runs after the OAuth gate and
+/// limits them per account.
 pub async fn rate_limit_middleware(
     State(ctx): State<crate::context::AppContext>,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let endpoint_path = request.uri().path();
-
     // Master enable gate (chainlink #153). When PDS_RATE_LIMITS_ENABLED=false,
-    // skip the distributed-bucket layer below + all governor checks in this
-    // middleware. Method-level `check_*` calls in handlers (check_did_endpoint
-    // etc.) are gated separately at the method entry, so the env flag fully
-    // disables enforcement everywhere. Production default `true` preserves
-    // existing behavior; Phase B harness emits `false` for deterministic
-    // multi-call scenarios.
+    // skip every check in this middleware and the account one. Method-level
+    // `check_*` calls in handlers are gated separately at the method entry,
+    // so the env flag fully disables enforcement everywhere. Phase B harness
+    // emits `false` for deterministic multi-call scenarios.
     if !ctx.rate_limiter.enabled() {
         return Ok(next.run(request).await);
     }
@@ -1024,73 +1143,104 @@ pub async fn rate_limit_middleware(
     // limiter. Returning early skips rate-limit header injection on purpose:
     // these responses are not rate-limited and shouldn't advertise a counter.
     if ctx.rate_limiter.exempt_admin_assets
-        && is_admin_asset_exempt(endpoint_path, request.method())
+        && is_admin_asset_exempt(request.uri().path(), request.method())
     {
         return Ok(next.run(request).await);
     }
 
-    // Extract client IP for rate limiting and logging
-    let client_ip = extract_client_ip(request.headers(), ctx.rate_limiter.trust_proxy);
-
-    // Log client IP for debugging and security monitoring
-    if let Some(ip) = client_ip {
-        tracing::debug!("Request from IP: {} to endpoint: {}", ip, endpoint_path);
+    if request.headers().contains_key(axum::http::header::AUTHORIZATION) {
+        return Ok(next.run(request).await);
     }
+    let caller = address_key(request.headers());
+    Ok(limit(&ctx, request, next, caller, Tier::Unauthenticated).await)
+}
 
-    // Check if this is an admin endpoint
-    let is_admin = endpoint_path.contains("/xrpc/com.atproto.admin");
+/// Rate limiting for requests with credentials, per account (#514). Runs
+/// after the OAuth gate, so an atproto-OAuth request is counted against
+/// the account the gate verified; a classic access token is counted against
+/// its subject once its signature and expiry check out. Any other
+/// credential (a service-auth token, or one that does not verify) is
+/// counted against the client address, as an unauthenticated request.
+pub async fn account_rate_limit_middleware(
+    State(ctx): State<crate::context::AppContext>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !ctx.rate_limiter.enabled()
+        || !request.headers().contains_key(axum::http::header::AUTHORIZATION)
+    {
+        return Ok(next.run(request).await);
+    }
+    let (caller, tier) = match verified_account(&ctx, request.headers()) {
+        Some(did) => {
+            let tier = if request.uri().path().contains("/xrpc/com.atproto.admin") {
+                Tier::Admin
+            } else {
+                Tier::Authenticated
+            };
+            (CallerKey::Account(did), tier)
+        }
+        None => (address_key(request.headers()), Tier::Unauthenticated),
+    };
+    Ok(limit(&ctx, request, next, caller, tier).await)
+}
 
-    // Check if user is authenticated (has Authorization header)
-    let has_auth_header = request.headers().get("authorization").is_some();
+/// The caller key of a request's client address.
+fn address_key(headers: &HeaderMap) -> CallerKey {
+    extract_client_ip(headers).map_or(CallerKey::Unknown, CallerKey::Address)
+}
+
+/// The account a request's credentials name, when this layer can verify
+/// them without a lookup: the OAuth gate's verified DID, or the subject of
+/// an access token signed with this server's secret and not expired.
+fn verified_account(ctx: &crate::context::AppContext, headers: &HeaderMap) -> Option<String> {
+    if let Some(did) = crate::api::middleware::oauth_resolved_did(headers) {
+        return Some(did);
+    }
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")?;
+    let claims = crate::auth::verify_jwt_token(token, &ctx.config.authentication.jwt_secret).ok()?;
+    claims
+        .claims
+        .get("sub")
+        .and_then(|sub| sub.as_str())
+        .filter(|sub| sub.starts_with("did:"))
+        .map(str::to_string)
+}
+
+/// Apply the distributed, endpoint and tier limits for `caller`, then run
+/// the request or refuse it.
+async fn limit(
+    ctx: &crate::context::AppContext,
+    request: Request,
+    next: Next,
+    caller: CallerKey,
+    tier: Tier,
+) -> Response {
+    let path = request.uri().path().to_string();
 
     // PRIORITY 0: cross-instance distributed-rate-limit check
     // (Arc 7 Step 3). In Distributed mode this runs BEFORE the
-    // governor's per-endpoint check so cross-instance correctness
-    // is enforced first. The governor still runs as
-    // per-instance defense-in-depth (PRIORITY 1+ below).
-    //
-    // Bucket key is `endpoint|<path>` — one bucket per
-    // endpoint path, no IP/DID composite. IP/DID-keyed limits
-    // remain governor-only (per-instance limits are about
-    // protecting one instance from a single source; the
-    // distributed substrate addresses the
-    // per-endpoint-across-the-deployment view).
-    //
-    // Rate parameters: 100 tokens/sec, max=100. Tuned to be
-    // tighter than the governor's default per-endpoint
-    // quotas (which are typically minutes/day-scaled) so
-    // the distributed check rate-limits FIRST under
-    // contention; tuneability lands in a v0.6 candidate
-    // entry alongside per-endpoint-config plumbing.
+    // governor's checks so cross-instance correctness is enforced first;
+    // the governor still runs as per-instance defense-in-depth. One bucket
+    // per endpoint and caller (#514), at 100 tokens/sec, max 100.
     if let Some(dist) = ctx.distributed_rate_limiter.as_ref() {
-        let bucket_key = format!("endpoint|{}", endpoint_path);
+        let bucket_key = format!("endpoint|{path}|{}", caller.bucket());
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        match dist
-            .try_consume(&bucket_key, 1, 100, 100, now_ms)
-            .await
-        {
-            Ok(RateLimitOutcome::Allowed { .. }) => {
-                // Continue to governor checks below.
-            }
+        match dist.try_consume(&bucket_key, 1, 100, 100, now_ms).await {
+            Ok(RateLimitOutcome::Allowed { .. }) => {}
             Ok(RateLimitOutcome::RateLimited) => {
-                let mut response =
-                    Response::new(axum::body::Body::from("Too Many Requests"));
-                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                response
-                    .headers_mut()
-                    .insert("Retry-After", "1".parse().unwrap());
-                return Ok(response);
+                return refuse(request, Duration::from_secs(1), 100).await;
             }
             Err(e) => {
-                // Distributed-store failure is operator-meaningful
-                // but request-non-fatal: log and fall through to
-                // the governor's per-instance check. Operators
-                // with monitoring on `distributed_store_errors`
-                // see this surface; end users see the request
-                // continue.
+                // Distributed-store failure is operator-meaningful but
+                // request-non-fatal: log and fall through to the governor.
                 tracing::warn!(
                     bucket = %bucket_key,
                     error = %e,
@@ -1100,126 +1250,80 @@ pub async fn rate_limit_middleware(
         }
     }
 
-    // PRIORITY 1: Check endpoint-specific rate limit first
-    let rate_limit_result =
-        if let Some(endpoint_result) = ctx.rate_limiter.check_endpoint(endpoint_path) {
-            // Endpoint has a specific rate limit configured - use it
-            endpoint_result
-        } else {
-            // PRIORITY 2: Fall back to global rate limits based on user type
-            if is_admin && has_auth_header {
-                // Admin endpoints with auth - highest rate limit
-                ctx.rate_limiter.check_admin()
-            } else if has_auth_header {
-                // Authenticated users - medium rate limit
-                ctx.rate_limiter.check_authenticated()
-            } else {
-                // Unauthenticated users - check both global and IP-based limits
-                // First check global limit
-                let global_result = ctx.rate_limiter.check_unauthenticated();
+    // PRIORITY 1: the endpoint's own limits, else the tier's.
+    let result = ctx
+        .rate_limiter
+        .check_endpoint(&path, &caller)
+        .unwrap_or_else(|| match tier {
+            Tier::Admin => ctx.rate_limiter.check_admin(&caller),
+            Tier::Authenticated => ctx.rate_limiter.check_authenticated(&caller),
+            Tier::Unauthenticated => ctx.rate_limiter.check_unauthenticated(&caller),
+        });
+    let identifier = format!("{}:{}", tier.name(), caller.bucket());
+    let info = ctx.rate_limiter.get_limit_info(&identifier, tier.name());
 
-                // Then check IP-based limit if we have an IP and global limit passed
-                match (global_result, client_ip) {
-                    (Ok(()), Some(ip)) => {
-                        // Global limit passed, now check IP-specific limit
-                        ctx.rate_limiter.check_ip(&ip)
-                    }
-                    (Ok(()), None) => {
-                        // Global limit passed, but no IP - allow request
-                        Ok(())
-                    }
-                    (Err(e), _) => {
-                        // Global limit failed - return error
-                        Err(e)
-                    }
+    match result {
+        Ok(()) => {
+            let mut response = next.run(request).await;
+            let headers = response.headers_mut();
+            // Standard headers (draft-polli-ratelimit-headers), then the
+            // legacy X- forms.
+            for (name, value) in [
+                ("RateLimit-Limit", info.limit.to_string()),
+                ("RateLimit-Remaining", info.remaining.to_string()),
+                ("RateLimit-Reset", info.reset_seconds.to_string()),
+                ("X-RateLimit-Limit", info.limit.to_string()),
+                ("X-RateLimit-Remaining", info.remaining.to_string()),
+                ("X-RateLimit-Reset", info.reset_seconds.to_string()),
+            ] {
+                if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+                    headers.insert(name, value);
                 }
             }
-        };
-
-    // Determine limiter type for header generation
-    let limiter_type = if is_admin && has_auth_header {
-        "admin"
-    } else if has_auth_header {
-        "authenticated"
-    } else {
-        "unauthenticated"
-    };
-
-    // Get identifier for rate limit info
-    let identifier = format!("global:{}", limiter_type);
-
-    // Check rate limit
-    match rate_limit_result {
-        Ok(_) => {
-            // Get rate limit info for headers
-            let limit_info = ctx.rate_limiter.get_limit_info(&identifier, limiter_type);
-
-            // Rate limit check passed, continue to next handler
-            let mut response = next.run(request).await;
-
-            // Add dynamic rate limit headers to response (RFC 6585 + draft-polli-ratelimit-headers)
-            let headers = response.headers_mut();
-
-            // Standard headers (draft-polli-ratelimit-headers)
-            headers.insert(
-                "RateLimit-Limit",
-                limit_info.limit.to_string().parse().unwrap(),
-            );
-            headers.insert(
-                "RateLimit-Remaining",
-                limit_info.remaining.to_string().parse().unwrap(),
-            );
-            headers.insert(
-                "RateLimit-Reset",
-                limit_info.reset_seconds.to_string().parse().unwrap(),
-            );
-
-            // Legacy headers for backward compatibility
-            headers.insert(
-                "X-RateLimit-Limit",
-                limit_info.limit.to_string().parse().unwrap(),
-            );
-            headers.insert(
-                "X-RateLimit-Remaining",
-                limit_info.remaining.to_string().parse().unwrap(),
-            );
-            headers.insert(
-                "X-RateLimit-Reset",
-                limit_info.reset_seconds.to_string().parse().unwrap(),
-            );
-
-            Ok(response)
+            response
         }
-        Err(e) => {
-            // Rate limit exceeded - extract retry_after from error
-            let retry_after_secs = if let PdsError::RateLimitExceeded { retry_after } = &e {
-                retry_after.as_secs()
-            } else {
-                60 // Default to 60 seconds
-            };
-
-            // Create 429 response with Retry-After header
-            let mut response = Response::new(axum::body::Body::from("Too Many Requests"));
-            *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-
-            let headers = response.headers_mut();
-            headers.insert("Retry-After", retry_after_secs.to_string().parse().unwrap());
-
-            // Also include rate limit headers showing exhausted limit
-            let limit_info = ctx.rate_limiter.get_limit_info(&identifier, limiter_type);
-            headers.insert(
-                "RateLimit-Limit",
-                limit_info.limit.to_string().parse().unwrap(),
-            );
-            headers.insert("RateLimit-Remaining", "0".parse().unwrap());
-            headers.insert(
-                "RateLimit-Reset",
-                retry_after_secs.to_string().parse().unwrap(),
-            );
-
-            Ok(response)
+        Err(PdsError::RateLimitExceeded { retry_after }) => {
+            refuse(request, retry_after, info.limit).await
+        }
+        Err(other) => {
+            tracing::error!(error = %other, "rate limiter failed");
+            refuse(request, Duration::from_secs(60), info.limit).await
         }
     }
+}
+
+/// A 429 telling the caller when to try again: `Retry-After` in seconds and
+/// an XRPC error body. The request's body is read and discarded first (for
+/// at most [`REFUSED_BODY_DRAIN`]), so a reverse proxy still sending it
+/// delivers this answer instead of a 502.
+async fn refuse(request: Request, retry_after: Duration, limit: u32) -> Response {
+    use futures::StreamExt;
+    let mut body = request.into_body().into_data_stream();
+    let _ = tokio::time::timeout(REFUSED_BODY_DRAIN, async {
+        while let Some(Ok(_)) = body.next().await {}
+    })
+    .await;
+
+    let seconds = retry_after.as_secs().max(1);
+    let message = serde_json::json!({
+        "error": "RateLimitExceeded",
+        "message": format!("Rate limit exceeded; try again in {seconds} seconds"),
+    });
+    let mut response = Response::new(axum::body::Body::from(message.to_string()));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("Content-Type", "application/json".to_string()),
+        ("Retry-After", seconds.to_string()),
+        ("RateLimit-Limit", limit.to_string()),
+        ("RateLimit-Remaining", "0".to_string()),
+        ("RateLimit-Reset", seconds.to_string()),
+    ] {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
+    }
+    response
 }
 
 // ============================================================================
@@ -1627,6 +1731,7 @@ mod distributed_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn test_rate_limiter_creation() {
@@ -1634,9 +1739,9 @@ mod tests {
         let limiter = RateLimiter::new(config);
 
         // Should allow first request
-        assert!(limiter.check_authenticated().is_ok());
-        assert!(limiter.check_unauthenticated().is_ok());
-        assert!(limiter.check_admin().is_ok());
+        assert!(limiter.check_authenticated(&caller()).is_ok());
+        assert!(limiter.check_unauthenticated(&caller()).is_ok());
+        assert!(limiter.check_admin(&caller()).is_ok());
     }
 
     #[test]
@@ -1648,17 +1753,18 @@ mod tests {
             cross_pds_rps: 20,
             burst_size: 5,
             trust_proxy: false,
+            client_ip_header: crate::rate_limit::DEFAULT_CLIENT_IP_HEADER.to_string(),
             ..Default::default()
         };
         let limiter = RateLimiter::new(config);
 
         // Should allow burst requests
         for _ in 0..5 {
-            assert!(limiter.check_authenticated().is_ok());
+            assert!(limiter.check_authenticated(&caller()).is_ok());
         }
 
         // Should hit rate limit after burst
-        assert!(limiter.check_authenticated().is_err());
+        assert!(limiter.check_authenticated(&caller()).is_err());
     }
 
     #[test]
@@ -1678,13 +1784,13 @@ mod tests {
 
         // Should allow first requests up to burst limit
         for i in 0..5 {
-            let result = limiter.check_endpoint("/xrpc/com.atproto.server.createAccount");
+            let result = limiter.check_endpoint("/xrpc/com.atproto.server.createAccount", &caller());
             assert!(result.is_some(), "Request {} should have endpoint limit", i);
             assert!(result.unwrap().is_ok(), "Request {} should be allowed", i);
         }
 
         // Should hit rate limit after burst
-        let result = limiter.check_endpoint("/xrpc/com.atproto.server.createAccount");
+        let result = limiter.check_endpoint("/xrpc/com.atproto.server.createAccount", &caller());
         assert!(result.is_some());
         assert!(
             result.unwrap().is_err(),
@@ -1711,12 +1817,12 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::default());
 
         // Endpoint without specific limit should return None
-        let result = limiter.check_endpoint("/xrpc/com.atproto.repo.getRecord");
+        let result = limiter.check_endpoint("/xrpc/com.atproto.repo.getRecord", &caller());
         assert!(result.is_none());
 
         // Global limits should still work
-        assert!(limiter.check_authenticated().is_ok());
-        assert!(limiter.check_unauthenticated().is_ok());
+        assert!(limiter.check_authenticated(&caller()).is_ok());
+        assert!(limiter.check_unauthenticated(&caller()).is_ok());
     }
 
     #[test]
@@ -1741,61 +1847,98 @@ mod tests {
         assert_eq!(create_account_limit.duration_secs, 300); // 5 minutes
     }
 
-    #[test]
-    fn test_extract_ip_from_x_forwarded_for() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-forwarded-for",
-            "192.168.1.100, 10.0.0.1".parse().unwrap(),
-        );
+    fn caller() -> CallerKey {
+        CallerKey::Account("did:plc:alice".to_string())
+    }
 
-        let ip = extract_client_ip(&headers, true);
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap(), IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)));
+    fn headers_with(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    const PROXY: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::new(172, 18, 0, 3)));
+    const OUTSIDER: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)));
+
+    /// From the trusted proxy, the rightmost X-Forwarded-For address is the
+    /// client: entries before it are whatever the client wrote.
+    #[test]
+    fn the_proxy_names_the_client_in_the_rightmost_forwarded_address() {
+        let headers = headers_with(&[("x-forwarded-for", "6.6.6.6, 198.51.100.7")]);
+        let ip = resolve_client_ip(&headers, PROXY, true, "x-forwarded-for");
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))));
     }
 
     #[test]
-    fn test_extract_ip_from_x_real_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "203.0.113.42".parse().unwrap());
+    fn a_configured_header_is_read_whole() {
+        let headers = headers_with(&[("x-real-ip", "203.0.113.42"), ("x-forwarded-for", "1.2.3.4")]);
+        let ip = resolve_client_ip(&headers, PROXY, true, "x-real-ip");
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42))));
+        let forwarded = headers_with(&[("forwarded", "for=192.0.2.1, for=\"198.51.100.17\"")]);
+        let ip = resolve_client_ip(&forwarded, PROXY, true, "forwarded");
+        assert_eq!(ip, Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 17))));
+    }
 
-        let ip = extract_client_ip(&headers, true);
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)));
+    /// A forwarded header from anyone but a proxy address, or with proxy
+    /// trust off, is ignored: the client is the peer.
+    #[test]
+    fn a_header_from_anyone_else_is_ignored() {
+        let headers = headers_with(&[("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(resolve_client_ip(&headers, OUTSIDER, true, "x-forwarded-for"), OUTSIDER);
+        assert_eq!(resolve_client_ip(&headers, PROXY, false, "x-forwarded-for"), PROXY);
+        assert_eq!(resolve_client_ip(&headers, None, true, "x-forwarded-for"), None);
     }
 
     #[test]
-    fn test_extract_ip_from_forwarded_header() {
-        let mut headers = HeaderMap::new();
-        headers.insert("forwarded", "for=198.51.100.17".parse().unwrap());
-
-        let ip = extract_client_ip(&headers, true);
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap(), IpAddr::V4(Ipv4Addr::new(198, 51, 100, 17)));
+    fn a_proxy_without_the_header_is_the_client() {
+        let headers = HeaderMap::new();
+        assert_eq!(resolve_client_ip(&headers, PROXY, true, "x-real-ip"), PROXY);
     }
 
     #[test]
-    fn test_extract_ip_trust_proxy_false() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "192.168.1.100".parse().unwrap());
-
-        // With trust_proxy=false, should ignore proxy headers and return localhost
-        let ip = extract_client_ip(&headers, false);
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap(), IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    fn the_resolved_address_is_read_back_from_the_internal_header() {
+        let headers = headers_with(&[(CLIENT_IP_HEADER, "198.51.100.7")]);
+        assert_eq!(extract_client_ip(&headers), Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))));
+        assert_eq!(extract_client_ip(&HeaderMap::new()), None);
     }
 
+    /// #514: each caller has its own bucket; one exhausting it leaves the
+    /// others theirs, and the refusal says how long to wait.
     #[test]
-    fn test_extract_ip_priority_order() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
-        headers.insert("x-real-ip", "5.6.7.8".parse().unwrap());
-        headers.insert("forwarded", "for=9.10.11.12".parse().unwrap());
+    fn one_caller_exhausting_an_endpoint_leaves_the_others_theirs() {
+        let mut config = EndpointRateLimitConfig::new();
+        config.add_limit("/xrpc/test.upload", EndpointRateLimit::new(3, 3600));
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
+        let alice = caller();
+        let bob = CallerKey::Account("did:plc:bob".to_string());
+        for _ in 0..3 {
+            assert!(limiter.check_endpoint("/xrpc/test.upload", &alice).unwrap().is_ok());
+        }
+        match limiter.check_endpoint("/xrpc/test.upload", &alice).unwrap() {
+            Err(PdsError::RateLimitExceeded { retry_after }) => {
+                // One request refills every 3600 / 3 seconds.
+                assert!(retry_after > Duration::from_secs(1100), "{retry_after:?}");
+                assert!(retry_after <= Duration::from_secs(1200), "{retry_after:?}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(limiter.check_endpoint("/xrpc/test.upload", &bob).unwrap().is_ok());
+    }
 
-        // X-Forwarded-For should have highest priority
-        let ip = extract_client_ip(&headers, true);
-        assert!(ip.is_some());
-        assert_eq!(ip.unwrap(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+    /// A ten-image post never meets the upload limit, many times over.
+    #[test]
+    fn the_upload_budget_fits_many_ten_image_posts() {
+        let limiter = RateLimiter::with_bluesky_defaults(RateLimitConfig::default());
+        for upload in 0..300 {
+            let result = limiter.check_endpoint("/xrpc/com.atproto.repo.uploadBlob", &caller());
+            assert!(result.unwrap().is_ok(), "upload {upload}");
+        }
+        assert!(limiter
+            .check_endpoint("/xrpc/com.atproto.repo.uploadBlob", &caller())
+            .unwrap()
+            .is_err());
     }
 
     #[test]
@@ -2018,10 +2161,10 @@ mod tests {
 
         // Per-auth-type globals.
         for _ in 0..1000 {
-            assert!(limiter.check_authenticated().is_ok());
-            assert!(limiter.check_unauthenticated().is_ok());
-            assert!(limiter.check_admin().is_ok());
-            assert!(limiter.check_cross_pds().is_ok());
+            assert!(limiter.check_authenticated(&caller()).is_ok());
+            assert!(limiter.check_unauthenticated(&caller()).is_ok());
+            assert!(limiter.check_admin(&caller()).is_ok());
+            assert!(limiter.check_cross_pds(&caller()).is_ok());
         }
 
         // Outbound resolution buckets.
@@ -2034,7 +2177,7 @@ mod tests {
         // check_endpoint returns Option<PdsResult<()>>; when gated it
         // returns Some(Ok(())) so callers see "limit configured + allowed"
         // rather than the None "no limit configured" branch.
-        let ep_result = limiter.check_endpoint("/xrpc/com.atproto.repo.createRecord");
+        let ep_result = limiter.check_endpoint("/xrpc/com.atproto.repo.createRecord", &caller());
         assert!(matches!(ep_result, Some(Ok(()))));
 
         // check_ip on a hot key — 200 rapid same-IP checks.
@@ -2098,7 +2241,7 @@ mod tests {
 
         // First 5 requests should succeed (within both limits)
         for i in 0..5 {
-            let result = limiter.check_endpoint("/xrpc/test.endpoint");
+            let result = limiter.check_endpoint("/xrpc/test.endpoint", &caller());
             assert!(result.is_some(), "Request {} should have endpoint limit", i);
             assert!(
                 result.unwrap().is_ok(),
@@ -2108,7 +2251,7 @@ mod tests {
         }
 
         // 6th request should fail (exceeds first limit of 5)
-        let result = limiter.check_endpoint("/xrpc/test.endpoint");
+        let result = limiter.check_endpoint("/xrpc/test.endpoint", &caller());
         assert!(result.is_some());
         assert!(
             result.unwrap().is_err(),
@@ -2177,7 +2320,7 @@ mod tests {
 
         // First 10 requests should succeed (within both limits)
         for i in 0..10 {
-            let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession");
+            let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession", &caller());
             assert!(result.is_some(), "Request {} should have endpoint limit", i);
             assert!(
                 result.unwrap().is_ok(),
@@ -2187,7 +2330,7 @@ mod tests {
         }
 
         // 11th request should fail (exceeds short-term limit of 10/minute)
-        let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession");
+        let result = limiter.check_endpoint("/xrpc/com.atproto.server.createSession", &caller());
         assert!(result.is_some());
         assert!(
             result.unwrap().is_err(),
@@ -2213,12 +2356,12 @@ mod tests {
 
         // First 3 requests should succeed
         for i in 0..3 {
-            let result = limiter.check_endpoint("/xrpc/test.strict");
+            let result = limiter.check_endpoint("/xrpc/test.strict", &caller());
             assert!(result.unwrap().is_ok(), "Request {} should pass", i);
         }
 
         // 4th request should fail due to strict limit, even though loose limit would allow it
-        let result = limiter.check_endpoint("/xrpc/test.strict");
+        let result = limiter.check_endpoint("/xrpc/test.strict", &caller());
         assert!(
             result.unwrap().is_err(),
             "Request 4 should fail the 3/minute limit (most restrictive)"
@@ -2236,11 +2379,11 @@ mod tests {
 
         // Should work like before
         for i in 0..5 {
-            let result = limiter.check_endpoint("/xrpc/test.single");
+            let result = limiter.check_endpoint("/xrpc/test.single", &caller());
             assert!(result.unwrap().is_ok(), "Request {} should pass", i);
         }
 
-        let result = limiter.check_endpoint("/xrpc/test.single");
+        let result = limiter.check_endpoint("/xrpc/test.single", &caller());
         assert!(result.unwrap().is_err(), "Request 6 should fail");
     }
 
@@ -2264,13 +2407,13 @@ mod tests {
         let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), config);
 
         // Endpoint 1 should have limits
-        assert!(limiter.check_endpoint("/xrpc/endpoint1").is_some());
+        assert!(limiter.check_endpoint("/xrpc/endpoint1", &caller()).is_some());
 
         // Endpoint 2 should have limits
-        assert!(limiter.check_endpoint("/xrpc/endpoint2").is_some());
+        assert!(limiter.check_endpoint("/xrpc/endpoint2", &caller()).is_some());
 
         // Endpoint 3 should NOT have limits
-        assert!(limiter.check_endpoint("/xrpc/endpoint3").is_none());
+        assert!(limiter.check_endpoint("/xrpc/endpoint3", &caller()).is_none());
     }
 
     // ========== Tests for Identity Resolution Rate Limiting ==========

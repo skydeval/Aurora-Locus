@@ -75,15 +75,12 @@ pub struct AuthContext {
     pub auth_method: AuthMethod,
 }
 
-/// The request's client IP for admin session IP-binding enforcement (#442).
-/// Honors X-Forwarded-For/X-Real-IP only when `trust_proxy` is on, else a
-/// loopback placeholder — so a client can't spoof its bound IP via the header
-/// unless the operator has opted into trusting the proxy.
-pub(crate) fn request_client_ip(
-    headers: &axum::http::HeaderMap,
-    ctx: &AppContext,
-) -> Option<std::net::IpAddr> {
-    crate::rate_limit::extract_client_ip(headers, ctx.rate_limiter.trust_proxy)
+/// The request's client IP for admin session IP-binding enforcement (#442):
+/// the address [`crate::rate_limit::client_ip_middleware`] resolved, which
+/// honours a forwarded header only from a trusted proxy, so a client can't
+/// spoof its bound IP via the header.
+pub(crate) fn request_client_ip(headers: &axum::http::HeaderMap) -> Option<std::net::IpAddr> {
+    crate::rate_limit::extract_client_ip(headers)
 }
 
 #[async_trait]
@@ -129,7 +126,7 @@ impl FromRequestParts<AppContext> for AuthContext {
             Err(_) => {
                 // Fallback to JWT validation for backward compatibility. Thread
                 // the client IP so a bound admin session is enforced (#442).
-                let current_ip = request_client_ip(&parts.headers, state);
+                let current_ip = request_client_ip(&parts.headers);
                 let session = state
                     .account_manager
                     .validate_access_token_with_ip(&token, current_ip)
@@ -293,7 +290,7 @@ impl FromRequestParts<AppContext> for AuthContextForwarded {
         }
         // #442: thread the client IP so a bound admin session is enforced on this
         // forwarded path (getSession routes here), not fail-closed.
-        let current_ip = request_client_ip(&parts.headers, ctx);
+        let current_ip = request_client_ip(&parts.headers);
         let auth = ctx
             .verify_jwt_with_allowlist(&token, &allowlist, current_ip)
             .await?;
@@ -357,7 +354,7 @@ impl FromRequestParts<AppContext> for OptionalAuthContext {
                 Err(_) => {
                     // Fallback to JWT validation. Thread the client IP so a bound
                     // admin session is enforced here too (#442).
-                    let current_ip = request_client_ip(&parts.headers, state);
+                    let current_ip = request_client_ip(&parts.headers);
                     match state
                         .account_manager
                         .validate_access_token_with_ip(&token, current_ip)
@@ -413,7 +410,7 @@ impl FromRequestParts<AppContext> for AdminAuthContext {
     ) -> Result<Self, Self::Rejection> {
         let token = extract_bearer_token(&parts.headers)
             .ok_or_else(|| PdsError::Authentication("Missing authorization header".to_string()))?;
-        let current_ip = request_client_ip(&parts.headers, state);
+        let current_ip = request_client_ip(&parts.headers);
         admin_auth_from_token_with_ip(state, &token, current_ip).await
     }
 }
@@ -1689,6 +1686,7 @@ mod admin_auth_third_path_tests {
                 exempt_admin_assets: true,
             buckets_retention_days: 7,
             trust_proxy: false,
+            client_ip_header: crate::rate_limit::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

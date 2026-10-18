@@ -42,8 +42,8 @@ struct CreateRecordRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     validate: Option<bool>,
     record: serde_json::Value,
+    /// The commit the repository must be at (`InvalidSwap` otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 
@@ -91,6 +91,9 @@ struct PutRecordRequest {
     /// record that does not exist is `NotFound` (404).
     #[serde(skip_serializing_if = "Option::is_none")]
     swap_record: Option<String>,
+    /// The commit the repository must be at (`InvalidSwap` otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_commit: Option<String>,
 }
 
 /// Response from updating a record: as [`CreateRecordResponse`].
@@ -116,6 +119,9 @@ struct DeleteRecordRequest {
     /// record that does not exist is `NotFound` (404).
     #[serde(skip_serializing_if = "Option::is_none")]
     swap_record: Option<String>,
+    /// The commit the repository must be at (`InvalidSwap` otherwise).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap_commit: Option<String>,
 }
 
 /// Query parameters for getRecord
@@ -206,12 +212,12 @@ struct DescribeRepoResponse {
 #[serde(rename_all = "camelCase")]
 struct ApplyWritesRequest {
     repo: String,
+    /// Applies to every write that does not set its own.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement record validation
     validate: Option<bool>,
     writes: Vec<WriteOpInput>,
+    /// The commit the repository must be at (`InvalidSwap` otherwise).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[allow(dead_code)] // TODO: Implement optimistic concurrency control
     swap_commit: Option<String>,
 }
 
@@ -469,7 +475,8 @@ async fn create_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
         tracing::debug!("create_record: Cross-PDS rate limit check passed");
     }
 
@@ -494,7 +501,8 @@ async fn create_record(
     // `.with_lexicon`, leaving the dispatch ladder's PRIORITY 2 gate
     // empty and forcing every unknown-NSID write through Optimistic
     // fall-through.
-    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
+    let repo_mgr =
+        RepositoryManager::for_writer(&ctx, auth_did.to_string()).with_swap_commit(req.swap_commit);
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -599,7 +607,8 @@ async fn put_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user
@@ -611,7 +620,8 @@ async fn put_record(
 
     // Create repository manager via §17.4-Step-4 / #136 helper —
     // plumbs the lexicon resolver + config when enabled.
-    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
+    let repo_mgr =
+        RepositoryManager::for_writer(&ctx, auth_did.to_string()).with_swap_commit(req.swap_commit);
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -690,7 +700,8 @@ async fn delete_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user
@@ -704,7 +715,8 @@ async fn delete_record(
     // path (`validate_write` early-returns on `write.value = None`),
     // but route through `for_writer` anyway so the audit grep
     // (#136-guard-2) has a uniform rule.
-    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
+    let repo_mgr =
+        RepositoryManager::for_writer(&ctx, auth_did.to_string()).with_swap_commit(req.swap_commit);
 
     // Create signer from repo key
     let signer = create_actor_signer(&ctx.account_manager, auth_did).await?;
@@ -1095,7 +1107,8 @@ async fn apply_writes(
 
     // Apply stricter rate limiting for cross-PDS requests
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user
@@ -1109,15 +1122,20 @@ async fn apply_writes(
     // per-write validate dispatch goes through the lexicon resolver
     // when plumbed, and the §17.3.4 `validate_imports` override
     // fires at validate-phase entry for each write in the batch.
-    let repo_mgr = RepositoryManager::for_writer(&ctx, auth_did.to_string());
+    let repo_mgr =
+        RepositoryManager::for_writer(&ctx, auth_did.to_string()).with_swap_commit(req.swap_commit);
 
     // Prepare writes (converts to PreparedWrite format)
     // Normalize both accepted wire shapes (#110) into the canonical WriteOp.
-    let writes = req
+    // The request's `validate` applies to every write that sets none itself.
+    let mut writes = req
         .writes
         .into_iter()
         .map(WriteOpInput::into_write_op)
         .collect::<PdsResult<Vec<WriteOp>>>()?;
+    for write in &mut writes {
+        write.validate = write.validate.or(req.validate);
+    }
     // An OAuth client needs a permission for every write in the batch.
     if auth.granted_scopes().is_some() {
         for write in &writes {

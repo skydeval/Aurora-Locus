@@ -153,6 +153,11 @@ impl JobScheduler {
         tokio::spawn(Self::rate_limit_buckets_reaper_job(Arc::clone(&self)));
         info!("rate_limit_buckets reaper job started");
 
+        // The in-process limiter keeps one bucket per caller (#514); forget
+        // the buckets of callers idle long enough to be full again.
+        tokio::spawn(Self::rate_limit_retain_job(Arc::clone(&self)));
+        info!("rate limiter per-caller cleanup job started");
+
         // Spawn OAuth authorization_request cleanup job. The
         // sweeper has existed since Arc 7 Step 0 recon Q1 but
         // was previously unwired (no JobScheduler entry). Step 1
@@ -680,6 +685,18 @@ impl JobScheduler {
                     "Rate-limit bucket reaper failed"
                 ),
             }
+        }
+    }
+
+    /// Drop the in-process limiter's per-caller buckets that are full again
+    /// (#514), every five minutes, so state for callers who have gone away
+    /// does not accumulate. A dropped bucket starts full on the caller's
+    /// next request, which is where it would be anyway.
+    async fn rate_limit_retain_job(scheduler: Arc<Self>) {
+        let mut interval = interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            scheduler.context.rate_limiter.retain_recent();
         }
     }
 
