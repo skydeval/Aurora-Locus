@@ -201,7 +201,8 @@ async fn authenticated_did_for_repo(
     let auth = middleware::require_auth_unified(State(ctx.clone()), headers).await?;
     middleware::enforce_scope(&auth, &scope)?;
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
     let auth_did = auth.did();
     if requested_repo != auth_did {

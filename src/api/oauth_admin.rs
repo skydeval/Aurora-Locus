@@ -419,7 +419,7 @@ async fn password_login_gate(
             .into_response();
     }
     // Resolve the client IP for IP binding (#442) before consuming ctx.
-    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let client_ip = crate::auth::request_client_ip(&headers);
     match handle_password_login(State(ctx), client_ip, body).await {
         Ok(json) => json.into_response(),
         Err((status, msg)) => (status, msg).into_response(),
@@ -910,7 +910,7 @@ async fn handle_oauth_callback(
     // v0.10 constitutional claim: admin/superadmin roles are restricted to LOCAL
     // accounts. Resolve the login into a real account session (the tokens the
     // request-auth path validates), rejecting non-local DIDs and non-admins.
-    let current_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let current_ip = crate::auth::request_client_ip(&headers);
     let (access_token, refresh_token, role) =
         authorize_local_admin(&ctx, &did, current_ip).await?;
 
@@ -1120,6 +1120,7 @@ mod tests {
                 exempt_admin_assets: true,
                 buckets_retention_days: 7,
                 trust_proxy: false,
+                client_ip_header: crate::rate_limit::DEFAULT_CLIENT_IP_HEADER.to_string(),
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

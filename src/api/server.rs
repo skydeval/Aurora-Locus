@@ -138,7 +138,7 @@ async fn create_account(
     // This is handled by the endpoint-specific middleware limits, but we add
     // an additional per-IP check here for extra protection
     if let Some(client_ip) =
-        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+        crate::rate_limit::extract_client_ip(&headers)
     {
         tracing::debug!(
             "create_account: Checking IP-based rate limit for IP: {}",
@@ -348,7 +348,7 @@ async fn create_session(
 ) -> PdsResult<Json<SessionResponse>> {
     // #442: resolve the client IP once — reused for identifier+IP rate limiting
     // and, after the session is minted, IP-binding enforcement.
-    let client_ip = crate::auth::request_client_ip(&headers, &ctx);
+    let client_ip = crate::auth::request_client_ip(&headers);
 
     // Identifier+IP rate limiting for login attempts (30 per 5min per identifier+IP)
     // Prevents brute-force attacks on specific accounts from specific IPs
@@ -759,7 +759,7 @@ async fn request_password_reset(
     // IP-based rate limiting for password reset (50 per 5 minutes per IP)
     // Prevents email spam and denial of service
     if let Some(client_ip) =
-        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+        crate::rate_limit::extract_client_ip(&headers)
     {
         tracing::debug!(
             "request_password_reset: Checking IP-based rate limit for IP: {}",
@@ -1059,7 +1059,7 @@ async fn delete_account(
 
     // IP-based rate limiting for account deletion (50 per 5 minutes)
     if let Some(client_ip) =
-        crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy)
+        crate::rate_limit::extract_client_ip(&headers)
     {
         ctx.rate_limiter.check_ip(&client_ip).map_err(|e| {
             tracing::error!(
@@ -2417,8 +2417,9 @@ mod create_session_ip_binding_tests {
         .await
         .unwrap();
 
+        // The client address as the client-IP layer resolves it (#514).
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "203.0.113.44".parse().unwrap());
+        headers.insert(crate::rate_limit::CLIENT_IP_HEADER, "203.0.113.44".parse().unwrap());
         let resp = create_session(
             State(ctx.clone()),
             headers,
@@ -2456,7 +2457,7 @@ mod create_session_ip_binding_tests {
         seed_password_account(&ctx, did, "createunbound.localhost", "pw-correct").await;
         // No admin_security_config row → binding off.
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "203.0.113.45".parse().unwrap());
+        headers.insert(crate::rate_limit::CLIENT_IP_HEADER, "203.0.113.45".parse().unwrap());
         let resp = create_session(
             State(ctx.clone()),
             headers,

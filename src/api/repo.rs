@@ -475,7 +475,8 @@ async fn create_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
         tracing::debug!("create_record: Cross-PDS rate limit check passed");
     }
 
@@ -606,7 +607,8 @@ async fn put_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user
@@ -698,7 +700,8 @@ async fn delete_record(
 
     // Apply stricter rate limiting for cross-PDS requests (Phase 4 Security)
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user
@@ -1104,7 +1107,8 @@ async fn apply_writes(
 
     // Apply stricter rate limiting for cross-PDS requests
     if auth.is_cross_pds() {
-        ctx.rate_limiter.check_cross_pds()?;
+        ctx.rate_limiter
+            .check_cross_pds(&crate::rate_limit::CallerKey::Account(auth.did().to_string()))?;
     }
 
     // Verify repo matches authenticated user

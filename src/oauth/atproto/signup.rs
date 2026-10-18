@@ -87,7 +87,7 @@ pub async fn submit_signup(
     };
     let password = form.password.unwrap_or_default();
 
-    if let Some(ip) = crate::rate_limit::extract_client_ip(&headers, ctx.rate_limiter.trust_proxy) {
+    if let Some(ip) = crate::rate_limit::extract_client_ip(&headers) {
         if ctx.rate_limiter.check_ip(&ip).is_err() {
             return page(
                 &ctx,
