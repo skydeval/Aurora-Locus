@@ -92,7 +92,9 @@ impl<'a> ActorTransaction<'a> {
         sqlx::query(query)
     }
 
-    /// Insert a block into the repository within this transaction
+    /// Insert a block into the repository within this transaction. A block
+    /// already stored is kept: its CID fixes its content, and replacing the
+    /// row would cascade-delete every record that points at it (#498).
     pub async fn insert_block(&mut self, cid: &str, content: &[u8]) -> PdsResult<()> {
         let txn = self
             .txn
@@ -100,8 +102,9 @@ impl<'a> ActorTransaction<'a> {
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO repo_block (cid, content, indexed_at)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO repo_block (cid, content, indexed_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(cid) DO NOTHING",
         )
         .bind(cid)
         .bind(content)
@@ -113,7 +116,9 @@ impl<'a> ActorTransaction<'a> {
         Ok(())
     }
 
-    /// Insert a record into the repository within this transaction
+    /// Insert or update a record within this transaction. An existing row is
+    /// updated in place, as [`crate::actor_store::ActorStore::put_record`]
+    /// does, so its takedown is kept and no delete is seen (#498).
     pub async fn insert_record(
         &mut self,
         uri: &str,
@@ -128,8 +133,12 @@ impl<'a> ActorTransaction<'a> {
             .ok_or_else(|| PdsError::Internal("Transaction already completed".to_string()))?;
 
         sqlx::query(
-            "INSERT OR REPLACE INTO record (uri, cid, collection, rkey, repo_rev, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO record (uri, cid, collection, rkey, repo_rev, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(uri) DO UPDATE SET
+                cid = excluded.cid,
+                repo_rev = excluded.repo_rev,
+                indexed_at = excluded.indexed_at",
         )
         .bind(uri)
         .bind(cid)
@@ -340,6 +349,40 @@ mod tests {
             .unwrap();
 
         (store, temp_dir, did.to_string())
+    }
+
+    /// #498: inserting a block that is already stored keeps it, and the
+    /// records pointing at it; re-inserting a record updates it in place and
+    /// keeps its takedown.
+    #[tokio::test]
+    async fn reinserting_a_block_or_record_keeps_what_is_stored() {
+        let (store, _temp, did) = create_test_store().await;
+        let uri = format!("at://{did}/app.bsky.feed.post/3mxaaaaaaaa2a");
+
+        let mut txn = store.begin_transaction(&did).await.unwrap();
+        txn.insert_block("cidA", b"content").await.unwrap();
+        txn.insert_record(&uri, "cidA", "app.bsky.feed.post", "3mxaaaaaaaa2a", Some("r1"))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let pool = store.open_db(&did).await.unwrap();
+        sqlx::query("UPDATE record SET takedown_ref = 'td' WHERE uri = ?1")
+            .bind(&uri)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut txn = store.begin_transaction(&did).await.unwrap();
+        txn.insert_block("cidA", b"content").await.unwrap();
+        txn.insert_record(&uri, "cidA", "app.bsky.feed.post", "3mxaaaaaaaa2a", Some("r2"))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let record = store.get_record(&did, &uri).await.unwrap().expect("record kept");
+        assert_eq!(record.repo_rev, "r2");
+        assert_eq!(record.takedown_ref.as_deref(), Some("td"));
+        assert_eq!(store.get_block(&did, "cidA").await.unwrap().as_deref(), Some(&b"content"[..]));
     }
 
     #[tokio::test]
