@@ -131,6 +131,9 @@ pub(crate) async fn prepare_handle_change(
     }
 
     if !is_under_service_handle_domain(&handle, domains) {
+        // A fresh lookup: the owner may have just published the record, so
+        // neither a remembered failure nor an older answer counts (#516).
+        ctx.identity_resolver.invalidate_handle(&handle).await?;
         let resolved = ctx.identity_resolver.resolve_handle(&handle).await?;
         if resolved != did {
             return Err(PdsError::Validation(format!(

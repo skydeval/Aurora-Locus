@@ -91,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The relay set may be empty. Removing the last relay, clearing the set, or starting with `PDS_FEDERATION_RELAY_URLS` empty no longer fails; with federation on, an empty `PDS_FEDERATION_RELAY_URLS` used to fail the boot seed and block every federation-policy change until the next restart
 - Peer discovery no longer treats a relay's account list as PDS servers. It read `com.atproto.sync.listRepos`, which lists user accounts, recorded each account as a "PDS instance" with no URL, and queued them as pending discoveries; relay-based discovery is removed, and the leftover URL-less pending entries are cleared at startup
 
+### Security
+
+- Resolving a DID or a handle no longer reaches this machine or its private network, whoever named it. In release builds a `did:web` whose host is an address or a loopback name is refused, names are resolved to public addresses only for `did:web` documents and handle `/.well-known/atproto-did` lookups, and those requests do not follow redirects. Every DID document answer, from PLC or a `did:web` host, is read up to 64 KiB. A failed resolution is remembered for a minute (up to 10,000 DIDs), so a stream of unknown DIDs no longer makes one PLC request per use; an identity event for the DID clears it
+
 ## [0.10.1] - 2026-07-27
 
 ### Fixed

@@ -49,6 +49,7 @@ use crate::{
     api::kryphocron_endpoints::NSID_POST_PRIVATE,
     context::AppContext,
     kryphocron_audience::{audience_owner, audience_reference, parse_record_uri, AudienceRef},
+    outbound::{is_internal, read_limited, refuse_internal_did_web, PublicAddresses},
 };
 
 /// The most records fetched from other PDSes for one reply. Posts held here
@@ -414,50 +415,6 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-/// A DNS resolver that answers only public addresses, so a PDS name that
-/// resolves inward is not reached ([`is_internal`]).
-struct PublicAddresses;
-
-impl reqwest::dns::Resolve for PublicAddresses {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let host = name.as_str().to_string();
-        Box::pin(public_addresses(host))
-    }
-}
-
-/// The public addresses `host` resolves to; an error when it has none.
-async fn public_addresses(
-    host: String,
-) -> Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>> {
-    let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
-        .await?
-        .filter(|address| !is_internal(address.ip()))
-        .collect();
-    if addresses.is_empty() {
-        return Err(format!("{host} resolves to no public address").into());
-    }
-    Ok(Box::new(addresses.into_iter()))
-}
-
-/// Refuse a `did:web` whose host is an address or a loopback name: its DID
-/// document would be fetched from there. Any other DID passes.
-fn refuse_internal_did_web(did: &str) -> Result<(), String> {
-    let Some(rest) = did.strip_prefix("did:web:") else {
-        return Ok(());
-    };
-    let host_and_port = rest.split(':').next().unwrap_or_default().replace("%3A", ":");
-    let host = host_and_port
-        .rsplit_once(':')
-        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
-        .map_or(host_and_port.as_str(), |(host, _)| host)
-        .to_ascii_lowercase();
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host == "localhost" || host.ends_with(".localhost") || host.parse::<IpAddr>().is_ok() {
-        return Err(format!("{did}: a did:web on an address or loopback name"));
-    }
-    Ok(())
-}
-
 /// Fetch `uri` from its owner's PDS, as the DID document names it.
 async fn fetch_remote(ctx: &AppContext, uri: &str) -> Result<Option<serde_json::Value>, String> {
     let mut segments = uri
@@ -491,20 +448,14 @@ async fn fetch_remote(ctx: &AppContext, uri: &str) -> Result<Option<serde_json::
 /// GET a `getRecord` URL and read its record: `None` for a record or
 /// repository the PDS says is not there.
 async fn get_record_answer(url: url::Url) -> Result<Option<serde_json::Value>, String> {
-    let mut response = client()
+    let response = client()
         .get(url.clone())
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .await
         .map_err(|e| format!("{url}: {e}"))?;
     let status = response.status();
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| format!("{url}: {e}"))? {
-        if body.len() + chunk.len() > MAX_RECORD_BYTES {
-            return Err(format!("{url}: answer larger than {MAX_RECORD_BYTES} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_limited(response, MAX_RECORD_BYTES).await?;
     let answer: serde_json::Value =
         serde_json::from_slice(&body).map_err(|e| format!("{url}: {status}: {e}"))?;
     if status.is_success() {
@@ -548,32 +499,6 @@ fn require_fetchable(url: &url::Url) -> Result<(), String> {
         return Err(format!("{url}: internal address"));
     }
     Ok(())
-}
-
-/// Addresses a PDS never has on the public network.
-fn is_internal(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                // 100.64.0.0/10, carrier-grade NAT
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64)
-        }
-        IpAddr::V6(v6) => {
-            let first = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                // fc00::/7 unique local, fe80::/10 link-local
-                || (first & 0xFE00) == 0xFC00
-                || (first & 0xFFC0) == 0xFE80
-                || v6.to_ipv4_mapped().is_some_and(|v4| is_internal(IpAddr::V4(v4)))
-        }
-    }
 }
 
 #[cfg(test)]

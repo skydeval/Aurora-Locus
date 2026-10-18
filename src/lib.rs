@@ -29,6 +29,7 @@ pub mod jobs;
 pub mod kryphocron;
 pub mod kryphocron_audience;
 pub mod kryphocron_thread;
+pub mod outbound;
 pub mod kryphocron_audit;
 pub mod kryphocron_content;
 pub mod kryphocron_oracle_activity;

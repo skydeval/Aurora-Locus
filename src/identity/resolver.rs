@@ -40,12 +40,61 @@ impl Default for IdentityResolverConfig {
     }
 }
 
+/// The largest DID document read, from PLC or a `did:web` host (#516).
+const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// How long a failed DID resolution is answered from memory before it is
+/// tried again (#516), and how many such answers are kept.
+const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const NEGATIVE_CAPACITY: u64 = 10_000;
+
+/// Whether requests to hosts that DIDs and handles name are kept on the
+/// public network ([`crate::outbound`]). Debug builds reach loopback hosts,
+/// which local multi-instance runs use as `did:web` peers.
+const GUARD_OUTBOUND: bool = !cfg!(debug_assertions);
+
+/// A failed DID or handle resolution, as remembered for [`NEGATIVE_TTL`].
+#[derive(Debug, Clone)]
+enum FailedResolution {
+    Tombstoned,
+    HandleNotFound(String),
+    Failed(String),
+}
+
+impl FailedResolution {
+    fn of(error: &PdsError) -> Self {
+        match error {
+            PdsError::DidTombstoned(_) => Self::Tombstoned,
+            PdsError::HandleNotFound(message) => Self::HandleNotFound(message.clone()),
+            other => Self::Failed(other.to_string()),
+        }
+    }
+
+    fn to_error(&self, did: &str) -> PdsError {
+        match self {
+            Self::Tombstoned => PdsError::DidTombstoned(did.to_string()),
+            Self::HandleNotFound(message) => PdsError::HandleNotFound(message.clone()),
+            Self::Failed(message) => PdsError::IdentityResolution(message.clone()),
+        }
+    }
+}
+
+/// The negative-cache key of a handle, kept apart from DIDs.
+fn handle_key(handle: &str) -> String {
+    format!("handle:{handle}")
+}
+
 /// Main identity resolver - combines caching with SDK resolution
 #[derive(Clone)]
 pub struct IdentityResolver {
     cache: DidCache,
     handle_resolver: Arc<HandleResolver>,
+    /// For the PLC directory, whose URL the operator configures.
     http_client: reqwest::Client,
+    /// For `did:web` hosts and handle hosts, which anyone names: no
+    /// redirects, and in release builds public addresses only.
+    web_client: reqwest::Client,
+    failed: moka::future::Cache<String, FailedResolution>,
     #[allow(dead_code)] // Kept for future configuration needs
     config: IdentityResolverConfig,
 }
@@ -59,15 +108,39 @@ impl IdentityResolver {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| PdsError::Internal(format!("Failed to create HTTP client: {}", e)))?;
+        let mut web_client = reqwest::Client::builder()
+            .user_agent(&config.user_agent)
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none());
+        if GUARD_OUTBOUND {
+            web_client = web_client.dns_resolver(Arc::new(crate::outbound::PublicAddresses));
+        }
+        let web_client = web_client
+            .build()
+            .map_err(|e| PdsError::Internal(format!("Failed to create HTTP client: {}", e)))?;
 
         // Create handle resolver from SDK
         // 10s timeout matches the http_client; matches the SDK default for handle DNS+well-known races.
-        let handle_resolver = Arc::new(HandleResolver::new(10_000));
+        let handle_resolver = Arc::new(if GUARD_OUTBOUND {
+            HandleResolver::with_fetch_handler(
+                10_000,
+                Arc::new(GuardedFetcher {
+                    client: web_client.clone(),
+                }),
+            )
+        } else {
+            HandleResolver::new(10_000)
+        });
 
         Ok(Self {
             cache,
             handle_resolver,
             http_client,
+            web_client,
+            failed: moka::future::Cache::builder()
+                .max_capacity(NEGATIVE_CAPACITY)
+                .time_to_live(NEGATIVE_TTL)
+                .build(),
             config,
         })
     }
@@ -152,18 +225,32 @@ impl IdentityResolver {
         // PdsError::IdentityResolution → HTTP 500. An Ok(None) is the
         // resolver completing cleanly but determining no DID maps to
         // the handle → PdsError::HandleNotFound → HTTP 400 with the
-        // lexicon-canonical `HandleNotFound` error name.
-        let did_str = self
+        // lexicon-canonical `HandleNotFound` error name. Either is
+        // remembered for NEGATIVE_TTL (#516).
+        let key = handle_key(&normalized);
+        if let Some(failed) = self.failed.get(&key).await {
+            return Err(failed.to_error(&normalized));
+        }
+        let resolved = self
             .handle_resolver
             .resolve(&normalized)
             .await
-            .map_err(|e| PdsError::IdentityResolution(format!("Failed to resolve handle: {}", e)))?
-            .ok_or_else(|| {
-                PdsError::HandleNotFound(format!(
-                    "Handle {} did not resolve to any DID",
-                    normalized
-                ))
-            })?;
+            .map_err(|e| PdsError::IdentityResolution(format!("Failed to resolve handle: {}", e)))
+            .and_then(|did| {
+                did.ok_or_else(|| {
+                    PdsError::HandleNotFound(format!(
+                        "Handle {} did not resolve to any DID",
+                        normalized
+                    ))
+                })
+            });
+        let did_str = match resolved {
+            Ok(did) => did,
+            Err(error) => {
+                self.failed.insert(key, FailedResolution::of(&error)).await;
+                return Err(error);
+            }
+        };
 
         // Cache the successful resolution
         self.cache.cache_handle(&normalized, &did_str).await?;
@@ -237,16 +324,36 @@ impl IdentityResolver {
         Ok(doc)
     }
 
-    /// Fetch DID document from source
+    /// Fetch DID document from source. A failure is remembered for
+    /// [`NEGATIVE_TTL`] and answered again without a request, so a stream of
+    /// unknown DIDs costs one request each per minute, not one per use.
     async fn fetch_did_document(&self, did: &str) -> PdsResult<DidDocument> {
-        match parse_did(did).map(|p| p.method()) {
+        if let Some(failed) = self.failed.get(did).await {
+            return Err(failed.to_error(did));
+        }
+        let result = match parse_did(did).map(|p| p.method()) {
             Ok(DidMethod::Plc) => self.fetch_plc_document(did).await,
             Ok(DidMethod::Web) => self.fetch_web_document(did).await,
             Err(_) => Err(PdsError::IdentityResolution(format!(
                 "Unsupported DID method: {}",
                 did
             ))),
+        };
+        if let Err(error) = &result {
+            self.failed
+                .insert(did.to_string(), FailedResolution::of(error))
+                .await;
         }
+        result
+    }
+
+    /// Parse a DID document answer, read up to [`MAX_DID_DOCUMENT_BYTES`].
+    async fn read_document(response: reqwest::Response, source: &str) -> PdsResult<DidDocument> {
+        let body = crate::outbound::read_limited(response, MAX_DID_DOCUMENT_BYTES)
+            .await
+            .map_err(PdsError::IdentityResolution)?;
+        serde_json::from_slice(&body)
+            .map_err(|e| PdsError::IdentityResolution(format!("Invalid {source} document: {e}")))
     }
 
     /// Check if an HTTP error is retryable
@@ -327,9 +434,7 @@ impl IdentityResolver {
             match self.http_client.get(&plc_url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        let doc: DidDocument = response.json().await.map_err(|e| {
-                            PdsError::IdentityResolution(format!("Invalid PLC document: {}", e))
-                        })?;
+                        let doc = Self::read_document(response, "PLC").await?;
 
                         if attempt > 0 {
                             tracing::info!(
@@ -414,6 +519,9 @@ impl IdentityResolver {
         let did_suffix = did
             .strip_prefix("did:web:")
             .ok_or_else(|| PdsError::IdentityResolution("Invalid did:web format".to_string()))?;
+        if GUARD_OUTBOUND {
+            crate::outbound::refuse_internal_did_web(did).map_err(PdsError::IdentityResolution)?;
+        }
 
         let parts: Vec<&str> = did_suffix.split(':').collect();
         let domain = parts
@@ -446,12 +554,10 @@ impl IdentityResolver {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.http_client.get(&url).send().await {
+            match self.web_client.get(&url).send().await {
                 Ok(response) => {
                     if response.status().is_success() {
-                        let doc: DidDocument = response.json().await.map_err(|e| {
-                            PdsError::IdentityResolution(format!("Invalid did:web document: {}", e))
-                        })?;
+                        let doc = Self::read_document(response, "did:web").await?;
 
                         if attempt > 0 {
                             tracing::info!(
@@ -548,19 +654,84 @@ impl IdentityResolver {
         Ok(None)
     }
 
-    /// Invalidate cached handle (force re-resolution)
+    /// Invalidate cached handle (force re-resolution), and forget a failed
+    /// resolution of it.
     pub async fn invalidate_handle(&self, handle: &str) -> PdsResult<()> {
+        self.failed.invalidate(&handle_key(&handle.to_lowercase())).await;
         self.cache.delete_handle(handle).await
     }
 
-    /// Invalidate cached DID document (force re-fetch)
+    /// Invalidate cached DID document (force re-fetch), and forget a failed
+    /// resolution of it: an identity event for a DID just created must not
+    /// be answered with the miss from before it existed.
     pub async fn invalidate_did(&self, did: &str) -> PdsResult<()> {
+        self.failed.invalidate(did).await;
         self.cache.delete_did_doc(did).await
     }
 
     /// Clean up expired cache entries
     pub async fn cleanup_cache(&self) -> PdsResult<()> {
         self.cache.cleanup_expired().await
+    }
+}
+
+/// The fetch handler handle resolution uses in release builds: the
+/// resolver's guarded `did:web` client ([`crate::outbound`]), with the
+/// answer read up to [`MAX_DID_DOCUMENT_BYTES`]. A handle's host is named by
+/// whoever chose the handle, as a `did:web` host is.
+struct GuardedFetcher {
+    client: reqwest::Client,
+}
+
+#[async_trait::async_trait]
+impl proto_blue::common::fetch::FetchHandler for GuardedFetcher {
+    async fn fetch(
+        &self,
+        req: proto_blue::common::fetch::HttpRequest,
+    ) -> Result<proto_blue::common::fetch::HttpResponse, proto_blue::common::fetch::FetchError> {
+        use proto_blue::common::fetch::{FetchError, HttpMethod, HttpResponse};
+        let method = match req.method {
+            HttpMethod::Get => reqwest::Method::GET,
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
+            HttpMethod::Delete => reqwest::Method::DELETE,
+            HttpMethod::Patch => reqwest::Method::PATCH,
+            HttpMethod::Head => reqwest::Method::HEAD,
+            HttpMethod::Options => reqwest::Method::OPTIONS,
+        };
+        let mut request = self.client.request(method, &req.url);
+        for (name, value) in &req.headers {
+            request = request.header(name, value);
+        }
+        if let Some(body) = req.body {
+            request = request.body(body);
+        }
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                FetchError::Timeout
+            } else {
+                FetchError::Network(e.to_string())
+            }
+        })?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect();
+        let body = crate::outbound::read_limited(response, MAX_DID_DOCUMENT_BYTES)
+            .await
+            .map_err(FetchError::Body)?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -1142,5 +1313,90 @@ mod tests {
                 "expected PdsError::IdentityResolution, got: {other:?}"
             ),
         }
+    }
+
+    // ---- #516: failed resolutions are remembered; answers are bounded ----
+
+    /// A stub PLC answering `status` with `body` to every request, counting
+    /// the requests it receives.
+    async fn spawn_counting_plc(
+        status: u16,
+        body: Vec<u8>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::sync::oneshot::Sender<()>) {
+        use axum::http::StatusCode;
+        use axum::routing::any;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/*path",
+            any(move || {
+                let counter = counter.clone();
+                let body = body.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    (StatusCode::from_u16(status).unwrap(), body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = rx.await;
+                })
+                .await
+                .ok();
+        });
+        (format!("http://{addr}"), hits, tx)
+    }
+
+    #[tokio::test]
+    async fn a_failed_resolution_is_answered_from_memory_until_invalidated() {
+        use std::sync::atomic::Ordering;
+        let (url, hits, _shutdown) = spawn_counting_plc(404, b"not found".to_vec()).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+        let did = "did:plc:nosuchdid00000000000000";
+
+        for _ in 0..3 {
+            let err = resolver.resolve_did(did).await.unwrap_err();
+            assert!(matches!(err, PdsError::IdentityResolution(ref m) if m.contains("404")), "{err:?}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "one request for three resolutions");
+
+        // An identity event for the DID clears the remembered failure.
+        resolver.invalidate_did(did).await.unwrap();
+        assert!(resolver.resolve_did(did).await.is_err());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_tombstone_is_still_a_tombstone() {
+        use std::sync::atomic::Ordering;
+        let (url, hits, _shutdown) = spawn_counting_plc(410, Vec::new()).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+        let did = "did:plc:tombstoned0000000000000";
+
+        for _ in 0..2 {
+            let err = resolver.resolve_did(did).await.unwrap_err();
+            assert!(matches!(err, PdsError::DidTombstoned(ref d) if d == did), "{err:?}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_did_document_is_refused() {
+        let body = vec![b' '; MAX_DID_DOCUMENT_BYTES + 1];
+        let (url, _hits, _shutdown) = spawn_counting_plc(200, body).await;
+        let cache = DidCache::new(open_test_pool_for_plc().await);
+        let resolver = IdentityResolver::new(cache, config_pointing_at(&url)).unwrap();
+
+        let err = resolver.resolve_did("did:plc:hugedocument000000000000").await.unwrap_err();
+        assert!(matches!(err, PdsError::IdentityResolution(ref m) if m.contains("larger than")), "{err:?}");
     }
 }
