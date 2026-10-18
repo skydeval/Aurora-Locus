@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `swapCommit` is enforced on `createRecord`, `putRecord`, `deleteRecord` and `applyWrites`: the write is refused with `InvalidSwap` unless the repository's current commit is the one named, checked inside the commit so no other write can land in between. It was ignored, and `putRecord` and `deleteRecord` did not read it at all. `applyWrites`' top-level `validate` now applies to every write that does not set its own; it was ignored
+- Creating a record at a record key that already holds one (`createRecord` with an `rkey`, or an `applyWrites` create) answers 400 `InvalidRequest` ("Record already exists"); it answered 500
 - The actor-store transaction no longer replaces rows it re-inserts: inserting a block already stored keeps it (replacing it deleted every record pointing at it), and inserting a record already indexed updates it in place, keeping its takedown
 - `com.atproto.repo.listRecords` lists newest first, as the reference PDS does, and honours `reverse=true` (oldest first); the cursor continues in the listing's order. It listed oldest first and ignored `reverse`, so a client paging "the newest N" got the oldest N. `limit` must be 1–100 (HTTP 400 otherwise); a negative limit made the handler panic
 - Deleting a record can no longer drop other records from the repository. proto-blue-repo 0.3.3's tree delete merged the two subtrees beside a deleted record wrongly, losing one of them; since #505 such commits were refused rather than stored, so the delete failed. proto-blue now comes from the upstream commit that fixes this (a `[patch.crates-io]` pinned to `dollspace-gay/proto-blue` `7a3fb57`) until a fixed release is published, and those deletes succeed

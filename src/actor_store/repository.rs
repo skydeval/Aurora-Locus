@@ -248,6 +248,9 @@ pub struct RepositoryManager {
     /// (preserving back-compat for `RepositoryManager::new`-
     /// constructed test instances that have no shared pool).
     shared_pool: Option<sqlx::AnyPool>,
+    /// The CID the repository's current commit must have for a commit to
+    /// be made (`swapCommit`, #452); `None` = no precondition.
+    swap_commit: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +352,7 @@ impl RepositoryManager {
             kryphocron_enabled: false,
             kryphocron_deny_map: None,
             shared_pool: None,
+            swap_commit: None,
         }
     }
 
@@ -374,6 +378,7 @@ impl RepositoryManager {
             kryphocron_enabled: false,
             kryphocron_deny_map: None,
             shared_pool: None,
+            swap_commit: None,
         }
     }
 
@@ -388,6 +393,17 @@ impl RepositoryManager {
     #[must_use]
     pub fn with_shared_pool(mut self, shared_pool: sqlx::AnyPool) -> Self {
         self.shared_pool = Some(shared_pool);
+        self
+    }
+
+    /// Require the repository's current commit to be `swap_commit` (a
+    /// commit CID) for this manager's commits (`swapCommit`, #452). The check
+    /// runs inside the commit, against the commit it builds on; a mismatch
+    /// is [`PdsError::SwapCidMismatch`] and nothing is written. `None`
+    /// leaves the precondition off.
+    #[must_use]
+    pub fn with_swap_commit(mut self, swap_commit: Option<String>) -> Self {
+        self.swap_commit = swap_commit;
         self
     }
 
@@ -1130,6 +1146,7 @@ impl RepositoryManager {
             let storage = self.make_storage();
             let did = self.did.clone();
             let signer_arc = signer.clone();
+            let swap_commit = self.swap_commit.clone();
             let repo_writes_owned = repo_writes;
             let prepared_owned = prepared;
             let prior_record_cids_owned = prior_record_cids;
@@ -1146,13 +1163,14 @@ impl RepositoryManager {
                     let did_for_blocking = did.clone();
                     let signer_for_blocking = signer_arc.clone();
                     let proto_blue_join = tokio::task::spawn_blocking(
-                        move || -> Result<_, ProtoRepoError> {
+                        move || -> Result<_, CommitFailure> {
                             let storage_dyn: Arc<dyn RepoStorage> = storage_for_blocking;
                             let mut repo = load_or_create(
                                 storage_dyn.clone(),
                                 did_for_blocking,
                                 signer_for_blocking.as_ref(),
                             )?;
+                            check_swap_commit(&repo, swap_commit.as_deref())?;
                             // #467: `since` is the previous commit's rev (a TID
                             // string), not its CID.
                             let prev_rev = repo.commit().map(|c| c.rev.clone());
@@ -1175,8 +1193,8 @@ impl RepositoryManager {
                     )
                     .await
                     .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?;
-                    let (commit_cid, new_rev, prev_rev, prev_data, blocks) = proto_blue_join
-                        .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+                    let (commit_cid, new_rev, prev_rev, prev_data, blocks) =
+                        proto_blue_join.map_err(commit_error)?;
 
                     // Phase A metadata — route through the lent
                     // actor tx so the record-table updates land
@@ -1318,6 +1336,7 @@ impl RepositoryManager {
             let storage = self.make_storage();
             let did = self.did.clone();
             let signer_arc = signer;
+            let swap_commit = self.swap_commit.clone();
 
             let (commit_cid, new_rev, prev_rev, prev_data, blocks): (
                 Cid,
@@ -1326,10 +1345,11 @@ impl RepositoryManager {
                 Option<Cid>,
                 BlockMap,
             ) = tokio::task::spawn_blocking(
-                move || -> Result<_, ProtoRepoError> {
+                move || -> Result<_, CommitFailure> {
                     let storage_dyn: Arc<dyn RepoStorage> = storage.clone();
                     let mut repo =
                         load_or_create(storage_dyn.clone(), did, signer_arc.as_ref())?;
+                    check_swap_commit(&repo, swap_commit.as_deref())?;
                     // #467: `since` is the previous commit's rev, not its CID.
                     let prev_rev = repo.commit().map(|c| c.rev.clone());
                     let prev_data = repo.commit().map(|c| c.data.clone());
@@ -1351,7 +1371,7 @@ impl RepositoryManager {
             )
             .await
             .map_err(|e| PdsError::Internal(format!("commit join failed: {}", e)))?
-            .map_err(|e| PdsError::Internal(format!("Commit creation failed: {}", e)))?;
+            .map_err(commit_error)?;
 
             let mut commit_ops: Vec<CommitOp> = Vec::with_capacity(prepared.len());
             for rec in &prepared {
@@ -2496,6 +2516,58 @@ fn apply_writes_verified(
     Ok(returned)
 }
 
+/// Why a commit could not be made, inside the blocking commit closure.
+#[derive(Debug)]
+enum CommitFailure {
+    /// proto-blue refused or failed the commit.
+    Repo(ProtoRepoError),
+    /// `swapCommit` named another commit than the current one (#452).
+    SwapCommit { expected: String, actual: String },
+}
+
+impl From<ProtoRepoError> for CommitFailure {
+    fn from(error: ProtoRepoError) -> Self {
+        Self::Repo(error)
+    }
+}
+
+/// Refuse the commit unless the repository's current commit is
+/// `swap_commit` (when given).
+fn check_swap_commit(repo: &Repo, swap_commit: Option<&str>) -> Result<(), CommitFailure> {
+    let Some(expected) = swap_commit else {
+        return Ok(());
+    };
+    let actual = repo
+        .commit_cid()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(CommitFailure::SwapCommit {
+            expected: expected.to_string(),
+            actual,
+        })
+    }
+}
+
+/// The error a failed commit answers with. A stale `swapCommit` is
+/// `InvalidSwap` (#452); a create whose key already holds a record is the
+/// client's mistake (HTTP 400, #451); anything else is the server's.
+fn commit_error(failure: CommitFailure) -> PdsError {
+    match failure {
+        CommitFailure::SwapCommit { expected, actual } => PdsError::SwapCidMismatch(format!(
+            "commit: expected '{expected}', found '{actual}'"
+        )),
+        CommitFailure::Repo(ProtoRepoError::KeyAlreadyExists(key)) => {
+            PdsError::Validation(format!("Record already exists: {key}"))
+        }
+        CommitFailure::Repo(other) => {
+            PdsError::Internal(format!("Commit creation failed: {other}"))
+        }
+    }
+}
+
 /// Load the stored repository, or start one when none has been stored yet.
 ///
 /// Only a missing root means "no repository": any other failure (an
@@ -2627,6 +2699,71 @@ mod tests {
         let record_cid = outcome.single_record_cid().unwrap();
         assert_ne!(record_cid, outcome.commit_cid);
         assert_eq!(store_record_cid(&repo_mgr, &written.uri).await, record_cid);
+    }
+
+    /// #451: creating a record where one already is answers 400 and changes
+    /// nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn creating_over_an_existing_record_is_refused() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store);
+        repo_mgr.initialize().await.unwrap();
+        let first = repo_mgr
+            .create_record("app.bsky.feed.post", Some("3mxaaaaaaaa2a"), serde_json::json!({ "n": 1 }), Some(false), test_signer())
+            .await
+            .unwrap();
+
+        let err = repo_mgr
+            .create_record("app.bsky.feed.post", Some("3mxaaaaaaaa2a"), serde_json::json!({ "n": 2 }), Some(false), test_signer())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, PdsError::Validation(m) if m.contains("app.bsky.feed.post/3mxaaaaaaaa2a")),
+            "got {err:?}"
+        );
+        let uri = &first.results[0].uri;
+        assert_eq!(store_record_cid(&repo_mgr, uri).await, first.single_record_cid().unwrap());
+    }
+
+    /// #452: `swapCommit` must name the current commit; a stale one is
+    /// `InvalidSwap` and writes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn swap_commit_must_name_the_current_commit() {
+        let (store, _tmp) = test_store();
+        let did = unique_did();
+        let repo_mgr = RepositoryManager::new(did.clone(), store.clone());
+        repo_mgr.initialize().await.unwrap();
+        let first = repo_mgr
+            .create_record("app.bsky.feed.post", Some("3mxaaaaaaaa2a"), serde_json::json!({ "n": 1 }), Some(false), test_signer())
+            .await
+            .unwrap();
+        let second = repo_mgr
+            .create_record("app.bsky.feed.post", Some("3mxbbbbbbbb2b"), serde_json::json!({ "n": 2 }), Some(false), test_signer())
+            .await
+            .unwrap();
+
+        // The first commit is stale now.
+        let stale = RepositoryManager::new(did.clone(), store.clone())
+            .with_swap_commit(Some(first.commit_cid.clone()));
+        let err = stale
+            .create_record("app.bsky.feed.post", Some("3mxcccccccc2c"), serde_json::json!({ "n": 3 }), Some(false), test_signer())
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PdsError::SwapCidMismatch(m) if m.contains(&second.commit_cid)), "got {err:?}");
+        assert!(store
+            .get_record(&did, &format!("at://{did}/app.bsky.feed.post/3mxcccccccc2c"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(store.get_repo_root(&did).await.unwrap().cid, second.commit_cid);
+
+        let current = RepositoryManager::new(did.clone(), store.clone())
+            .with_swap_commit(Some(second.commit_cid.clone()));
+        current
+            .create_record("app.bsky.feed.post", Some("3mxcccccccc2c"), serde_json::json!({ "n": 3 }), Some(false), test_signer())
+            .await
+            .expect("the current commit is accepted");
     }
 
     // ---- #506 — an unreadable repository is never replaced ----
