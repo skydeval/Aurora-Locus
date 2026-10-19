@@ -426,7 +426,10 @@ pub(crate) async fn insert_persistent_orphan_marker(
     // Internal try-block: `?` for early exit on the first sqlx error;
     // the outer wrapper below catches it.
     let result: Result<(), sqlx::Error> = async {
-        let mut tx = shared_pool.begin().await?;
+        // Reads `subject_uri` before inserting, so it takes the write lock
+        // when it begins (#497); a deferred one could lose the marker to a
+        // concurrent writer.
+        let mut tx = crate::db::begin_write_tx(shared_pool).await?;
         for event_id in emitted_event_ids {
             // subject_uri is read as String (NOT Option<String>): the
             // v0.7 orphan-able emit set unconditionally populates it

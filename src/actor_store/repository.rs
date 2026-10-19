@@ -659,9 +659,14 @@ impl RepositoryManager {
     /// queried. The map flows into the per-record `prev` field on
     /// the `CommitOp` so the firehose event carries the
     /// pre-update CID per Arc 14 §7.3.2.
+    ///
+    /// `actor_tx` is the write path's actor transaction when it has one
+    /// (#497): prior CIDs are read through it, under the account's write
+    /// lock. The legacy path passes `None` and reads from the pool.
     async fn compute_prior_cids_and_prepared(
         &self,
         writes: Vec<WriteOp>,
+        mut actor_tx: Option<&mut sqlx::Transaction<'static, sqlx::Sqlite>>,
     ) -> PdsResult<(
         std::collections::HashMap<String, String>,
         Vec<RepoWrite>,
@@ -682,10 +687,16 @@ impl RepositoryManager {
                     "at://{}/{}/{}",
                     self.did, write.collection, write.rkey
                 );
-                if let Some(prior) =
-                    self.store.get_record(&self.did, &uri).await?
-                {
-                    prior_record_cids.insert(uri, prior.cid);
+                let prior = match actor_tx.as_deref_mut() {
+                    Some(tx) => ActorStore::record_cid_in_tx(tx, &uri).await?,
+                    None => self
+                        .store
+                        .get_record(&self.did, &uri)
+                        .await?
+                        .map(|record| record.cid),
+                };
+                if let Some(prior) = prior {
+                    prior_record_cids.insert(uri, prior);
                 }
             }
         }
@@ -1099,7 +1110,10 @@ impl RepositoryManager {
             if let Some(shared_pool) = self.shared_pool.clone() {
             // ----- Relay-race lent-tx path -----
             let actor_pool = self.store.open_db(&self.did).await?;
-            let actor_tx = actor_pool.begin().await.map_err(PdsError::Database)?;
+            // Deferred is safe for the shared tx (#497): within this scope
+            // it is written only by bind-pipeline audit emits, whose first
+            // statement is an INSERT, so it never upgrades from a read.
+            // `bind_pipeline` must keep writing before it reads here.
             let mut shared_tx = shared_pool.begin().await.map_err(PdsError::Database)?;
 
             // Validate every write with the shared tx threaded
@@ -1137,11 +1151,25 @@ impl RepositoryManager {
                 .await?;
             }
 
+            // #497: the actor tx opens after validation, taking the
+            // account's write lock at once. Validation never uses it, so
+            // lexicon resolution (possibly network) and
+            // `track_validation_failure` (its own connection) run before
+            // the lock. proto-blue reads the root before it writes; a
+            // deferred tx would fail that upgrade at once if another write
+            // to the account committed in between.
+            let mut actor_tx = actor_pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(PdsError::Database)?;
+
             // The shared_tx mutable borrow ends with the validate
             // loop; we now move it into `with_lent_txns` alongside
-            // `actor_tx` for the proto-blue + Phase A scope.
-            let (prior_record_cids, repo_writes, prepared) =
-                self.compute_prior_cids_and_prepared(writes).await?;
+            // `actor_tx` for the proto-blue + Phase A scope. Prior CIDs
+            // are read under the actor lock, through the actor tx.
+            let (prior_record_cids, repo_writes, prepared) = self
+                .compute_prior_cids_and_prepared(writes, Some(&mut actor_tx))
+                .await?;
 
             let storage = self.make_storage();
             let did = self.did.clone();
@@ -1330,7 +1358,7 @@ impl RepositoryManager {
             }
 
             let (prior_record_cids, repo_writes, prepared_owned) =
-                self.compute_prior_cids_and_prepared(writes).await?;
+                self.compute_prior_cids_and_prepared(writes, None).await?;
             let prepared = prepared_owned;
 
             let storage = self.make_storage();
@@ -1505,17 +1533,29 @@ impl RepositoryManager {
     ) -> PdsResult<()> {
         use std::io::Write as _;
 
+        // Nothing to do when every record is a create without blob
+        // references (a like, a follow, a text post): no transaction, so
+        // no shared write lock (#497).
+        if prepared.iter().all(|rec| {
+            matches!(rec.op, OpAction::Create)
+                && rec.blob_cids.as_ref().is_none_or(|cids| cids.is_empty())
+        }) {
+            return Ok(());
+        }
+
         let now = chrono::Utc::now();
-        let mut tx = blob_store
-            .pool()
-            .begin()
+        // Reads (existing refs, blob rows) come before the writes, so the
+        // transaction takes the write lock when it begins (#497): a
+        // deferred one fails its upgrade at once when another writer
+        // committed after its first read.
+        let mut tx = crate::db::begin_write_tx(blob_store.pool())
             .await
             .map_err(PdsError::Database)?;
 
         // Phase B pause hook: production no-op; tests override via
-        // the `PhaseBHook` trait. Fires unconditionally after
-        // `tx.begin()` so test-side race coordination can land
-        // between tx-open and the first state mutation.
+        // the `PhaseBHook` trait. Fires after `tx.begin()`. With the write
+        // lock already held, a racing writer waits behind this
+        // transaction rather than landing before its first mutation.
         self.phase_b_pause_hook().await;
 
         // Build per-record STRICT/unref plans and the full-batch
@@ -2764,6 +2804,83 @@ mod tests {
             .create_record("app.bsky.feed.post", Some("3mxcccccccc2c"), serde_json::json!({ "n": 3 }), Some(false), test_signer())
             .await
             .expect("the current commit is accepted");
+    }
+
+    // ---- #497 — concurrent writes take their write locks up front ----
+
+    /// An account on a production-shaped context (file-backed WAL databases,
+    /// shared pool and blob store wired through `for_writer`).
+    async fn seed_writer(ctx: &crate::context::AppContext, handle: &str) -> String {
+        let acc = ctx
+            .account_manager
+            .create_account(handle.into(), Some(format!("{handle}@example.com")), "password123".into(), None, None)
+            .await
+            .unwrap();
+        RepositoryManager::with_validation_mode(acc.did.clone(), (*ctx.actor_store).clone(), ctx.config.validation_mode)
+            .initialize()
+            .await
+            .unwrap();
+        let h = acc.handle.clone().unwrap_or_else(|| handle.to_string());
+        crate::api::account_emit::create_account_emit_sequence(ctx, &acc.did, &h)
+            .await
+            .unwrap();
+        acc.did
+    }
+
+    /// A post embedding a freshly uploaded image of `did`'s.
+    async fn image_post(ctx: &crate::context::AppContext, did: &str, n: u8) -> serde_json::Value {
+        let bytes = vec![n; 2048 + usize::from(n)];
+        let staged = ctx.blob_store.stage_blob(bytes, Some("image/jpeg"), did).await.unwrap();
+        ctx.blob_store.commit_blob(&staged.cid).await.unwrap();
+        serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": format!("image {n}"),
+            "createdAt": "2026-10-18T00:00:00Z",
+            "embed": {
+                "$type": "app.bsky.embed.images",
+                "images": [{
+                    "alt": "",
+                    "image": {
+                        "$type": "blob",
+                        "ref": { "$link": staged.cid },
+                        "mimeType": "image/jpeg",
+                        "size": staged.size,
+                    },
+                }],
+            },
+        })
+    }
+
+    /// Image posts written at the same time by two accounts, three each,
+    /// all succeed (#497): each account's writes queue on its write lock,
+    /// and the blob promotions (Phase B) queue on the shared one. Begun
+    /// deferred, they failed with "database is locked" when another write
+    /// committed between a transaction's first read and its first write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_image_posts_all_commit() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let mut jobs = Vec::new();
+        for handle in ["lockone", "locktwo"] {
+            let did = seed_writer(&ctx, handle).await;
+            let signer = crate::api::repo::create_actor_signer(&ctx.account_manager, &did)
+                .await
+                .unwrap();
+            for n in 0..3u8 {
+                let post = image_post(&ctx, &did, n + if handle == "lockone" { 0 } else { 10 }).await;
+                jobs.push((did.clone(), signer.clone(), post));
+            }
+        }
+        let writes = jobs.into_iter().map(|(did, signer, post)| {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                RepositoryManager::for_writer(&ctx, did)
+                    .create_record("app.bsky.feed.post", None, post, Some(false), signer)
+                    .await
+            })
+        });
+        for (i, result) in futures::future::join_all(writes).await.into_iter().enumerate() {
+            result.unwrap().unwrap_or_else(|e| panic!("post {i}: {e}"));
+        }
     }
 
     // ---- #506 — an unreadable repository is never replaced ----
