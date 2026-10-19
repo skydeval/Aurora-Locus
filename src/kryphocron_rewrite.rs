@@ -379,9 +379,19 @@ impl RewriteJob {
     ) -> PdsResult<()> {
         let signer = create_actor_signer(&ctx.account_manager, did).await?;
         let repo_mgr = RepositoryManager::for_writer(ctx, did.to_string());
+        let scope = AccountScope {
+            ctx,
+            hooks,
+            sink,
+            did,
+            repo_mgr: &repo_mgr,
+            signer: &signer,
+        };
 
         let mut record_cursor: Option<String> = None;
-        let mut batch: Vec<WriteOp> = Vec::new();
+        // Each write with the record it was prepared from, so a batch refused
+        // because one record changed meanwhile can be redone record by record.
+        let mut batch: Vec<(crate::actor_store::models::Record, WriteOp)> = Vec::new();
         loop {
             let records = ctx
                 .actor_store
@@ -403,10 +413,10 @@ impl RewriteJob {
                 self.bump_processed();
                 match prepare_record_rewrite(ctx, hooks, sink, did, rec).await {
                     Ok(Some(write)) => {
-                        batch.push(write);
+                        batch.push((rec.clone(), write));
                         if batch.len() >= REWRITE_BATCH {
                             let taken = std::mem::take(&mut batch);
-                            self.flush_batch(&repo_mgr, &signer, taken).await?;
+                            self.flush_batch(&scope, taken).await?;
                         }
                     }
                     Ok(None) => {} // not encoded / nothing to rewrite — skip
@@ -429,28 +439,79 @@ impl RewriteJob {
             record_cursor = last_rkey;
         }
         if !batch.is_empty() {
-            self.flush_batch(&repo_mgr, &signer, batch).await?;
+            self.flush_batch(&scope, batch).await?;
         }
         Ok(())
     }
 
+    /// Write a batch of rewrites in one commit. Each write is pinned to the
+    /// CID it was prepared from (#524), so a record changed meanwhile (an
+    /// audience move by `updatePostPrivate`) refuses the batch instead of
+    /// being overwritten with its old content. The batch is then redone one
+    /// record at a time, each prepared afresh from its current version; a
+    /// record that changes again in that window is left for the next pass.
     async fn flush_batch(
         &self,
-        repo_mgr: &RepositoryManager,
-        signer: &Arc<dyn proto_blue::crypto::Signer>,
-        batch: Vec<WriteOp>,
+        scope: &AccountScope<'_>,
+        batch: Vec<(crate::actor_store::models::Record, WriteOp)>,
     ) -> PdsResult<()> {
         let n = batch.len() as u64;
-        repo_mgr
-            .apply_writes(
-                batch,
-                signer.clone(),
-                Arc::new(crate::blob_store::StrictPromoter),
-            )
-            .await?;
+        let (records, writes): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+        match scope
+            .repo_mgr
+            .apply_writes(writes, scope.signer.clone(), Arc::new(crate::blob_store::StrictPromoter))
+            .await
+        {
+            Ok(_) => {
+                self.add_rewritten(n);
+                Ok(())
+            }
+            Err(PdsError::SwapCidMismatch(_)) => {
+                for stale in records {
+                    self.rewrite_one_fresh(scope, &stale).await;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Rewrite one record from its current version, pinned to it. Failures
+    /// are logged and leave the record for the next pass.
+    async fn rewrite_one_fresh(
+        &self,
+        scope: &AccountScope<'_>,
+        stale: &crate::actor_store::models::Record,
+    ) {
+        let AccountScope { ctx, hooks, sink, did, repo_mgr, signer } = *scope;
+        let current = match ctx.actor_store.get_record(did, &stale.uri).await {
+            Ok(Some(current)) => current,
+            Ok(None) => return, // deleted meanwhile
+            Err(e) => {
+                tracing::warn!(target: "aurora_locus::kryphocron", uri = %stale.uri, error = %e, "rewrite-on-rotate: record re-read failed; left for next pass");
+                return;
+            }
+        };
+        let write = match prepare_record_rewrite(ctx, hooks, sink, did, &current).await {
+            Ok(Some(write)) => write,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(target: "aurora_locus::kryphocron", uri = %stale.uri, error = %e, "rewrite-on-rotate: record skipped");
+                return;
+            }
+        };
+        match repo_mgr
+            .apply_writes(vec![write], signer.clone(), Arc::new(crate::blob_store::StrictPromoter))
+            .await
+        {
+            Ok(_) => self.add_rewritten(1),
+            Err(e) => tracing::warn!(target: "aurora_locus::kryphocron", uri = %stale.uri, error = %e, "rewrite-on-rotate: record changed during rewrite; left for next pass"),
+        }
+    }
+
+    fn add_rewritten(&self, n: u64) {
         let mut st = self.state.write().expect("rewrite state lock not poisoned");
         st.rewritten += n;
-        Ok(())
     }
 
     fn bump_processed(&self) {
@@ -492,6 +553,17 @@ impl RewriteJob {
     }
 }
 
+/// What one account's rewrite works with.
+#[derive(Clone, Copy)]
+struct AccountScope<'a> {
+    ctx: &'a AppContext,
+    hooks: &'a dyn kryphocron::encryption::AtRestHooks,
+    sink: &'a ContentAuditSink,
+    did: &'a str,
+    repo_mgr: &'a RepositoryManager,
+    signer: &'a Arc<dyn proto_blue::crypto::Signer>,
+}
+
 /// Decode one stored `postPrivate` record under its write-time generation and
 /// re-encode it under the oracle's current (post-`force_rotation`) generation,
 /// returning the `Update` [`WriteOp`] to re-store it — or `None` when the
@@ -520,7 +592,9 @@ async fn prepare_record_rewrite(
         rkey: rec.rkey.clone(),
         value: Some(value),
         validate: None,
-        swap_cid: None,
+        // Pinned to the version read (#524): a record changed since is not
+        // overwritten with its old content (e.g. its old audienceList).
+        swap_cid: Some(rec.cid.clone()),
         kryphocron_authorization: Some(KryphocronWriteAuthorization::DedicatedEndpoint {
             capability_class: CapabilityClass::User,
             prior: None,

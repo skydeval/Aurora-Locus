@@ -695,9 +695,12 @@ impl RepositoryManager {
                         .await?
                         .map(|record| record.cid),
                 };
+                check_swap_cid(write, prior.as_deref())?;
                 if let Some(prior) = prior {
                     prior_record_cids.insert(uri, prior);
                 }
+            } else {
+                check_swap_cid(write, None)?;
             }
         }
 
@@ -2556,6 +2559,38 @@ fn apply_writes_verified(
     Ok(returned)
 }
 
+/// Enforce a write's `swap_cid` (#524) against `prior`, the CID the record
+/// index holds for it, read under the account's write lock on the write path
+/// so nothing can change it before the commit. Every write is checked here,
+/// however it reached `apply_writes`; the `applyWrites` batch path's earlier
+/// check (`validate_batch`) only fails it sooner.
+///
+/// # Errors
+///
+/// - [`PdsError::SwapCidMismatch`]: the record's CID is not `swap_cid`.
+/// - [`PdsError::NotFound`]: a `swap_cid` for a record that does not exist.
+/// - [`PdsError::Validation`]: a `swap_cid` on a create.
+fn check_swap_cid(write: &WriteOp, prior: Option<&str>) -> PdsResult<()> {
+    let Some(swap_cid) = write.swap_cid.as_deref() else {
+        return Ok(());
+    };
+    match (write.action, prior) {
+        (WriteOpAction::Create, _) => Err(PdsError::Validation(format!(
+            "swap_cid cannot be used with Create action for {}/{}",
+            write.collection, write.rkey
+        ))),
+        (_, Some(current)) if current == swap_cid => Ok(()),
+        (_, Some(current)) => Err(PdsError::SwapCidMismatch(format!(
+            "{}/{}: expected '{}', found '{}'",
+            write.collection, write.rkey, swap_cid, current
+        ))),
+        (_, None) => Err(PdsError::NotFound(format!(
+            "Cannot swap CID - record not found: {}/{}",
+            write.collection, write.rkey
+        ))),
+    }
+}
+
 /// Why a commit could not be made, inside the blocking commit closure.
 #[derive(Debug)]
 enum CommitFailure {
@@ -2881,6 +2916,67 @@ mod tests {
         for (i, result) in futures::future::join_all(writes).await.into_iter().enumerate() {
             result.unwrap().unwrap_or_else(|e| panic!("post {i}: {e}"));
         }
+    }
+
+    // ---- #524 — a write's swap_cid is enforced on every path ----
+
+    fn update_op(rkey: &str, value: serde_json::Value, swap_cid: Option<String>) -> WriteOp {
+        WriteOp {
+            action: WriteOpAction::Update,
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: rkey.to_string(),
+            value: Some(value),
+            validate: Some(false),
+            swap_cid,
+            kryphocron_authorization: None,
+        }
+    }
+
+    /// A write handed straight to `apply_writes` (as the rotation rewrite
+    /// and the block cascade do) is held to its `swap_cid`: a stale pin is
+    /// refused and nothing changes. Before #524 only the `applyWrites` batch
+    /// path checked it, so a stale rewrite overwrote a newer version.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn apply_writes_enforces_swap_cid() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let did = seed_writer(&ctx, "swapper").await;
+        let signer = crate::api::repo::create_actor_signer(&ctx.account_manager, &did)
+            .await
+            .unwrap();
+        let repo_mgr = RepositoryManager::for_writer(&ctx, did.clone());
+        let promoter = || -> Arc<dyn crate::blob_store::BlobPromoter> {
+            Arc::new(crate::blob_store::StrictPromoter)
+        };
+        let first = repo_mgr
+            .create_record("app.bsky.feed.post", Some("3mxaaaaaaaa2a"), serde_json::json!({ "n": 1 }), Some(false), signer.clone())
+            .await
+            .unwrap();
+        let v1 = first.single_record_cid().unwrap();
+        let second = repo_mgr
+            .apply_writes_detailed(vec![update_op("3mxaaaaaaaa2a", serde_json::json!({ "n": 2 }), Some(v1.clone()))], signer.clone(), promoter())
+            .await
+            .unwrap();
+        let v2 = second.single_record_cid().unwrap();
+
+        // A writer that read version 1 is refused now that version 2 is current.
+        let err = repo_mgr
+            .apply_writes(vec![update_op("3mxaaaaaaaa2a", serde_json::json!({ "n": 3 }), Some(v1))], signer.clone(), promoter())
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, PdsError::SwapCidMismatch(m) if m.contains(&v2)), "got {err:?}");
+        let uri = &first.results[0].uri;
+        assert_eq!(store_record_cid(&repo_mgr, uri).await, v2, "version 2 kept");
+
+        // A pin on a record that does not exist, or on a create, is refused too.
+        let err = repo_mgr
+            .apply_writes(vec![update_op("3mxzzzzzzzz2z", serde_json::json!({}), Some(v2.clone()))], signer.clone(), promoter())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::NotFound(_)), "got {err:?}");
+        let mut create = update_op("3mxbbbbbbbb2b", serde_json::json!({}), Some(v2));
+        create.action = WriteOpAction::Create;
+        let err = repo_mgr.apply_writes(vec![create], signer, promoter()).await.unwrap_err();
+        assert!(matches!(err, PdsError::Validation(_)), "got {err:?}");
     }
 
     // ---- #506 — an unreadable repository is never replaced ----
