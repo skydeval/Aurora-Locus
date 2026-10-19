@@ -637,6 +637,20 @@ impl ActorStore {
         Ok(content)
     }
 
+    /// The CID the record index holds for `uri`, read through a
+    /// caller-managed transaction (#497): the write path reads prior CIDs
+    /// under the write lock it already holds, not on a second connection.
+    pub async fn record_cid_in_tx<'c>(
+        tx: &mut sqlx::Transaction<'c, sqlx::Sqlite>,
+        uri: &str,
+    ) -> PdsResult<Option<String>> {
+        let cid: Option<String> = sqlx::query_scalar("SELECT cid FROM record WHERE uri = ?1")
+            .bind(uri)
+            .fetch_optional(&mut **tx)
+            .await?;
+        Ok(cid)
+    }
+
     /// v0.7 arc 2 phase B fix-up — per-actor `get_repo_root`
     /// against a caller-managed `sqlx::Sqlite` transaction. Same
     /// SQL as `get_repo_root`, same NotFound-on-uninitialised-repo

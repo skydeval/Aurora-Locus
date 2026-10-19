@@ -45,6 +45,29 @@ pub fn read_bool(row: &sqlx::any::AnyRow, col: &str) -> Result<bool, sqlx::Error
     }
 }
 
+/// Begin a transaction that will read and then write on `pool` (#497).
+///
+/// On SQLite this is `BEGIN IMMEDIATE`: the write lock is taken at once, so
+/// a concurrent writer is waited out by the busy timeout. A deferred
+/// transaction that reads first fails its upgrade to a write immediately
+/// ("database is locked") when another connection committed after its
+/// first read, which no timeout waits out. On Postgres it is a plain
+/// `BEGIN`, whose row locks need no such step. The backend is read from the
+/// pool's URL.
+///
+/// # Errors
+///
+/// The pool or the database failed to start the transaction.
+pub async fn begin_write_tx(
+    pool: &AnyPool,
+) -> Result<sqlx::Transaction<'static, sqlx::Any>, sqlx::Error> {
+    if pool.connect_options().database_url.scheme().starts_with("sqlite") {
+        pool.begin_with("BEGIN IMMEDIATE").await
+    } else {
+        pool.begin().await
+    }
+}
+
 /// Database connection options. Legacy `SqlitePool` factory pair —
 /// only the AnyPool path has production callers; both this struct
 /// and `create_pool` below survive only to wire the intra-module
