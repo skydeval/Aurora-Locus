@@ -860,7 +860,9 @@ mod tests {
         let sink = ContentAuditSink;
         let mut record = serde_json::json!({
             "$type": NSID_POST_PRIVATE,
-            "text": "look",
+            "text": "look @alice",
+            "facets": [{ "index": { "byteStart": 5, "byteEnd": 11 },
+                "features": [{ "$type": "tools.kryphocron.feed.postPublic#mention", "did": "did:plc:alice" }] }],
             "embed": image_embed(),
         });
         encode_private_content_with_hooks(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE, RKEY, &mut record)
@@ -873,18 +875,26 @@ mod tests {
             .await
             .unwrap());
         assert!(record.get("embed").is_none(), "embed is encoded");
+        assert!(record.get("facets").is_none(), "facets are encoded");
         assert_eq!(
             record["embedBlobs"],
             serde_json::json!([image_embed()["images"][0]["image"]]),
             "blob refs stay in the clear",
         );
+        assert_eq!(
+            record["mentionDids"],
+            serde_json::json!(["did:plc:alice"]),
+            "a converted post keeps its mentions in the clear for the AppView",
+        );
 
         decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE, RKEY, &mut record)
             .await
             .unwrap();
-        assert_eq!(record["text"], "look");
+        assert_eq!(record["text"], "look @alice");
         assert_eq!(record["embed"], image_embed());
+        assert_eq!(record["facets"][0]["features"][0]["did"], "did:plc:alice");
         assert!(record.get("embedBlobs").is_none());
+        assert!(record.get("mentionDids").is_none());
 
         // Rewriting a content-form post again keeps its content.
         let mut again = record.clone();
