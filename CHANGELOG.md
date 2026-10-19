@@ -99,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- `createPostPrivate` and `participatePrivate` refuse a record that carries its own `encodedContent`, `encodedContentCodec` or `encodedContentGeneration` (HTTP 400): this server is the only encoder. Such a record was stored as sent, so every reader that decodes private posts (`getRecord` for audience members, the rotation rewrite, the AppView) decoded bytes of the client's choosing, and the codec's output is unbounded (a ~1 MB artifact can expand to tens of GB). A `null` `text`, `facets` or `embed` is treated as absent
 - Resolving a DID or a handle no longer reaches this machine or its private network, whoever named it. In release builds a `did:web` whose host is an address or a loopback name is refused, names are resolved to public addresses only for `did:web` documents and handle `/.well-known/atproto-did` lookups, and those requests do not follow redirects. Every DID document answer, from PLC or a `did:web` host, is read up to 64 KiB. A failed resolution is remembered for a minute (up to 10,000 DIDs), so a stream of unknown DIDs no longer makes one PLC request per use; an identity event for the DID clears it
 
 ## [0.10.1] - 2026-07-27
