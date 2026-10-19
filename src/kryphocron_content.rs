@@ -200,7 +200,9 @@ pub(crate) enum PayloadForm {
     /// The post's text alone, as UTF-8: the original form.
     Text,
     /// [`CONTENT_FORM_MARKER`] then a JSON object `{text, facets?, embed?}`.
-    /// The stored record keeps the embed's blob refs in `embedBlobs`.
+    /// The stored record keeps, in the clear, the embed's blob refs in
+    /// `embedBlobs`, the mentioned DIDs in `mentionDids` and a strong ref to
+    /// a quoted record in `quote`.
     Content,
 }
 
@@ -248,6 +250,65 @@ pub(crate) async fn encode_private_content_with_hooks(
     record: &mut serde_json::Value,
 ) -> PdsResult<bool> {
     encode_private_content_as(hooks, sink, writer_did, nsid, rkey, record, PayloadForm::Text).await
+}
+
+/// The top-level field naming the DIDs a content-form post mentions, kept
+/// in the clear for the AppView's indexing (#504, Prism's ask).
+pub(crate) const MENTION_DIDS_FIELD: &str = "mentionDids";
+
+/// The top-level field holding a strong ref to the record a content-form
+/// post quotes, kept in the clear for the AppView's indexing (#504).
+pub(crate) const QUOTE_FIELD: &str = "quote";
+
+/// Mention facet features: the stock and the kryphocron vocabularies, and
+/// the bare local form the AppView also reads.
+const MENTION_FEATURE_TYPES: [&str; 3] = [
+    "app.bsky.richtext.facet#mention",
+    "tools.kryphocron.feed.postPublic#mention",
+    "#mention",
+];
+
+/// The DIDs `facets` mention, deduplicated, in first-appearance order.
+fn mention_dids(facets: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut dids: Vec<serde_json::Value> = Vec::new();
+    let features = facets
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|facet| facet.get("features")?.as_array())
+        .flatten();
+    for feature in features {
+        let is_mention = feature
+            .get("$type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| MENTION_FEATURE_TYPES.contains(&t));
+        if let (true, Some(did)) = (is_mention, feature.get("did").and_then(|d| d.as_str())) {
+            let did = serde_json::Value::String(did.to_string());
+            if !dids.contains(&did) {
+                dids.push(did);
+            }
+        }
+    }
+    dids
+}
+
+/// The strong ref (`{uri, cid}`) of the record `embed` quotes: a record
+/// embed's `record`, or a record-with-media embed's `record.record`, in the
+/// stock or the kryphocron vocabulary.
+fn quoted_record(embed: &serde_json::Value) -> Option<serde_json::Value> {
+    let strong_ref = match embed.get("$type")?.as_str()? {
+        "app.bsky.embed.record" | "tools.kryphocron.feed.postPublic#embedRecord" => {
+            embed.get("record")?
+        }
+        "app.bsky.embed.recordWithMedia" | "tools.kryphocron.feed.postPublic#embedRecordWithMedia" => {
+            embed.get("record")?.get("record")?
+        }
+        _ => return None,
+    };
+    Some(serde_json::json!({
+        "uri": strong_ref.get("uri")?.as_str()?,
+        "cid": strong_ref.get("cid")?.as_str()?,
+    }))
 }
 
 /// Every blob object (`$type: blob`) inside `value`, copied whole.
@@ -333,8 +394,10 @@ fn content_payload(
 ///
 /// - **Text form:** `text` is encoded and removed.
 /// - **Content form:** `text`, `facets` and `embed` are encoded together and
-///   removed, and `embedBlobs` is set to the embed's blob objects (replacing
-///   any the client sent).
+///   removed. In the clear, `embedBlobs` holds the embed's blob objects,
+///   `mentionDids` the mentioned DIDs and `quote` a strong ref to a quoted
+///   record, each derived from what was encoded, omitted when empty, and
+///   replacing any the client sent.
 ///
 /// Returns `Ok(true)` when the record was encoded, `Ok(false)` when there
 /// was nothing to encode (already encoded, or no `text`/`facets`/`embed`).
@@ -428,6 +491,8 @@ pub(crate) async fn encode_private_content_as(
     // The client's own `embedBlobs`, if any, is never kept: only the
     // encoder's, taken from the embed it encoded.
     obj.remove(EMBED_BLOBS_FIELD);
+    obj.remove(MENTION_DIDS_FIELD);
+    obj.remove(QUOTE_FIELD);
     // A null content field means absent; none is stored.
     for field in ["facets", "embed"] {
         if obj.get(field).is_some_and(serde_json::Value::is_null) {
@@ -435,8 +500,18 @@ pub(crate) async fn encode_private_content_as(
         }
     }
     if form == PayloadForm::Content {
-        obj.remove("facets");
+        // The clear fields are derived from the same facets and embed the
+        // payload carries, so the two always agree.
+        if let Some(facets) = obj.remove("facets") {
+            let dids = mention_dids(&facets);
+            if !dids.is_empty() {
+                obj.insert(MENTION_DIDS_FIELD.to_string(), serde_json::Value::Array(dids));
+            }
+        }
         if let Some(embed) = obj.remove("embed") {
+            if let Some(quote) = quoted_record(&embed) {
+                obj.insert(QUOTE_FIELD.to_string(), quote);
+            }
             let mut blobs = Vec::new();
             blob_objects(&embed, &mut blobs);
             if !blobs.is_empty() {
@@ -624,7 +699,11 @@ pub(crate) async fn decode_private_content_with_hooks(
     obj.remove("encodedContent");
     obj.remove("encodedContentCodec");
     obj.remove("encodedContentGeneration");
+    // The clear derivatives of the content are dropped: the restored
+    // record is the one that was written.
     obj.remove(EMBED_BLOBS_FIELD);
+    obj.remove(MENTION_DIDS_FIELD);
+    obj.remove(QUOTE_FIELD);
     obj.extend(restored);
 
     tracing::debug!(
@@ -1100,8 +1179,19 @@ mod tests {
     async fn the_content_form_round_trips_every_embed_kind() {
         let (hooks, _guard) = default_hooks("content-form");
         let sink = ContentAuditSink;
-        let facets = serde_json::json!([{ "index": { "byteStart": 0, "byteEnd": 4 },
-            "features": [{ "$type": "tools.kryphocron.feed.postPublic#link", "uri": "https://example.com/l" }] }]);
+        let facets = serde_json::json!([
+            { "index": { "byteStart": 0, "byteEnd": 4 },
+              "features": [{ "$type": "tools.kryphocron.feed.postPublic#link", "uri": "https://example.com/l" }] },
+            { "index": { "byteStart": 5, "byteEnd": 7 },
+              "features": [{ "$type": "tools.kryphocron.feed.postPublic#mention", "did": "did:plc:alice" }] },
+            { "index": { "byteStart": 8, "byteEnd": 12 },
+              "features": [
+                  { "$type": "app.bsky.richtext.facet#mention", "did": "did:plc:bob" },
+                  { "$type": "app.bsky.richtext.facet#mention", "did": "did:plc:alice" },
+              ] },
+            { "index": { "byteStart": 13, "byteEnd": 17 },
+              "features": [{ "$type": "#mention", "did": "did:plc:carol" }] },
+        ]);
         for (embed, blobs) in embeds() {
             let original = serde_json::json!({
                 "$type": NSID_POST_PRIVATE_TEST,
@@ -1122,6 +1212,21 @@ mod tests {
             match blobs.is_empty() {
                 true => assert!(!obj.contains_key(EMBED_BLOBS_FIELD)),
                 false => assert_eq!(record[EMBED_BLOBS_FIELD], serde_json::Value::Array(blobs)),
+            }
+            // Mentions: deduplicated, first-appearance order, every form.
+            assert_eq!(
+                record[MENTION_DIDS_FIELD],
+                serde_json::json!(["did:plc:alice", "did:plc:bob", "did:plc:carol"])
+            );
+            // A quote: only for the record and record-with-media embeds.
+            let quotes = embed["$type"].as_str().is_some_and(|t| t.contains("embedRecord"));
+            match quotes {
+                true => assert_eq!(
+                    record[QUOTE_FIELD],
+                    serde_json::json!({ "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002", "cid": "bafyreigquoted" }),
+                    "{}", embed["$type"],
+                ),
+                false => assert!(!obj.contains_key(QUOTE_FIELD), "{}", embed["$type"]),
             }
 
             decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record)
@@ -1167,21 +1272,34 @@ mod tests {
         }
     }
 
-    /// The client's own `embedBlobs` is never stored: the encoder sets it
-    /// from the embed it encodes.
+    /// The client's own `embedBlobs`, `mentionDids` and `quote` are never
+    /// stored: the encoder derives them from what it encodes, and drops
+    /// them when there is nothing to derive.
     #[tokio::test]
-    async fn a_client_sent_embed_blobs_is_replaced() {
+    async fn client_sent_clear_fields_are_replaced() {
         let (hooks, _guard) = default_hooks("client-blobs");
         let sink = ContentAuditSink;
-        let mut record = serde_json::json!({
-            "$type": NSID_POST_PRIVATE_TEST, "text": "x",
-            "embed": embeds()[0].0,
-            "embedBlobs": [blob("zzzzz", "image/gif")],
-        });
-        encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, PayloadForm::Content)
-            .await
-            .unwrap();
-        assert_eq!(record[EMBED_BLOBS_FIELD], serde_json::Value::Array(embeds()[0].1.clone()));
+        for form in [PayloadForm::Text, PayloadForm::Content] {
+            let mut record = serde_json::json!({
+                "$type": NSID_POST_PRIVATE_TEST, "text": "x",
+                "embed": embeds()[0].0,
+                "embedBlobs": [blob("zzzzz", "image/gif")],
+                "mentionDids": ["did:plc:forged"],
+                "quote": { "uri": "at://did:plc:forged/x/y", "cid": "bafyforged" },
+            });
+            encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, form)
+                .await
+                .unwrap();
+            assert!(record.get(MENTION_DIDS_FIELD).is_none(), "{form:?}");
+            assert!(record.get(QUOTE_FIELD).is_none(), "{form:?}");
+            match form {
+                PayloadForm::Text => assert!(record.get(EMBED_BLOBS_FIELD).is_none()),
+                PayloadForm::Content => assert_eq!(
+                    record[EMBED_BLOBS_FIELD],
+                    serde_json::Value::Array(embeds()[0].1.clone())
+                ),
+            }
+        }
     }
 
     #[tokio::test]
