@@ -947,7 +947,7 @@ mod verify_service_jwt_tests {
             .public_key_did_key();
         let token = create_service_jwt(
             "did:plc:issuer",
-            "did:web:api.nearhorizon.app#bsky_appview",
+            "did:web:prism.nearhorizon.app#bsky_appview",
             None,
             Some("app.bsky.actor.getProfile"),
             &key.to_bytes(),
@@ -963,7 +963,7 @@ mod verify_service_jwt_tests {
         let now = Utc::now().timestamp();
         assert_eq!(claims["iss"], "did:plc:issuer");
         assert_eq!(
-            claims["aud"], "did:web:api.nearhorizon.app",
+            claims["aud"], "did:web:prism.nearhorizon.app",
             "fragment stripped"
         );
         assert_eq!(claims["lxm"], "app.bsky.actor.getProfile");
