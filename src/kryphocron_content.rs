@@ -188,8 +188,7 @@ pub(crate) async fn encode_private_content(
             writer_did,
             nsid,
             rkey,
-            "private-tier write carried no `text` field; nothing to encode \
-             (already-encoded or legacy/interop shape)",
+            "private-tier write carried no text, facets or embed; nothing to encode",
         );
     }
     Ok(())
@@ -221,6 +220,14 @@ impl PayloadForm {
 /// cannot be confused, and a reader that knows only the text form fails
 /// (not UTF-8) instead of showing JSON as text.
 pub(crate) const CONTENT_FORM_MARKER: u8 = 0xFF;
+
+/// The fields only this server's encoder writes; a record being written that
+/// already has one is refused (#525).
+const ENCODED_FIELDS: [&str; 3] = [
+    "encodedContent",
+    "encodedContentCodec",
+    "encodedContentGeneration",
+];
 
 /// The top-level field holding a content-form post's embed blob refs, which
 /// must stay in the clear for the PDS to keep the blobs (#504).
@@ -270,21 +277,27 @@ fn content_payload(
     record: &serde_json::Map<String, serde_json::Value>,
     form: PayloadForm,
 ) -> PdsResult<Option<Vec<u8>>> {
-    if record.contains_key("encodedContent") {
-        return Ok(None);
+    // This server is the only encoder (#525). Encoded fields in a record
+    // being written come from the client; stored, they would hand every
+    // decoder (getRecord for members, the rotation rewrite, the AppView)
+    // bytes of the client's choosing.
+    if let Some(field) = ENCODED_FIELDS.iter().find(|f| record.contains_key(**f)) {
+        return Err(PdsError::Validation(format!(
+            "{field} is set by the server; send the post's text"
+        )));
     }
     let text = match record.get("text") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(text)) => Some(text.clone()),
         Some(_) => return Err(PdsError::Validation("text must be a string".to_string())),
     };
     let facets = match record.get("facets") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(facets @ serde_json::Value::Array(_)) => Some(facets.clone()),
         Some(_) => return Err(PdsError::Validation("facets must be an array".to_string())),
     };
     let embed = match record.get("embed") {
-        None => None,
+        None | Some(serde_json::Value::Null) => None,
         Some(embed @ serde_json::Value::Object(_)) => Some(embed.clone()),
         Some(_) => return Err(PdsError::Validation("embed must be an object".to_string())),
     };
@@ -415,6 +428,12 @@ pub(crate) async fn encode_private_content_as(
     // The client's own `embedBlobs`, if any, is never kept: only the
     // encoder's, taken from the embed it encoded.
     obj.remove(EMBED_BLOBS_FIELD);
+    // A null content field means absent; none is stored.
+    for field in ["facets", "embed"] {
+        if obj.get(field).is_some_and(serde_json::Value::is_null) {
+            obj.remove(field);
+        }
+    }
     if form == PayloadForm::Content {
         obj.remove("facets");
         if let Some(embed) = obj.remove("embed") {
@@ -946,15 +965,42 @@ mod tests {
         assert_eq!(roundtripped, expected);
     }
 
+    /// #525: this server is the only encoder. A record arriving with any
+    /// encoded field is refused, never stored for decoders to run on.
     #[tokio::test]
-    async fn record_without_text_passes_through_untouched() {
+    async fn a_client_supplied_encoding_is_refused() {
+        let (hooks, _guard) = default_hooks("client-encoded");
+        let sink = ContentAuditSink;
+        for field in ENCODED_FIELDS {
+            let mut record = serde_json::json!({
+                "$type": "tools.kryphocron.feed.postPrivate",
+                "text": "hi",
+            });
+            record[field] = serde_json::json!("x");
+            let before = record.clone();
+            let err = encode_private_content_with_hooks(
+                hooks.as_ref(),
+                &sink,
+                DID,
+                "tools.kryphocron.feed.postPrivate",
+                RKEY,
+                &mut record,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, PdsError::Validation(ref m) if m.contains(field)), "{field}: {err:?}");
+            assert_eq!(record, before, "record untouched");
+        }
+    }
+
+    /// A record with no content at all has nothing to encode.
+    #[tokio::test]
+    async fn a_record_without_content_passes_through_untouched() {
         let (hooks, _guard) = default_hooks("notext");
         let sink = ContentAuditSink;
-        // A record already in the encoded shape (no `text`).
         let mut record = serde_json::json!({
             "$type": "tools.kryphocron.feed.postPrivate",
-            "encodedContent": { "$bytes": "QUJD" },
-            "encodedContentCodec": "laquna/0.2",
+            "createdAt": "2026-10-19T00:00:00Z",
         });
         let before = record.clone();
         let did_encode = encode_private_content_with_hooks(
@@ -967,8 +1013,30 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!did_encode, "no `text` field means nothing to encode");
-        assert_eq!(record, before, "record must be untouched");
+        assert!(!did_encode);
+        assert_eq!(record, before);
+    }
+
+    /// Null content fields are absent: not refused, not stored.
+    #[tokio::test]
+    async fn null_content_fields_are_absent() {
+        let (hooks, _guard) = default_hooks("nulls");
+        let sink = ContentAuditSink;
+        for form in [PayloadForm::Text, PayloadForm::Content] {
+            let mut record = serde_json::json!({
+                "$type": "tools.kryphocron.feed.postPrivate",
+                "text": "hi", "facets": null, "embed": null,
+            });
+            encode_private_content_as(hooks.as_ref(), &sink, DID, "tools.kryphocron.feed.postPrivate", RKEY, &mut record, form)
+                .await
+                .unwrap();
+            assert!(record.get("facets").is_none() && record.get("embed").is_none(), "{form:?}");
+            decode_private_content_with_hooks(hooks.as_ref(), DID, "tools.kryphocron.feed.postPrivate", RKEY, &mut record)
+                .await
+                .unwrap();
+            assert_eq!(record["text"], "hi");
+            assert!(record.get("facets").is_none() && record.get("embed").is_none(), "{form:?}");
+        }
     }
 
     // ---- #504: the content form encodes facets and embed too ----
