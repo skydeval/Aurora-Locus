@@ -178,8 +178,9 @@ pub(crate) async fn encode_private_content(
         None => return Ok(()),
     };
     let sink = ContentAuditSink;
+    let form = PayloadForm::configured(ctx);
     let encoded =
-        encode_private_content_with_hooks(hooks.as_ref(), &sink, writer_did, nsid, rkey, record)
+        encode_private_content_as(hooks.as_ref(), &sink, writer_did, nsid, rkey, record, form)
             .await?;
     if !encoded {
         tracing::debug!(
@@ -194,17 +195,43 @@ pub(crate) async fn encode_private_content(
     Ok(())
 }
 
-/// The testable core of [`encode_private_content`]: given the at-rest
-/// hooks and an audit sink directly (rather than via [`AppContext`]),
-/// transform the record's `text` field to the encoded shape.
-///
-/// Returns `Ok(true)` when a `text` field was found and encoded,
-/// `Ok(false)` when the record carried no `text` (passed through
-/// untouched).
+/// What a private post's encoded payload carries (#504).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadForm {
+    /// The post's text alone, as UTF-8: the original form.
+    Text,
+    /// [`CONTENT_FORM_MARKER`] then a JSON object `{text, facets?, embed?}`.
+    /// The stored record keeps the embed's blob refs in `embedBlobs`.
+    Content,
+}
+
+impl PayloadForm {
+    /// The form this deployment writes (`PDS_KRYPHOCRON_ENCODE_EMBEDS`).
+    pub(crate) fn configured(ctx: &AppContext) -> Self {
+        if ctx.config.kryphocron.encode_embeds {
+            Self::Content
+        } else {
+            Self::Text
+        }
+    }
+}
+
+/// The first byte of a [`PayloadForm::Content`] payload. It never begins
+/// valid UTF-8, and a text payload is always valid UTF-8, so the two forms
+/// cannot be confused, and a reader that knows only the text form fails
+/// (not UTF-8) instead of showing JSON as text.
+pub(crate) const CONTENT_FORM_MARKER: u8 = 0xFF;
+
+/// The top-level field holding a content-form post's embed blob refs, which
+/// must stay in the clear for the PDS to keep the blobs (#504).
+pub(crate) const EMBED_BLOBS_FIELD: &str = "embedBlobs";
+
+/// [`encode_private_content_as`] in the text form (the tests' shorthand).
 ///
 /// # Errors
 ///
 /// See [`encode_private_content`].
+#[cfg(test)]
 pub(crate) async fn encode_private_content_with_hooks(
     hooks: &dyn AtRestHooks,
     sink: &dyn UserAuditSink,
@@ -213,12 +240,113 @@ pub(crate) async fn encode_private_content_with_hooks(
     rkey: &str,
     record: &mut serde_json::Value,
 ) -> PdsResult<bool> {
-    // Only the plaintext `text` field is encoded. A record without a
-    // `text` field (already encoded, or a non-text shape) passes through
-    // untouched — the §1.4 legacy / federation-interop carveout.
-    let text = match record.get("text").and_then(|v| v.as_str()) {
-        Some(text) => text.to_string(),
-        None => return Ok(false),
+    encode_private_content_as(hooks, sink, writer_did, nsid, rkey, record, PayloadForm::Text).await
+}
+
+/// Every blob object (`$type: blob`) inside `value`, copied whole.
+fn blob_objects(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("$type").and_then(|t| t.as_str()) == Some("blob") {
+                found.push(value.clone());
+            } else {
+                map.values().for_each(|v| blob_objects(v, found));
+            }
+        }
+        serde_json::Value::Array(items) => items.iter().for_each(|v| blob_objects(v, found)),
+        _ => {}
+    }
+}
+
+/// The payload to encode for `record` in `form`, and the content fields it
+/// takes from the record. `None` when there is nothing to encode: the record
+/// is already encoded, or carries none of `text`, `facets` and `embed`.
+///
+/// # Errors
+///
+/// [`PdsError::Validation`] when `text` is not a string, `facets` not an
+/// array, or `embed` not an object.
+fn content_payload(
+    record: &serde_json::Map<String, serde_json::Value>,
+    form: PayloadForm,
+) -> PdsResult<Option<Vec<u8>>> {
+    if record.contains_key("encodedContent") {
+        return Ok(None);
+    }
+    let text = match record.get("text") {
+        None => None,
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(PdsError::Validation("text must be a string".to_string())),
+    };
+    let facets = match record.get("facets") {
+        None => None,
+        Some(facets @ serde_json::Value::Array(_)) => Some(facets.clone()),
+        Some(_) => return Err(PdsError::Validation("facets must be an array".to_string())),
+    };
+    let embed = match record.get("embed") {
+        None => None,
+        Some(embed @ serde_json::Value::Object(_)) => Some(embed.clone()),
+        Some(_) => return Err(PdsError::Validation("embed must be an object".to_string())),
+    };
+    if text.is_none() && facets.is_none() && embed.is_none() {
+        return Ok(None);
+    }
+    // A post with an embed or facets but no text still encodes, with empty
+    // text, so it never carries neither `text` nor `encodedContent`.
+    let text = text.unwrap_or_default();
+    Ok(Some(match form {
+        PayloadForm::Text => text.into_bytes(),
+        PayloadForm::Content => {
+            let mut content = serde_json::Map::new();
+            content.insert("text".to_string(), serde_json::Value::String(text));
+            if let Some(facets) = facets {
+                content.insert("facets".to_string(), facets);
+            }
+            if let Some(embed) = embed {
+                content.insert("embed".to_string(), embed);
+            }
+            let mut bytes = vec![CONTENT_FORM_MARKER];
+            serde_json::to_writer(&mut bytes, &content).map_err(|e| {
+                PdsError::Internal(format!("private content serialisation failed: {e}"))
+            })?;
+            bytes
+        }
+    }))
+}
+
+/// The testable core of [`encode_private_content`]: given the at-rest
+/// hooks and an audit sink directly (rather than via [`AppContext`]),
+/// transform the record's content to the encoded shape in `form` (#504).
+///
+/// - **Text form:** `text` is encoded and removed.
+/// - **Content form:** `text`, `facets` and `embed` are encoded together and
+///   removed, and `embedBlobs` is set to the embed's blob objects (replacing
+///   any the client sent).
+///
+/// Returns `Ok(true)` when the record was encoded, `Ok(false)` when there
+/// was nothing to encode (already encoded, or no `text`/`facets`/`embed`).
+///
+/// # Errors
+///
+/// See [`encode_private_content`]; also [`PdsError::Validation`] when a
+/// content field has the wrong type.
+pub(crate) async fn encode_private_content_as(
+    hooks: &dyn AtRestHooks,
+    sink: &dyn UserAuditSink,
+    writer_did: &str,
+    nsid: &str,
+    rkey: &str,
+    record: &mut serde_json::Value,
+    form: PayloadForm,
+) -> PdsResult<bool> {
+    let payload = {
+        let obj = record.as_object().ok_or_else(|| {
+            PdsError::Validation("postPrivate record must be a JSON object".to_string())
+        })?;
+        match content_payload(obj, form)? {
+            Some(payload) => payload,
+            None => return Ok(false),
+        }
     };
 
     let nsid_typed = kryphocron::Nsid::new(nsid).map_err(|e| {
@@ -271,7 +399,7 @@ pub(crate) async fn encode_private_content_with_hooks(
     let encoded = kryphocron::encode_record_content(
         hooks,
         sink,
-        text.as_bytes(),
+        &payload,
         &content_ctx,
         deadline,
         now,
@@ -284,6 +412,19 @@ pub(crate) async fn encode_private_content_with_hooks(
     })?;
     // The XOR rule (§5.4): exactly one of `text` | `encodedContent`.
     obj.remove("text");
+    // The client's own `embedBlobs`, if any, is never kept: only the
+    // encoder's, taken from the embed it encoded.
+    obj.remove(EMBED_BLOBS_FIELD);
+    if form == PayloadForm::Content {
+        obj.remove("facets");
+        if let Some(embed) = obj.remove("embed") {
+            let mut blobs = Vec::new();
+            blob_objects(&embed, &mut blobs);
+            if !blobs.is_empty() {
+                obj.insert(EMBED_BLOBS_FIELD.to_string(), serde_json::Value::Array(blobs));
+            }
+        }
+    }
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&encoded.content);
     obj.insert(
         "encodedContent".to_string(),
@@ -454,17 +595,18 @@ pub(crate) async fn decode_private_content_with_hooks(
         );
         PdsError::Internal(format!("kryphocron at-rest decode failed: {e}"))
     })?;
-    let text = String::from_utf8(plaintext)
-        .map_err(|e| PdsError::Internal(format!("decoded content is not valid UTF-8: {e}")))?;
+    let restored = restore_content(plaintext)?;
 
     let obj = record.as_object_mut().ok_or_else(|| {
         PdsError::Validation("postPrivate record must be a JSON object".to_string())
     })?;
-    // Inverse of the encode transform: the XOR flips back to `text`.
+    // Inverse of the encode transform: the XOR flips back to `text`, and a
+    // content-form payload brings back `facets` and `embed` (#504).
     obj.remove("encodedContent");
     obj.remove("encodedContentCodec");
     obj.remove("encodedContentGeneration");
-    obj.insert("text".to_string(), serde_json::Value::String(text));
+    obj.remove(EMBED_BLOBS_FIELD);
+    obj.extend(restored);
 
     tracing::debug!(
         target: "aurora_locus::kryphocron",
@@ -476,6 +618,54 @@ pub(crate) async fn decode_private_content_with_hooks(
         "private-tier record content decoded for an authorized read",
     );
     Ok(DecodeOutcome::Decoded)
+}
+
+/// The record fields a decoded payload restores (#504): a text-form payload
+/// (UTF-8) gives `text`; a content-form one ([`CONTENT_FORM_MARKER`] then a
+/// JSON object) gives `text` and, when present, `facets` and `embed`.
+///
+/// # Errors
+///
+/// [`PdsError::Internal`] when a text payload is not UTF-8, or a content
+/// payload is not a JSON object with a string `text`, an array `facets` and
+/// an object `embed`.
+fn restore_content(
+    plaintext: Vec<u8>,
+) -> PdsResult<serde_json::Map<String, serde_json::Value>> {
+    let mut restored = serde_json::Map::new();
+    let Some(json) = plaintext.strip_prefix(&[CONTENT_FORM_MARKER]) else {
+        let text = String::from_utf8(plaintext)
+            .map_err(|e| PdsError::Internal(format!("decoded content is not valid UTF-8: {e}")))?;
+        restored.insert("text".to_string(), serde_json::Value::String(text));
+        return Ok(restored);
+    };
+    let bad = |what: &str| PdsError::Internal(format!("decoded content payload: {what}"));
+    let serde_json::Value::Object(content) = serde_json::from_slice(json)
+        .map_err(|e| PdsError::Internal(format!("decoded content payload is not JSON: {e}")))?
+    else {
+        return Err(bad("not a JSON object"));
+    };
+    match content.get("text") {
+        Some(text @ serde_json::Value::String(_)) => {
+            restored.insert("text".to_string(), text.clone());
+        }
+        _ => return Err(bad("text missing or not a string")),
+    }
+    match content.get("facets") {
+        None => {}
+        Some(facets @ serde_json::Value::Array(_)) => {
+            restored.insert("facets".to_string(), facets.clone());
+        }
+        Some(_) => return Err(bad("facets not an array")),
+    }
+    match content.get("embed") {
+        None => {}
+        Some(embed @ serde_json::Value::Object(_)) => {
+            restored.insert("embed".to_string(), embed.clone());
+        }
+        Some(_) => return Err(bad("embed not an object")),
+    }
+    Ok(restored)
 }
 
 /// Aurora-Locus's read-side authorization decision for a private-tier record
@@ -780,6 +970,170 @@ mod tests {
         assert!(!did_encode, "no `text` field means nothing to encode");
         assert_eq!(record, before, "record must be untouched");
     }
+
+    // ---- #504: the content form encodes facets and embed too ----
+
+    fn blob(cid_tail: &str, mime: &str) -> serde_json::Value {
+        serde_json::json!({
+            "$type": "blob",
+            "ref": { "$link": format!("bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6p{cid_tail}") },
+            "mimeType": mime,
+            "size": 1234,
+        })
+    }
+
+    /// One embed of each kind, with the blobs each one carries.
+    fn embeds() -> Vec<(serde_json::Value, Vec<serde_json::Value>)> {
+        let quoted = serde_json::json!({ "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002", "cid": "bafyreigquoted" });
+        vec![
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedImage",
+                    "images": [{ "alt": "a quiet street", "image": blob("aaaaa", "image/jpeg") }] }),
+                vec![blob("aaaaa", "image/jpeg")],
+            ),
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedGallery",
+                    "items": [
+                        { "alt": "one", "image": blob("bbbbb", "image/png"), "aspectRatio": { "width": 1, "height": 1 } },
+                        { "alt": "two", "image": blob("ccccc", "image/png"), "aspectRatio": { "width": 2, "height": 1 } },
+                    ] }),
+                vec![blob("bbbbb", "image/png"), blob("ccccc", "image/png")],
+            ),
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedVideo",
+                    "video": blob("ddddd", "video/mp4"), "alt": "a clip",
+                    "captions": [{ "lang": "en", "file": blob("eeeee", "text/vtt") }] }),
+                vec![blob("ddddd", "video/mp4"), blob("eeeee", "text/vtt")],
+            ),
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedExternal",
+                    "external": { "uri": "https://example.com/a", "title": "A page", "description": "about it",
+                        "thumb": blob("fffff", "image/jpeg") } }),
+                vec![blob("fffff", "image/jpeg")],
+            ),
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedRecord", "record": quoted }),
+                vec![],
+            ),
+            (
+                serde_json::json!({ "$type": "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
+                    "record": { "record": quoted },
+                    "media": { "$type": "tools.kryphocron.feed.postPublic#embedImage",
+                        "images": [{ "alt": "with a quote", "image": blob("ggggg", "image/jpeg") }] } }),
+                vec![blob("ggggg", "image/jpeg")],
+            ),
+        ]
+    }
+
+    /// Every embed kind round-trips: the stored record keeps no facets, no
+    /// embed and no text, holds exactly the embed's blobs in `embedBlobs`,
+    /// and decodes back to the original record.
+    #[tokio::test]
+    async fn the_content_form_round_trips_every_embed_kind() {
+        let (hooks, _guard) = default_hooks("content-form");
+        let sink = ContentAuditSink;
+        let facets = serde_json::json!([{ "index": { "byteStart": 0, "byteEnd": 4 },
+            "features": [{ "$type": "tools.kryphocron.feed.postPublic#link", "uri": "https://example.com/l" }] }]);
+        for (embed, blobs) in embeds() {
+            let original = serde_json::json!({
+                "$type": NSID_POST_PRIVATE_TEST,
+                "text": "look at this",
+                "facets": facets,
+                "embed": embed,
+                "createdAt": "2026-10-19T00:00:00Z",
+                "audienceList": "at://did:plc:exampleexampleexample/tools.kryphocron.policy.audience/aud",
+            });
+            let mut record = original.clone();
+            assert!(encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, PayloadForm::Content)
+                .await
+                .unwrap());
+            let obj = record.as_object().unwrap();
+            for gone in ["text", "facets", "embed"] {
+                assert!(!obj.contains_key(gone), "{gone} stays in the clear for {}", embed["$type"]);
+            }
+            match blobs.is_empty() {
+                true => assert!(!obj.contains_key(EMBED_BLOBS_FIELD)),
+                false => assert_eq!(record[EMBED_BLOBS_FIELD], serde_json::Value::Array(blobs)),
+            }
+
+            decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record)
+                .await
+                .unwrap();
+            assert_eq!(record, original, "{}", embed["$type"]);
+        }
+    }
+
+    /// A content-form payload starts with the marker byte, which no UTF-8
+    /// text begins with; a text-form payload is the UTF-8 text.
+    #[test]
+    fn the_two_payload_forms_are_told_apart_by_the_first_byte() {
+        let record = serde_json::json!({ "text": "hi", "embed": { "$type": "x" } });
+        let obj = record.as_object().unwrap();
+        let content = content_payload(obj, PayloadForm::Content).unwrap().unwrap();
+        assert_eq!(content[0], CONTENT_FORM_MARKER);
+        assert!(std::str::from_utf8(&content).is_err());
+        assert_eq!(content_payload(obj, PayloadForm::Text).unwrap().unwrap(), b"hi");
+
+        // A text payload that merely looks like JSON stays text.
+        let restored = restore_content(br#"{"text":"x","embed":{}}"#.to_vec()).unwrap();
+        assert_eq!(restored["text"], r#"{"text":"x","embed":{}}"#);
+        assert!(!restored.contains_key("embed"));
+    }
+
+    /// A post with an embed but no text still encodes (with empty text), in
+    /// either form, so it never carries neither `text` nor `encodedContent`.
+    #[tokio::test]
+    async fn a_post_without_text_is_still_encoded() {
+        let (hooks, _guard) = default_hooks("no-text-embed");
+        let sink = ContentAuditSink;
+        for form in [PayloadForm::Text, PayloadForm::Content] {
+            let mut record = serde_json::json!({ "$type": NSID_POST_PRIVATE_TEST, "embed": embeds()[0].0 });
+            assert!(encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, form)
+                .await
+                .unwrap());
+            assert!(record.get("encodedContent").is_some(), "{form:?}");
+            decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record)
+                .await
+                .unwrap();
+            assert_eq!(record["text"], "", "{form:?}");
+        }
+    }
+
+    /// The client's own `embedBlobs` is never stored: the encoder sets it
+    /// from the embed it encodes.
+    #[tokio::test]
+    async fn a_client_sent_embed_blobs_is_replaced() {
+        let (hooks, _guard) = default_hooks("client-blobs");
+        let sink = ContentAuditSink;
+        let mut record = serde_json::json!({
+            "$type": NSID_POST_PRIVATE_TEST, "text": "x",
+            "embed": embeds()[0].0,
+            "embedBlobs": [blob("zzzzz", "image/gif")],
+        });
+        encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, PayloadForm::Content)
+            .await
+            .unwrap();
+        assert_eq!(record[EMBED_BLOBS_FIELD], serde_json::Value::Array(embeds()[0].1.clone()));
+    }
+
+    #[tokio::test]
+    async fn content_fields_of_the_wrong_type_are_refused() {
+        let (hooks, _guard) = default_hooks("bad-types");
+        let sink = ContentAuditSink;
+        for bad in [
+            serde_json::json!({ "text": 5 }),
+            serde_json::json!({ "text": "x", "facets": {} }),
+            serde_json::json!({ "text": "x", "embed": [] }),
+        ] {
+            let mut record = bad.clone();
+            let err = encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, PayloadForm::Content)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::Validation(_)), "{bad}: {err:?}");
+        }
+    }
+
+    const NSID_POST_PRIVATE_TEST: &str = "tools.kryphocron.feed.postPrivate";
 
     // ---- decode-on-read (#237a) ----
 

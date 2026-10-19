@@ -51,7 +51,7 @@
 //! `getRotationStatus` to surface on the Laquna page.
 //!
 //! [dec]: crate::kryphocron_content::decode_private_content_with_hooks
-//! [enc]: crate::kryphocron_content::encode_private_content_with_hooks
+//! [enc]: crate::kryphocron_content::encode_private_content_as
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -68,8 +68,8 @@ use crate::context::AppContext;
 use crate::error::{PdsError, PdsResult};
 use crate::kryphocron::{CapabilityClass, KryphocronWriteAuthorization};
 use crate::kryphocron_content::{
-    decode_private_content_with_hooks, encode_private_content_with_hooks, ContentAuditSink,
-    DecodeOutcome,
+    decode_private_content_with_hooks, encode_private_content_as, ContentAuditSink,
+    DecodeOutcome, PayloadForm,
 };
 
 /// Max `Update` ops batched into one `apply_writes` commit (the `apply_writes`
@@ -582,7 +582,8 @@ async fn prepare_record_rewrite(
         .map_err(|e| PdsError::Internal(format!("rewrite: decode record block: {e}")))?;
     let mut value = proto_blue::lex_json::lex_to_json(&lex);
 
-    let rewritten = rewrite_value(hooks, sink, did, &rec.rkey, &mut value).await?;
+    let form = PayloadForm::configured(ctx);
+    let rewritten = rewrite_value_as(hooks, sink, did, &rec.rkey, &mut value, form).await?;
     if !rewritten {
         return Ok(None);
     }
@@ -607,6 +608,7 @@ async fn prepare_record_rewrite(
 /// oracle's current generation, mutating `value` in place. Returns `true` when
 /// the record was re-encoded, `false` when it carried no `encodedContent` (a
 /// legacy `text` / non-encoded record — left untouched, out of rewrite scope).
+#[cfg(test)]
 async fn rewrite_value(
     hooks: &dyn kryphocron::encryption::AtRestHooks,
     sink: &ContentAuditSink,
@@ -614,13 +616,27 @@ async fn rewrite_value(
     rkey: &str,
     value: &mut serde_json::Value,
 ) -> PdsResult<bool> {
+    rewrite_value_as(hooks, sink, did, rkey, value, PayloadForm::Text).await
+}
+
+/// [`rewrite_value`] re-encoding in `form` (#504). Decoding reads either
+/// form, so a text-form post rewritten in the content form comes out in the
+/// content form, with its embed encoded and its blob refs kept.
+async fn rewrite_value_as(
+    hooks: &dyn kryphocron::encryption::AtRestHooks,
+    sink: &ContentAuditSink,
+    did: &str,
+    rkey: &str,
+    value: &mut serde_json::Value,
+    form: PayloadForm,
+) -> PdsResult<bool> {
     match decode_private_content_with_hooks(hooks, did, NSID_POST_PRIVATE, rkey, value).await? {
         DecodeOutcome::NotEncoded => return Ok(false),
         DecodeOutcome::Decoded => {}
     }
     // Re-encode under the oracle's current (post-force_rotation) generation.
     let encoded =
-        encode_private_content_with_hooks(hooks, sink, did, NSID_POST_PRIVATE, rkey, value).await?;
+        encode_private_content_as(hooks, sink, did, NSID_POST_PRIVATE, rkey, value, form).await?;
     Ok(encoded)
 }
 
@@ -744,6 +760,7 @@ fn append_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kryphocron_content::encode_private_content_with_hooks;
 
     fn tmp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -822,6 +839,66 @@ mod tests {
                 .unwrap();
         assert_eq!(outcome, DecodeOutcome::Decoded);
         assert_eq!(record["text"].as_str(), Some("secret payload"));
+    }
+
+    fn image_embed() -> serde_json::Value {
+        serde_json::json!({
+            "$type": "tools.kryphocron.feed.postPublic#embedImage",
+            "images": [{
+                "alt": "a quiet street",
+                "image": {"$type": "blob", "ref": {"$link": "bafkreia3sxbycjd7nasotfqcvkqabmzrko6auicjmxtoev62cxv6pflezi"}, "mimeType": "image/jpeg", "size": 1000},
+            }],
+        })
+    }
+
+    /// #504: a text-form post whose embed is in the clear comes out of a
+    /// content-form rewrite with the embed encoded, its blob refs kept in
+    /// `embedBlobs`, and everything restored on decode.
+    #[tokio::test]
+    async fn a_content_form_rewrite_encodes_an_old_posts_embed() {
+        let (hooks, oracle, _g) = al_hooks("convert");
+        let sink = ContentAuditSink;
+        let mut record = serde_json::json!({
+            "$type": NSID_POST_PRIVATE,
+            "text": "look",
+            "embed": image_embed(),
+        });
+        encode_private_content_with_hooks(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE, RKEY, &mut record)
+            .await
+            .unwrap();
+        assert!(record.get("embed").is_some(), "text form leaves the embed clear");
+
+        oracle.force_rotation();
+        assert!(rewrite_value_as(hooks.as_ref(), &sink, DID, RKEY, &mut record, PayloadForm::Content)
+            .await
+            .unwrap());
+        assert!(record.get("embed").is_none(), "embed is encoded");
+        assert_eq!(
+            record["embedBlobs"],
+            serde_json::json!([image_embed()["images"][0]["image"]]),
+            "blob refs stay in the clear",
+        );
+
+        decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE, RKEY, &mut record)
+            .await
+            .unwrap();
+        assert_eq!(record["text"], "look");
+        assert_eq!(record["embed"], image_embed());
+        assert!(record.get("embedBlobs").is_none());
+
+        // Rewriting a content-form post again keeps its content.
+        let mut again = record.clone();
+        encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE, RKEY, &mut again, PayloadForm::Content)
+            .await
+            .unwrap();
+        oracle.force_rotation();
+        rewrite_value_as(hooks.as_ref(), &sink, DID, RKEY, &mut again, PayloadForm::Content)
+            .await
+            .unwrap();
+        decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE, RKEY, &mut again)
+            .await
+            .unwrap();
+        assert_eq!(again, record);
     }
 
     #[tokio::test]

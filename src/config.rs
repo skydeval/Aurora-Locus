@@ -1278,6 +1278,13 @@ pub struct KryphocronConfig {
     /// bound so what is stored is what is served.
     #[serde(default = "default_private_max_chain")]
     pub private_max_chain: usize,
+
+    /// Whether a private post's `facets` and `embed` are encoded along with
+    /// its text (`PDS_KRYPHOCRON_ENCODE_EMBEDS`, #504). Default off: readers
+    /// (the AppView) must decode the combined form before it is written.
+    /// Decoding both forms is always on.
+    #[serde(default)]
+    pub encode_embeds: bool,
 }
 
 /// The default walk bound for private replies: the AppView's default too.
@@ -1295,6 +1302,7 @@ impl Default for KryphocronConfig {
         Self {
             enabled: true,
             private_max_chain: DEFAULT_PRIVATE_MAX_CHAIN,
+            encode_embeds: false,
         }
     }
 }
@@ -1309,9 +1317,15 @@ impl KryphocronConfig {
     pub fn from_env_values(
         enabled: Option<String>,
         private_max_chain: Option<String>,
+        encode_embeds: Option<String>,
     ) -> PdsResult<Self> {
         let defaults = Self::default();
         let enabled = parse_bool_env("PDS_KRYPHOCRON_ENABLED", enabled, defaults.enabled)?;
+        let encode_embeds = parse_bool_env(
+            "PDS_KRYPHOCRON_ENCODE_EMBEDS",
+            encode_embeds,
+            defaults.encode_embeds,
+        )?;
         let private_max_chain = parse_usize_env(
             "PDS_KRYPHOCRON_MAX_CHAIN",
             private_max_chain,
@@ -1326,6 +1340,7 @@ impl KryphocronConfig {
         Ok(Self {
             enabled,
             private_max_chain,
+            encode_embeds,
         })
     }
 }
@@ -2062,6 +2077,7 @@ impl ServerConfig {
         let kryphocron = KryphocronConfig::from_env_values(
             env::var("PDS_KRYPHOCRON_ENABLED").ok(),
             env::var("PDS_KRYPHOCRON_MAX_CHAIN").ok(),
+            env::var("PDS_KRYPHOCRON_ENCODE_EMBEDS").ok(),
         )?;
 
         // Arc 12 §5.3.2 Gap 1: public_url override via env var.
@@ -2988,7 +3004,7 @@ mod kryphocron_config_tests {
 
     #[test]
     fn the_private_walk_bound_defaults_to_the_appviews_default() {
-        let config = KryphocronConfig::from_env_values(None, None).unwrap();
+        let config = KryphocronConfig::from_env_values(None, None, None).unwrap();
         assert_eq!(config.private_max_chain, DEFAULT_PRIVATE_MAX_CHAIN);
         assert_eq!(KryphocronConfig::default().private_max_chain, 16);
     }
@@ -2996,14 +3012,23 @@ mod kryphocron_config_tests {
     #[test]
     fn the_private_walk_bound_is_one_to_a_hundred() {
         for ok in ["1", "16", "100"] {
-            let config = KryphocronConfig::from_env_values(None, Some(ok.to_string())).unwrap();
+            let config = KryphocronConfig::from_env_values(None, Some(ok.to_string()), None).unwrap();
             assert_eq!(config.private_max_chain.to_string(), ok);
         }
         for refused in ["0", "101", "-1", "many"] {
             assert!(
-                KryphocronConfig::from_env_values(None, Some(refused.to_string())).is_err(),
+                KryphocronConfig::from_env_values(None, Some(refused.to_string()), None).is_err(),
                 "{refused}"
             );
         }
+    }
+
+    /// #504: encoding the embed is off until the AppView reads it.
+    #[test]
+    fn encoding_the_embed_is_off_by_default() {
+        assert!(!KryphocronConfig::from_env_values(None, None, None).unwrap().encode_embeds);
+        let on = KryphocronConfig::from_env_values(None, None, Some("true".into())).unwrap();
+        assert!(on.encode_embeds);
+        assert!(KryphocronConfig::from_env_values(None, None, Some("maybe".into())).is_err());
     }
 }
