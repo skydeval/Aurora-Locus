@@ -331,8 +331,13 @@ impl BlobStore {
         // no-op (2xx PUT already confirmed durability inside put()).
         self.backend.fsync(cid).await?;
 
-        // Step 4: open DB transaction. Steps 5-7 happen inside.
-        let mut tx = self.db.begin().await.map_err(PdsError::Database)?;
+        // Step 4: open DB transaction. Steps 5-7 happen inside. It reads
+        // (step 5) before it writes (step 6), so on SQLite it takes the
+        // write lock up front: a deferred transaction's read-to-write
+        // upgrade fails at once when another upload committed in between,
+        // which the busy timeout cannot wait out (a 10-image post's
+        // uploads collided this way and answered 500).
+        let mut tx = self.begin_write().await?;
 
         // Step 5: SELECT temp_blob_metadata row exists (plain SELECT,
         // no FOR UPDATE per §9.3.3.4). Catches Case 3a reaper-race
@@ -821,6 +826,20 @@ impl BlobStore {
         } else {
             Ok(None)
         }
+    }
+
+    /// Begin a transaction that will write: `BEGIN IMMEDIATE` on SQLite, so a
+    /// concurrent writer is waited out by the busy timeout instead of
+    /// failing the upgrade from read to write (as #519 did for the audit
+    /// chain); a plain `BEGIN` on Postgres, whose row locks need no such
+    /// step.
+    async fn begin_write(&self) -> PdsResult<sqlx::Transaction<'static, sqlx::Any>> {
+        if self.is_postgres {
+            self.db.begin().await
+        } else {
+            self.db.begin_with("BEGIN IMMEDIATE").await
+        }
+        .map_err(PdsError::Database)
     }
 
     /// Delete blob metadata from database. Pool-API wrapper that opens
@@ -1640,6 +1659,88 @@ mod tests {
         .unwrap();
 
         BlobStore::new(config, db).await.unwrap()
+    }
+
+    /// A blob store over a file-backed SQLite in WAL mode with several
+    /// connections and a busy timeout, as in production, so concurrent
+    /// transactions really contend.
+    async fn create_contended_store(dir: &std::path::Path) -> BlobStore {
+        use std::sync::Once;
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(sqlx::any::install_default_drivers);
+        let url = format!("sqlite://{}?mode=rwc", dir.join("account.sqlite").display());
+        let db = sqlx::any::AnyPoolOptions::new()
+            .max_connections(8)
+            .after_connect(|conn, _| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout = 5000").execute(&mut *conn).await?;
+                    Ok(())
+                })
+            })
+            .connect(&url)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA journal_mode = WAL").execute(&db).await.unwrap();
+        for table in ["blob_metadata", "temp_blob_metadata"] {
+            sqlx::query(&format!(
+                "CREATE TABLE {table} (
+                    cid TEXT PRIMARY KEY,
+                    mime_type TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    creator_did TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    width INTEGER,
+                    height INTEGER{extra}
+                )",
+                extra = if table == "blob_metadata" {
+                    ",
+                    alt_text TEXT,
+                    thumbnail_cid TEXT,
+                    temp_key TEXT NULL CHECK (temp_key IS NULL OR temp_key = '1')"
+                } else {
+                    ""
+                }
+            ))
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+        let config = BlobStoreConfig {
+            storage: BlobStorageConfig {
+                backend: BlobBackendType::Disk {
+                    location: dir.join("blobs"),
+                },
+                max_blob_size: 1024 * 1024,
+                temp_dir: dir.join("tmp"),
+            },
+        };
+        BlobStore::new(config, db).await.unwrap()
+    }
+
+    /// The uploads of one post commit at the same time. Each commit reads
+    /// before it writes; begun deferred, one failed with "database is
+    /// locked" whenever another committed in between (a 10-image post
+    /// answered 500 for one image). All of them commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_all_commit() {
+        let dir = tempdir().unwrap();
+        let store = create_contended_store(dir.path()).await;
+        let mut staged = Vec::new();
+        for i in 0..10u8 {
+            let bytes = vec![i; 4096 + usize::from(i)];
+            staged.push(stage_test_blob(&store, &bytes, "image/jpeg", "did:plc:happy").await);
+        }
+        let commits = staged.iter().map(|blob| {
+            let store = store.clone();
+            let cid = blob.r#ref.link.clone();
+            tokio::spawn(async move { store.commit_blob(&cid).await })
+        });
+        for (i, result) in futures::future::join_all(commits).await.into_iter().enumerate() {
+            result.unwrap().unwrap_or_else(|e| panic!("upload {i}: {e}"));
+        }
+        for blob in &staged {
+            assert!(store.is_untethered(&blob.r#ref.link).await.unwrap());
+        }
     }
 
     #[tokio::test]
