@@ -455,6 +455,25 @@ impl ActorStore {
         Ok(())
     }
 
+    /// The URIs of the records of `did` written after revision `since_rev`
+    /// (`com.atproto.sync.listBlobs`'s `since`, #530).
+    ///
+    /// # Errors
+    ///
+    /// A failure opening or reading the account's store.
+    pub async fn record_uris_since_rev(
+        &self,
+        did: &str,
+        since_rev: &str,
+    ) -> PdsResult<std::collections::HashSet<String>> {
+        let pool = self.open_db(did).await?;
+        let uris: Vec<String> = sqlx::query_scalar("SELECT uri FROM record WHERE repo_rev > ?1")
+            .bind(since_rev)
+            .fetch_all(&pool)
+            .await?;
+        Ok(uris.into_iter().collect())
+    }
+
     /// Get records created since a specific repo revision
     ///
     /// Used for read-after-write consistency to fetch records that might not

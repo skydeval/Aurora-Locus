@@ -70,7 +70,8 @@ pub struct GetBlobParams {
 pub struct ListBlobsParams {
     /// DID of the repository
     pub did: String,
-    /// Optional: only return blobs since this timestamp
+    /// Optional: only return blobs used by records written after this
+    /// repository revision
     pub since: Option<String>,
     /// Optional: maximum number of results (default: 100, max: 1000)
     pub limit: Option<i64>,
@@ -331,17 +332,17 @@ pub async fn list_blobs(
     let reader = crate::api::repo::optional_reader(&ctx, &headers).await;
     crate::api::repo::assert_readable_by(&ctx, &params.did, reader.as_deref()).await?;
 
-    let limit = params.limit.unwrap_or(100).min(1000);
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
 
-    // Get blob CIDs
+    // The blobs the account's records use (#530), and with `since` only
+    // those of records written after that revision.
+    let records = match params.since.as_deref() {
+        Some(since) => Some(ctx.actor_store.record_uris_since_rev(&params.did, since).await?),
+        None => None,
+    };
     let cids = ctx
         .blob_store
-        .list_blob_cids(
-            &params.did,
-            params.since.as_deref(),
-            limit,
-            params.cursor.as_deref(),
-        )
+        .list_referenced_blob_cids(&params.did, params.cursor.as_deref(), limit, records.as_ref())
         .await?;
 
     // Cursor is the last CID if we hit the limit
