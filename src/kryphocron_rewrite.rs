@@ -911,6 +911,44 @@ mod tests {
         assert_eq!(again, record);
     }
 
+    /// #504: a text-form post quoting a record (with media, in the kryphocron
+    /// vocabulary) comes out of a content-form rewrite with the quote's
+    /// strong ref in the clear `quote`, alongside its blobs, and decodes
+    /// back to the original embed.
+    #[tokio::test]
+    async fn a_content_form_rewrite_keeps_a_quote_in_the_clear() {
+        let (hooks, oracle, _g) = al_hooks("convert-quote");
+        let sink = ContentAuditSink;
+        let quoted = serde_json::json!({
+            "uri": "at://did:plc:other/tools.kryphocron.feed.postPrivate/3kquoted00002",
+            "cid": "bafyreigquoted",
+        });
+        let embed = serde_json::json!({
+            "$type": "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
+            "record": { "record": quoted },
+            "media": image_embed(),
+        });
+        let mut record = serde_json::json!({ "$type": NSID_POST_PRIVATE, "text": "this", "embed": embed });
+        encode_private_content_with_hooks(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE, RKEY, &mut record)
+            .await
+            .unwrap();
+        assert!(record.get("quote").is_none(), "text form has no clear quote");
+
+        oracle.force_rotation();
+        assert!(rewrite_value_as(hooks.as_ref(), &sink, DID, RKEY, &mut record, PayloadForm::Content)
+            .await
+            .unwrap());
+        assert!(record.get("embed").is_none(), "embed is encoded");
+        assert_eq!(record["quote"], quoted, "a converted post keeps its quote in the clear");
+        assert_eq!(record["embedBlobs"], serde_json::json!([image_embed()["images"][0]["image"]]));
+
+        decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE, RKEY, &mut record)
+            .await
+            .unwrap();
+        assert_eq!(record["embed"], embed);
+        assert!(record.get("quote").is_none());
+    }
+
     #[tokio::test]
     async fn rewrite_value_skips_non_encoded_record() {
         let (hooks, _oracle, _g) = al_hooks("skip");
