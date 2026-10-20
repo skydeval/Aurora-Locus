@@ -34,6 +34,7 @@ fn parse_timestamp(s: &str) -> PdsResult<DateTime<Utc>> {
 use image::ImageFormat;
 use proto_blue::lex_data::Cid;
 use sqlx::{AnyPool, Row};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::fs;
 
@@ -1031,14 +1032,14 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE $1
+                WHERE rb.record_uri LIKE $1 ESCAPE '\'
                   AND bm.cid IS NULL
                   AND rb.blob_cid > $2
                 ORDER BY rb.blob_cid ASC
                 LIMIT $3
                 "#,
             )
-            .bind(format!("at://{}/%", did))
+            .bind(record_uri_prefix_pattern(did))
             .bind(cursor)
             .bind(limit)
         } else {
@@ -1047,13 +1048,13 @@ impl BlobStore {
                 SELECT rb.blob_cid, rb.record_uri
                 FROM record_blob rb
                 LEFT JOIN blob_metadata bm ON rb.blob_cid = bm.cid
-                WHERE rb.record_uri LIKE $1
+                WHERE rb.record_uri LIKE $1 ESCAPE '\'
                   AND bm.cid IS NULL
                 ORDER BY rb.blob_cid ASC
                 LIMIT $2
                 "#,
             )
-            .bind(format!("at://{}/%", did))
+            .bind(record_uri_prefix_pattern(did))
             .bind(limit)
         };
 
@@ -1073,53 +1074,75 @@ impl BlobStore {
         Ok(results)
     }
 
-    /// List blob CIDs for sync protocol (com.atproto.sync.listBlobs)
+    /// The blobs the records of `did` reference, for
+    /// `com.atproto.sync.listBlobs` (#530): distinct CIDs in ascending order,
+    /// after `cursor`, at most `limit`. With `records`, only the blobs those
+    /// records reference (the records written since a revision).
     ///
-    /// Returns just the CID strings for a DID with cursor-based pagination.
+    /// The list comes from the records' references, as on the reference PDS,
+    /// not from who uploaded the bytes: a blob is stored once per CID, so one
+    /// another account uploaded first is still this account's when its
+    /// records use it, and a blob it uploaded but never used is not listed.
     ///
-    /// # Arguments
+    /// # Errors
     ///
-    /// * `did` - The DID to list blobs for
-    /// * `since` - Optional since parameter (not yet implemented)
-    /// * `limit` - Maximum number of CIDs to return
-    /// * `cursor` - Optional cursor for pagination (CID to start after)
-    ///
-    /// # Returns
-    ///
-    /// Vec of CID strings, ordered by CID (lexically)
-    pub async fn list_blob_cids(
+    /// A database failure.
+    pub async fn list_referenced_blob_cids(
         &self,
         did: &str,
-        _since: Option<&str>,
-        limit: i64,
         cursor: Option<&str>,
+        limit: i64,
+        records: Option<&HashSet<String>>,
     ) -> PdsResult<Vec<String>> {
-        let query = if let Some(cursor) = cursor {
-            sqlx::query_scalar(
-                "SELECT cid FROM blob_metadata
-                 WHERE creator_did = $1 AND cid > $2
-                 ORDER BY cid ASC
-                 LIMIT $3",
-            )
-            .bind(did)
-            .bind(cursor)
-            .bind(limit)
-        } else {
-            sqlx::query_scalar(
-                "SELECT cid FROM blob_metadata
-                 WHERE creator_did = $1
-                 ORDER BY cid ASC
-                 LIMIT $2",
-            )
-            .bind(did)
-            .bind(limit)
-        };
+        /// Reference rows read per query while filtering by record.
+        const SCAN_BATCH: i64 = 1000;
 
-        let cids = query
-            .fetch_all(&self.db)
-            .await
-            .map_err(PdsError::Database)?;
-
+        let pattern = record_uri_prefix_pattern(did);
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let mut cids: Vec<String> = Vec::new();
+        // Keyset position: the last (blob, record) pair read. A blob counts
+        // once however many records use it, so the scan resumes after the
+        // pair, not the blob, and the cursor skips the cursor blob entirely.
+        let mut after_cid = cursor.unwrap_or_default().to_string();
+        let mut after_uri: Option<String> = None;
+        while cids.len() < limit {
+            let query = match &after_uri {
+                None => sqlx::query_as(
+                    "SELECT blob_cid, record_uri FROM record_blob
+                     WHERE record_uri LIKE $1 ESCAPE '\\' AND blob_cid > $2
+                     ORDER BY blob_cid ASC, record_uri ASC
+                     LIMIT $3",
+                )
+                .bind(&pattern)
+                .bind(&after_cid)
+                .bind(SCAN_BATCH),
+                Some(uri) => sqlx::query_as(
+                    "SELECT blob_cid, record_uri FROM record_blob
+                     WHERE record_uri LIKE $1 ESCAPE '\\'
+                       AND (blob_cid > $2 OR (blob_cid = $2 AND record_uri > $3))
+                     ORDER BY blob_cid ASC, record_uri ASC
+                     LIMIT $4",
+                )
+                .bind(&pattern)
+                .bind(&after_cid)
+                .bind(uri)
+                .bind(SCAN_BATCH),
+            };
+            let rows: Vec<(String, String)> =
+                query.fetch_all(&self.db).await.map_err(PdsError::Database)?;
+            let exhausted = (rows.len() as i64) < SCAN_BATCH;
+            for (cid, uri) in rows {
+                let wanted = records.is_none_or(|records| records.contains(&uri));
+                if wanted && cids.last() != Some(&cid) && cids.len() < limit {
+                    cids.push(cid.clone());
+                }
+                after_cid = cid;
+                after_uri = Some(uri);
+            }
+            if exhausted {
+                break;
+            }
+        }
         Ok(cids)
     }
 
@@ -2217,6 +2240,100 @@ mod tests {
             )
             .bind(cid).bind(uri).execute(pool).await.unwrap();
         }
+    }
+
+    /// Every page of `did`'s referenced blobs, `limit` at a time, following
+    /// the cursor as `listBlobs` does.
+    async fn all_pages(store: &BlobStore, did: &str, limit: i64) -> Vec<Vec<String>> {
+        let mut pages = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let page = store
+                .list_referenced_blob_cids(did, cursor.as_deref(), limit, None)
+                .await
+                .unwrap();
+            cursor = page.last().cloned();
+            let full = page.len() as i64 == limit;
+            pages.push(page);
+            if !full {
+                return pages;
+            }
+        }
+    }
+
+    /// #530: an account's blobs are those its records use, whoever uploaded
+    /// the bytes first; an upload no record uses is not listed.
+    #[tokio::test]
+    async fn listed_blobs_are_the_ones_the_accounts_records_use() {
+        let (store, pool) = arc16b_store().await;
+        // Uploaded by alice (the seed's creator); used by alice and bob.
+        seed_permanent_with_refs(&pool, "bafyshared", &[
+            "at://did:plc:alice/app.bsky.feed.post/1",
+            "at://did:plc:bob/app.bsky.feed.post/1",
+        ]).await;
+        seed_permanent_with_refs(&pool, "bafyunused", &[]).await;
+        seed_permanent_with_refs(&pool, "bafybobs", &["at://did:plc:bob/app.bsky.feed.post/2"]).await;
+        // `_` is a LIKE wildcard: a_b's listing must not take aXb's blobs.
+        seed_permanent_with_refs(&pool, "bafyweb", &["at://did:web:aXb.example/app.bsky.feed.post/1"]).await;
+
+        let list = |did: &'static str| store.list_referenced_blob_cids(did, None, 100, None);
+        assert_eq!(list("did:plc:bob").await.unwrap(), ["bafybobs", "bafyshared"]);
+        assert_eq!(list("did:plc:alice").await.unwrap(), ["bafyshared"]);
+        assert!(list("did:web:a_b.example").await.unwrap().is_empty());
+    }
+
+    /// Pages are distinct CIDs in order, a blob used by several records
+    /// counts once, and the cursor resumes after its blob.
+    #[tokio::test]
+    async fn referenced_blobs_page_by_cid() {
+        let (store, pool) = arc16b_store().await;
+        for (cid, records) in [("bafy1", 2), ("bafy2", 1), ("bafy3", 3), ("bafy4", 1), ("bafy5", 2)] {
+            let uris: Vec<String> =
+                (0..records).map(|n| format!("at://did:plc:bob/app.bsky.feed.post/{cid}-{n}")).collect();
+            let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+            seed_permanent_with_refs(&pool, cid, &uris).await;
+        }
+        assert_eq!(
+            all_pages(&store, "did:plc:bob", 2).await,
+            [vec!["bafy1", "bafy2"], vec!["bafy3", "bafy4"], vec!["bafy5"]]
+        );
+    }
+
+    /// With a set of records, only their blobs are listed, even past many
+    /// references to other records of the same blob (the scan's batches).
+    #[tokio::test]
+    async fn referenced_blobs_filter_by_record() {
+        let (store, pool) = arc16b_store().await;
+        let older: Vec<String> =
+            (0..1200).map(|n| format!("at://did:plc:bob/app.bsky.feed.post/old{n:04}")).collect();
+        let older: Vec<&str> = older.iter().map(String::as_str).collect();
+        seed_permanent_with_refs(&pool, "bafyold", &older).await;
+        seed_permanent_with_refs(&pool, "bafynew", &["at://did:plc:bob/app.bsky.feed.post/new"]).await;
+        sqlx::query(
+            "INSERT INTO record_blob (blob_cid, record_uri, indexed_at) \
+             VALUES ('bafyold', 'at://did:plc:bob/app.bsky.feed.post/zz-new', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let recent: HashSet<String> = [
+            "at://did:plc:bob/app.bsky.feed.post/new".to_string(),
+            "at://did:plc:bob/app.bsky.feed.post/zz-new".to_string(),
+        ]
+        .into();
+        let listed = store
+            .list_referenced_blob_cids("did:plc:bob", None, 100, Some(&recent))
+            .await
+            .unwrap();
+        assert_eq!(listed, ["bafynew", "bafyold"]);
+
+        let none = HashSet::new();
+        let listed = store
+            .list_referenced_blob_cids("did:plc:bob", None, 100, Some(&none))
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
     }
 
     #[tokio::test]
