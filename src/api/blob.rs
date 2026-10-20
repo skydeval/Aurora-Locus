@@ -251,109 +251,118 @@ async fn get_blob(
         .ok_or_else(|| PdsError::BlobNotFound(cid.clone()))?;
 
     let (data, mime_type) = blob_data;
-    let total_size = data.len();
-
-    // Calculate ETag from CID (CID is already content-addressed)
-    let etag = format!("\"{}\"", cid);
-
-    // Check If-None-Match header for 304 Not Modified
-    if let Some(if_none_match) = headers.get(header::IF_NONE_MATCH) {
-        if let Ok(if_none_match_str) = if_none_match.to_str() {
-            if if_none_match_str == etag {
-                return Ok(Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, etag)
-                    .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
-                    .body(axum::body::Body::empty())
-                    .unwrap());
-            }
-        }
-    }
-
-    // Check for Range header
-    if let Some(range_header) = headers.get(header::RANGE) {
-        if let Ok(range_str) = range_header.to_str() {
-            // Parse Range header (format: "bytes=start-end")
-            if let Some(range) = parse_range(range_str, total_size) {
-                let (start, end) = range;
-                let length = end - start + 1;
-                let partial_data = data[start..=end].to_vec();
-
-                return Ok(Response::builder()
-                    .status(StatusCode::PARTIAL_CONTENT)
-                    .header(header::CONTENT_TYPE, mime_type)
-                    .header(header::CONTENT_LENGTH, length.to_string())
-                    .header(
-                        header::CONTENT_RANGE,
-                        format!("bytes {}-{}/{}", start, end, total_size),
-                    )
-                    .header(header::ETAG, etag)
-                    .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .body(axum::body::Body::from(partial_data))
-                    .unwrap());
-            }
-        }
-    }
-
-    // Return full content
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime_type)
-        .header(header::CONTENT_LENGTH, total_size.to_string())
-        .header(header::ETAG, etag)
-        .header(header::CACHE_CONTROL, BLOB_CACHE_CONTROL)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .body(axum::body::Body::from(data))
-        .unwrap())
+    let mut response = blob_bytes_response(data, &mime_type, &cid, &headers);
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static(BLOB_CACHE_CONTROL),
+    );
+    Ok(response)
 }
 
-/// Parse HTTP Range header
-///
-/// Returns (start, end) inclusive byte positions, or None if invalid
-fn parse_range(range_header: &str, total_size: usize) -> Option<(usize, usize)> {
-    // Expected format: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
-    let range_header = range_header.trim();
+/// What a request's `Range` header asks of a blob of `total` bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ByteRange {
+    /// No usable range: serve the whole blob. A malformed header, another
+    /// unit, or several ranges are ignored, as RFC 9110 allows.
+    Full,
+    /// Serve bytes `start..=end`.
+    Partial { start: usize, end: usize },
+    /// A well-formed range wholly outside the blob: answer 416.
+    Unsatisfiable,
+}
 
-    if !range_header.starts_with("bytes=") {
-        return None;
+/// Interpret a `Range` header for a blob of `total` bytes (RFC 9110 §14):
+/// `bytes=a-b` (end clamped to the blob), `bytes=a-`, and the suffix form
+/// `bytes=-n` (the last `n` bytes).
+pub(crate) fn byte_range(header: &str, total: usize) -> ByteRange {
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return ByteRange::Full;
+    };
+    if spec.contains(',') {
+        return ByteRange::Full;
+    }
+    let Some((first, last)) = spec.trim().split_once('-') else {
+        return ByteRange::Full;
+    };
+    let parse = |s: &str| s.trim().parse::<usize>().ok();
+    match (first.trim().is_empty(), last.trim().is_empty()) {
+        // Suffix: the last `n` bytes.
+        (true, false) => match parse(last) {
+            None => ByteRange::Full,
+            Some(0) => ByteRange::Unsatisfiable,
+            Some(_) if total == 0 => ByteRange::Unsatisfiable,
+            Some(n) => ByteRange::Partial { start: total - n.min(total), end: total - 1 },
+        },
+        // Open: from `a` to the end.
+        (false, true) => match parse(first) {
+            None => ByteRange::Full,
+            Some(start) if start >= total => ByteRange::Unsatisfiable,
+            Some(start) => ByteRange::Partial { start, end: total - 1 },
+        },
+        // Closed: `a` to `b`, `b` clamped to the blob.
+        (false, false) => match (parse(first), parse(last)) {
+            (Some(start), Some(end)) if start <= end => {
+                if start >= total {
+                    ByteRange::Unsatisfiable
+                } else {
+                    ByteRange::Partial { start, end: end.min(total - 1) }
+                }
+            }
+            _ => ByteRange::Full,
+        },
+        (true, true) => ByteRange::Full,
+    }
+}
+
+/// The response serving a blob's bytes, shared by `/blob/:cid` and
+/// `com.atproto.sync.getBlob`: an ETag of the CID (a matching
+/// `If-None-Match` answers 304), `Accept-Ranges: bytes`, and byte ranges
+/// (206 with `Content-Range`, or 416 with `Content-Range: bytes */size`).
+/// An `If-Range` naming another ETag gets the whole blob. Callers add their
+/// own cache and security headers.
+pub(crate) fn blob_bytes_response(
+    data: Vec<u8>,
+    mime_type: &str,
+    cid: &str,
+    request: &HeaderMap,
+) -> Response {
+    let etag = format!("\"{cid}\"");
+    let total = data.len();
+    let header_str = |name| request.get(name).and_then(|v: &header::HeaderValue| v.to_str().ok());
+
+    let base = |status: StatusCode| {
+        Response::builder()
+            .status(status)
+            .header(header::ETAG, &etag)
+            .header(header::ACCEPT_RANGES, "bytes")
+    };
+    if header_str(header::IF_NONE_MATCH) == Some(etag.as_str()) {
+        return base(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .expect("static response parts are valid");
     }
 
-    let range_spec = &range_header[6..]; // Remove "bytes=" prefix
-
-    if let Some(dash_pos) = range_spec.find('-') {
-        let start_str = &range_spec[..dash_pos];
-        let end_str = &range_spec[dash_pos + 1..];
-
-        if start_str.is_empty() {
-            // Suffix range: "bytes=-500" (last 500 bytes)
-            if let Ok(suffix) = end_str.parse::<usize>() {
-                let start = total_size.saturating_sub(suffix);
-                return Some((start, total_size - 1));
-            }
-        } else if end_str.is_empty() {
-            // Open-ended range: "bytes=500-" (from 500 to end)
-            if let Ok(start) = start_str.parse::<usize>() {
-                if start < total_size {
-                    return Some((start, total_size - 1));
-                }
-            }
-        } else {
-            // Complete range: "bytes=500-999"
-            if let (Ok(start), Ok(mut end)) = (start_str.parse::<usize>(), end_str.parse::<usize>())
-            {
-                if start < total_size {
-                    // Clamp end to total_size - 1
-                    end = end.min(total_size - 1);
-                    if start <= end {
-                        return Some((start, end));
-                    }
-                }
-            }
+    let range = match header_str(header::RANGE) {
+        Some(range) if header_str(header::IF_RANGE).is_none_or(|v| v == etag) => {
+            byte_range(range, total)
         }
-    }
-
-    None
+        _ => ByteRange::Full,
+    };
+    let response = match range {
+        ByteRange::Full => base(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime_type)
+            .header(header::CONTENT_LENGTH, total)
+            .body(axum::body::Body::from(data)),
+        ByteRange::Partial { start, end } => base(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_TYPE, mime_type)
+            .header(header::CONTENT_LENGTH, end - start + 1)
+            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
+            .body(axum::body::Body::from(data[start..=end].to_vec())),
+        ByteRange::Unsatisfiable => base(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{total}"))
+            .body(axum::body::Body::empty()),
+    };
+    response.expect("blob response parts are valid")
 }
 
 #[cfg(test)]
@@ -413,39 +422,87 @@ mod tests {
         assert_eq!(media_type(" ; charset=x"), None);
     }
 
-    #[test]
-    fn test_parse_range_complete() {
-        // "bytes=0-499" for 1000 byte file
-        assert_eq!(parse_range("bytes=0-499", 1000), Some((0, 499)));
-        assert_eq!(parse_range("bytes=500-999", 1000), Some((500, 999)));
+    fn partial(start: usize, end: usize) -> ByteRange {
+        ByteRange::Partial { start, end }
     }
 
     #[test]
-    fn test_parse_range_open_ended() {
-        // "bytes=500-" for 1000 byte file
-        assert_eq!(parse_range("bytes=500-", 1000), Some((500, 999)));
-        assert_eq!(parse_range("bytes=0-", 1000), Some((0, 999)));
+    fn closed_open_and_suffix_ranges() {
+        assert_eq!(byte_range("bytes=0-499", 1000), partial(0, 499));
+        assert_eq!(byte_range("bytes=500-999", 1000), partial(500, 999));
+        assert_eq!(byte_range("bytes=0-1023", 1000), partial(0, 999), "end clamped");
+        assert_eq!(byte_range("bytes=500-", 1000), partial(500, 999));
+        assert_eq!(byte_range("bytes=-100", 1000), partial(900, 999));
+        assert_eq!(byte_range("bytes=-5000", 1000), partial(0, 999), "suffix longer than the blob");
     }
 
     #[test]
-    fn test_parse_range_suffix() {
-        // "bytes=-500" for 1000 byte file (last 500 bytes)
-        assert_eq!(parse_range("bytes=-500", 1000), Some((500, 999)));
-        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+    fn ranges_outside_the_blob_are_unsatisfiable() {
+        assert_eq!(byte_range("bytes=1000-", 1000), ByteRange::Unsatisfiable);
+        assert_eq!(byte_range("bytes=1000-2000", 1000), ByteRange::Unsatisfiable);
+        assert_eq!(byte_range("bytes=-0", 1000), ByteRange::Unsatisfiable);
+        assert_eq!(byte_range("bytes=0-", 0), ByteRange::Unsatisfiable, "empty blob");
+        assert_eq!(byte_range("bytes=-10", 0), ByteRange::Unsatisfiable, "empty blob");
     }
 
     #[test]
-    fn test_parse_range_clamping() {
-        // Request beyond file size should be clamped
-        assert_eq!(parse_range("bytes=0-2000", 1000), Some((0, 999)));
-        assert_eq!(parse_range("bytes=900-2000", 1000), Some((900, 999)));
+    fn unusable_range_headers_serve_the_whole_blob() {
+        for header in ["bytes=invalid", "bytes=500-400", "items=0-1", "bytes=0-1,5-9", "bytes=-"] {
+            assert_eq!(byte_range(header, 1000), ByteRange::Full, "{header}");
+        }
     }
 
-    #[test]
-    fn test_parse_range_invalid() {
-        assert_eq!(parse_range("bytes=invalid", 1000), None);
-        assert_eq!(parse_range("bytes=1000-", 1000), None); // Start beyond file
-        assert_eq!(parse_range("bytes=500-400", 1000), None); // Start > end
-        assert_eq!(parse_range("invalid", 1000), None); // Wrong prefix
+    async fn body_of(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    fn with(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(name.clone(), value.parse().unwrap());
+        }
+        headers
+    }
+
+    /// The response a player needs: 206 with Content-Range for a range,
+    /// 416 outside the blob, 304 for a cached copy, and the whole blob when
+    /// If-Range names another version.
+    #[tokio::test]
+    async fn the_blob_response_serves_ranges() {
+        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        let cid = "bafkreitest";
+
+        let full = blob_bytes_response(data.clone(), "video/mp4", cid, &HeaderMap::new());
+        assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(body_of(full).await, data);
+
+        let part = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::RANGE, "bytes=10-19")]));
+        assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 10-19/1000");
+        assert_eq!(part.headers()[header::CONTENT_LENGTH], "10");
+        assert_eq!(body_of(part).await, data[10..20].to_vec());
+
+        let out = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::RANGE, "bytes=5000-")]));
+        assert_eq!(out.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(out.headers()[header::CONTENT_RANGE], "bytes */1000");
+
+        let cached = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::IF_NONE_MATCH, "\"bafkreitest\"")]));
+        assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
+
+        let stale = blob_bytes_response(
+            data.clone(),
+            "video/mp4",
+            cid,
+            &with(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"other\"")]),
+        );
+        assert_eq!(stale.status(), StatusCode::OK, "If-Range for another version gets the whole blob");
+        let fresh = blob_bytes_response(
+            data,
+            "video/mp4",
+            cid,
+            &with(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"bafkreitest\"")]),
+        );
+        assert_eq!(fresh.status(), StatusCode::PARTIAL_CONTENT);
     }
 }
