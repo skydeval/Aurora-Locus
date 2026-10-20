@@ -1138,8 +1138,10 @@ async fn update_post_private(
 /// `tools.kryphocron.graph.createBlock` — create a
 /// `tools.kryphocron.graph.block` record (carrying `subject`, the blocked DID)
 /// in the caller's own repo, under the `DedicatedEndpoint`/`User` authorization.
-/// Private-tier (existence is private; consumed by `BlockOracle` outside the
-/// normal capability flow — §7.2.4). **Route intentionally unregistered until
+/// Private-tier, consumed by `BlockOracle` outside the normal capability flow
+/// (§7.2.4). The record is not secret: its commit goes out on the firehose
+/// like any other, so firehose readers can see who blocked whom (private is
+/// friction, not encryption; kryphocron-lexicons 0.3.3). **Route intentionally unregistered until
 /// #282** (see the module note above): this persists the block but does not yet
 /// cascade the audience removals.
 async fn create_block(
