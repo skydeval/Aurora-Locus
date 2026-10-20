@@ -196,10 +196,14 @@ pub struct RateLimitInfo {
 }
 
 impl RateLimitInfo {
+    /// The state after an admission. Governor lets a long-idle bucket admit
+    /// one more than its burst and reports `limit` left after taking one, so
+    /// `remaining` is capped at `limit - 1`: what a full bucket has left after
+    /// this request, never more than it will admit.
     fn from_snapshot(snapshot: &StateSnapshot) -> Self {
         let quota = snapshot.quota();
         let limit = quota.burst_size().get();
-        let remaining = snapshot.remaining_burst_capacity().min(limit);
+        let remaining = snapshot.remaining_burst_capacity().min(limit - 1);
         let refill = quota.replenish_interval() * (limit - remaining);
         Self {
             limit,
@@ -2059,6 +2063,22 @@ mod tests {
         assert_eq!(refusal.limit, 3);
         assert!(refusal.retry_after >= Duration::from_secs(1));
         assert!(refusal.retry_after <= Duration::from_secs(20));
+    }
+
+    /// A bucket that has refilled reports one fewer than its size after an
+    /// admission, as a fresh one does, never its whole size.
+    #[test]
+    fn a_refilled_bucket_reports_one_taken() {
+        let mut endpoints = EndpointRateLimitConfig::new();
+        // One request back every millisecond, two at most.
+        endpoints.add_limit("/xrpc/test.fast", EndpointRateLimit::with_burst(1000, 1, 2));
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), endpoints);
+        let expected = Ok(Some(RateLimitInfo { limit: 2, remaining: 1, reset_seconds: 1 }));
+
+        assert_eq!(limiter.admit_endpoint("/xrpc/test.fast", &caller()), Some(expected.clone()));
+        // Well past the two milliseconds the bucket needs to refill.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(limiter.admit_endpoint("/xrpc/test.fast", &caller()), Some(expected));
     }
 
     /// With rate limits off nothing is counted, so there is no state to report.
