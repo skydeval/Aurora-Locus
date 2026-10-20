@@ -886,6 +886,11 @@ mod tests {
             serde_json::json!(["did:plc:alice"]),
             "a converted post keeps its mentions in the clear for the AppView",
         );
+        assert_eq!(
+            record["mediaKinds"],
+            serde_json::json!(["image"]),
+            "a rewrite marks the post's media in the clear (#529)",
+        );
 
         decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE, RKEY, &mut record)
             .await
@@ -895,6 +900,7 @@ mod tests {
         assert_eq!(record["facets"][0]["features"][0]["did"], "did:plc:alice");
         assert!(record.get("embedBlobs").is_none());
         assert!(record.get("mentionDids").is_none());
+        assert!(record.get("mediaKinds").is_none());
 
         // Rewriting a content-form post again keeps its content.
         let mut again = record.clone();
