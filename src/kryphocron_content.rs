@@ -260,6 +260,53 @@ pub(crate) const MENTION_DIDS_FIELD: &str = "mentionDids";
 /// post quotes, kept in the clear for the AppView's indexing (#504).
 pub(crate) const QUOTE_FIELD: &str = "quote";
 
+/// The top-level field naming the kinds of media a content-form post's own
+/// embed carries (`"image"`, `"video"`), kept in the clear so the AppView can
+/// filter an author's private posts by media (#529, agreed with Prism).
+pub(crate) const MEDIA_KINDS_FIELD: &str = "mediaKinds";
+
+/// Image embeds, in the stock and the kryphocron vocabularies.
+const IMAGE_EMBED_TYPES: [&str; 4] = [
+    "app.bsky.embed.images",
+    "app.bsky.embed.gallery",
+    "tools.kryphocron.feed.postPublic#embedImage",
+    "tools.kryphocron.feed.postPublic#embedGallery",
+];
+
+/// Video embeds, in the stock and the kryphocron vocabularies.
+const VIDEO_EMBED_TYPES: [&str; 2] = [
+    "app.bsky.embed.video",
+    "tools.kryphocron.feed.postPublic#embedVideo",
+];
+
+/// Record-with-media embeds, in the stock and the kryphocron vocabularies.
+const RECORD_WITH_MEDIA_TYPES: [&str; 2] = [
+    "app.bsky.embed.recordWithMedia",
+    "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
+];
+
+/// The media kinds `embed` itself carries, in the fixed order `image`,
+/// `video`: from an image or video embed, or the `media` of a
+/// record-with-media. Link cards (Bluesky's GIFs among them), plain quotes
+/// and a quoted post's own media are not the post's media, as in stock.
+fn media_kinds(embed: &serde_json::Value) -> Vec<serde_json::Value> {
+    let embed_type = |value: &serde_json::Value| -> Option<String> {
+        Some(value.get("$type")?.as_str()?.to_string())
+    };
+    let media_type = match embed_type(embed) {
+        Some(t) if RECORD_WITH_MEDIA_TYPES.contains(&t.as_str()) => {
+            embed.get("media").and_then(embed_type)
+        }
+        other => other,
+    };
+    let kind = match media_type.as_deref() {
+        Some(t) if IMAGE_EMBED_TYPES.contains(&t) => "image",
+        Some(t) if VIDEO_EMBED_TYPES.contains(&t) => "video",
+        _ => return Vec::new(),
+    };
+    vec![serde_json::Value::String(kind.to_string())]
+}
+
 /// Mention facet features: the stock and the kryphocron vocabularies, and
 /// the bare local form the AppView also reads.
 const MENTION_FEATURE_TYPES: [&str; 3] = [
@@ -395,9 +442,10 @@ fn content_payload(
 /// - **Text form:** `text` is encoded and removed.
 /// - **Content form:** `text`, `facets` and `embed` are encoded together and
 ///   removed. In the clear, `embedBlobs` holds the embed's blob objects,
-///   `mentionDids` the mentioned DIDs and `quote` a strong ref to a quoted
-///   record, each derived from what was encoded, omitted when empty, and
-///   replacing any the client sent.
+///   `mentionDids` the mentioned DIDs, `quote` a strong ref to a quoted
+///   record and `mediaKinds` the kinds of media the embed carries, each
+///   derived from what was encoded, omitted when empty, and replacing any
+///   the client sent.
 ///
 /// Returns `Ok(true)` when the record was encoded, `Ok(false)` when there
 /// was nothing to encode (already encoded, or no `text`/`facets`/`embed`).
@@ -493,6 +541,7 @@ pub(crate) async fn encode_private_content_as(
     obj.remove(EMBED_BLOBS_FIELD);
     obj.remove(MENTION_DIDS_FIELD);
     obj.remove(QUOTE_FIELD);
+    obj.remove(MEDIA_KINDS_FIELD);
     // A null content field means absent; none is stored.
     for field in ["facets", "embed"] {
         if obj.get(field).is_some_and(serde_json::Value::is_null) {
@@ -511,6 +560,10 @@ pub(crate) async fn encode_private_content_as(
         if let Some(embed) = obj.remove("embed") {
             if let Some(quote) = quoted_record(&embed) {
                 obj.insert(QUOTE_FIELD.to_string(), quote);
+            }
+            let kinds = media_kinds(&embed);
+            if !kinds.is_empty() {
+                obj.insert(MEDIA_KINDS_FIELD.to_string(), serde_json::Value::Array(kinds));
             }
             let mut blobs = Vec::new();
             blob_objects(&embed, &mut blobs);
@@ -704,6 +757,7 @@ pub(crate) async fn decode_private_content_with_hooks(
     obj.remove(EMBED_BLOBS_FIELD);
     obj.remove(MENTION_DIDS_FIELD);
     obj.remove(QUOTE_FIELD);
+    obj.remove(MEDIA_KINDS_FIELD);
     obj.extend(restored);
 
     tracing::debug!(
@@ -1228,6 +1282,11 @@ mod tests {
                 ),
                 false => assert!(!obj.contains_key(QUOTE_FIELD), "{}", embed["$type"]),
             }
+            // Media kinds: written exactly when the embed carries media.
+            match media_kinds(&embed).as_slice() {
+                [] => assert!(!obj.contains_key(MEDIA_KINDS_FIELD), "{}", embed["$type"]),
+                kinds => assert_eq!(record[MEDIA_KINDS_FIELD].as_array().unwrap(), kinds),
+            }
 
             decode_private_content_with_hooks(hooks.as_ref(), DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record)
                 .await
@@ -1286,6 +1345,7 @@ mod tests {
                 "embedBlobs": [blob("zzzzz", "image/gif")],
                 "mentionDids": ["did:plc:forged"],
                 "quote": { "uri": "at://did:plc:forged/x/y", "cid": "bafyforged" },
+                "mediaKinds": ["video"],
             });
             encode_private_content_as(hooks.as_ref(), &sink, DID, NSID_POST_PRIVATE_TEST, RKEY, &mut record, form)
                 .await
@@ -1293,12 +1353,59 @@ mod tests {
             assert!(record.get(MENTION_DIDS_FIELD).is_none(), "{form:?}");
             assert!(record.get(QUOTE_FIELD).is_none(), "{form:?}");
             match form {
-                PayloadForm::Text => assert!(record.get(EMBED_BLOBS_FIELD).is_none()),
-                PayloadForm::Content => assert_eq!(
-                    record[EMBED_BLOBS_FIELD],
-                    serde_json::Value::Array(embeds()[0].1.clone())
-                ),
+                PayloadForm::Text => {
+                    assert!(record.get(EMBED_BLOBS_FIELD).is_none());
+                    assert!(record.get(MEDIA_KINDS_FIELD).is_none());
+                }
+                PayloadForm::Content => {
+                    assert_eq!(
+                        record[EMBED_BLOBS_FIELD],
+                        serde_json::Value::Array(embeds()[0].1.clone())
+                    );
+                    assert_eq!(record[MEDIA_KINDS_FIELD], serde_json::json!(["image"]));
+                }
             }
+        }
+    }
+
+    /// Images and galleries are `image`, videos `video`, a record-with-media
+    /// counts its own media, and link cards and plain quotes are no media,
+    /// in both vocabularies.
+    #[test]
+    fn media_kinds_name_the_posts_own_media() {
+        let kinds: Vec<serde_json::Value> = embeds().iter().map(|(embed, _)| media_kinds(embed).into()).collect();
+        // Image, gallery, video, link card, quote, quote with an image.
+        assert_eq!(
+            kinds,
+            vec![
+                serde_json::json!(["image"]),
+                serde_json::json!(["image"]),
+                serde_json::json!(["video"]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+                serde_json::json!(["image"]),
+            ]
+        );
+
+        let quoted = serde_json::json!({ "uri": "at://did:plc:other/app.bsky.feed.post/3kquoted00002", "cid": "bafyreigquoted" });
+        let video = serde_json::json!({ "$type": "app.bsky.embed.video", "video": blob("hhhhh", "video/mp4") });
+        let stock = [
+            (serde_json::json!({ "$type": "app.bsky.embed.images", "images": [] }), serde_json::json!(["image"])),
+            (video.clone(), serde_json::json!(["video"])),
+            (
+                serde_json::json!({ "$type": "app.bsky.embed.recordWithMedia", "record": { "record": quoted }, "media": video }),
+                serde_json::json!(["video"]),
+            ),
+            (
+                serde_json::json!({ "$type": "app.bsky.embed.external",
+                    "external": { "uri": "https://media.tenor.com/a.gif", "title": "a gif", "description": "" } }),
+                serde_json::json!([]),
+            ),
+            (serde_json::json!({ "$type": "app.bsky.embed.record", "record": quoted }), serde_json::json!([])),
+            (serde_json::json!({ "images": [] }), serde_json::json!([])),
+        ];
+        for (embed, expected) in stock {
+            assert_eq!(serde_json::Value::from(media_kinds(&embed)), expected, "{embed}");
         }
     }
 
