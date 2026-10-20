@@ -53,14 +53,16 @@ fn no_store(mut resp: Response) -> Response {
 /// Response headers browser clients need to read, so they are exposed to
 /// cross-origin callers (#469). `atproto-content-labelers` /
 /// `atproto-repo-rev` come back from proxied app.bsky calls, `dpop-nonce` and
-/// `www-authenticate` drive the OAuth DPoP retry, and `retry-after` (#514)
-/// with the `ratelimit-*` family lets clients back off.
-const CORS_EXPOSED_HEADERS: [&str; 9] = [
+/// `www-authenticate` drive the OAuth DPoP retry, `retry-after` (#514)
+/// with the `ratelimit-*` family lets clients back off, and `content-range`
+/// lets script-driven media players read blob byte ranges.
+const CORS_EXPOSED_HEADERS: [&str; 10] = [
     "atproto-content-labelers",
     "atproto-repo-rev",
     "dpop-nonce",
     "www-authenticate",
     "retry-after",
+    "content-range",
     "ratelimit-limit",
     "ratelimit-remaining",
     "ratelimit-reset",

@@ -299,24 +299,21 @@ pub async fn get_blob(
         .await?
         .ok_or_else(|| PdsError::BlobNotFound(params.cid.clone()))?;
 
-    // Return blob with security headers (matching Bluesky pattern)
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, mime_type.as_str()),
-            (header::CONTENT_LENGTH, &data.len().to_string()),
-            (
-                header::HeaderName::from_static("x-content-type-options"),
-                "nosniff",
-            ),
-            (
-                header::HeaderName::from_static("content-security-policy"),
-                "default-src 'none'; sandbox",
-            ),
-        ],
-        data,
-    )
-        .into_response())
+    // Byte ranges, ETag and 304 as on `/blob/:cid`: video players need
+    // ranges to play and seek, and private videos play from here. Security
+    // headers as on the reference PDS.
+    let mut response =
+        crate::api::blob::blob_bytes_response(data, &mime_type, &params.cid, &headers);
+    let response_headers = response.headers_mut();
+    response_headers.insert(
+        header::HeaderName::from_static("x-content-type-options"),
+        header::HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(
+        header::HeaderName::from_static("content-security-policy"),
+        header::HeaderValue::from_static("default-src 'none'; sandbox"),
+    );
+    Ok(response)
 }
 
 /// List blob CIDs in a repository.
@@ -563,5 +560,53 @@ mod tests {
         assert_eq!(params.did, "did:plc:test");
         assert_eq!(params.limit, Some(50));
         assert_eq!(params.cursor, Some("bafyreiabc".to_string()));
+    }
+
+    /// getBlob serves byte ranges, which video players need to play and
+    /// seek (private videos play from here), with its security headers.
+    #[tokio::test]
+    async fn get_blob_serves_byte_ranges() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let account = ctx
+            .account_manager
+            .create_account("ranges.localhost".into(), None, "password123".into(), None, None)
+            .await
+            .unwrap();
+        let data: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+        let staged = ctx
+            .blob_store
+            .stage_blob(data.clone(), Some("video/mp4"), &account.did)
+            .await
+            .unwrap();
+        ctx.blob_store.commit_blob(&staged.cid).await.unwrap();
+
+        let fetch = |range: Option<&'static str>| {
+            let ctx = ctx.clone();
+            let params = GetBlobParams { did: account.did.clone(), cid: staged.cid.clone() };
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(range) = range {
+                    headers.insert(header::RANGE, range.parse().unwrap());
+                }
+                get_blob(State(ctx), headers, Query(params)).await.unwrap()
+            }
+        };
+
+        let whole = fetch(None).await;
+        assert_eq!(whole.status(), StatusCode::OK);
+        assert_eq!(whole.headers()[header::ACCEPT_RANGES], "bytes");
+        assert_eq!(whole.headers()["x-content-type-options"], "nosniff");
+
+        let first = fetch(Some("bytes=0-1023")).await;
+        assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(first.headers()[header::CONTENT_RANGE], "bytes 0-1023/4096");
+        assert_eq!(first.headers()["content-security-policy"], "default-src 'none'; sandbox");
+        let body = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), &data[..1024]);
+
+        let tail = fetch(Some("bytes=-96")).await;
+        assert_eq!(tail.headers()[header::CONTENT_RANGE], "bytes 4000-4095/4096");
+
+        assert_eq!(fetch(Some("bytes=4096-")).await.status(), StatusCode::RANGE_NOT_SATISFIABLE);
     }
 }
