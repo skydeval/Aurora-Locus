@@ -123,6 +123,23 @@ type EndpointLimiters = Arc<HashMap<String, Vec<Arc<KeyedLimiter>>>>;
 /// first, so its value is never the client's own claim.
 pub const CLIENT_IP_HEADER: &str = "x-aurora-client-ip";
 
+/// `com.atproto.sync.getBlob`, which has its own download limit.
+pub const BLOB_DOWNLOAD_PATH: &str = "/xrpc/com.atproto.sync.getBlob";
+
+/// The prefix of the `/blob/:cid` routes; they share one download limit,
+/// whatever the CID.
+pub const BLOB_ROUTE_PREFIX: &str = "/blob/";
+
+/// The path a request's endpoint limits are looked up under: its own, or
+/// [`BLOB_ROUTE_PREFIX`] for any `/blob/:cid`.
+fn limit_path(path: &str) -> &str {
+    if path.starts_with(BLOB_ROUTE_PREFIX) {
+        BLOB_ROUTE_PREFIX
+    } else {
+        path
+    }
+}
+
 /// The forwarded header believed from a trusted proxy unless configured.
 pub const DEFAULT_CLIENT_IP_HEADER: &str = "x-forwarded-for";
 
@@ -251,7 +268,6 @@ impl EndpointRateLimit {
     }
 
     /// Create a new endpoint rate limit with custom burst size
-    #[allow(dead_code)] // Future burst configuration
     pub fn with_burst(max_requests: u32, duration_secs: u64, burst_size: u32) -> Self {
         Self {
             max_requests,
@@ -389,6 +405,14 @@ impl EndpointRateLimitConfig {
                 EndpointRateLimit::new(3000, 86400), // Long-term: 3000 per day
             ],
         );
+
+        // Blob downloads: their own, generous per-caller limit. A screen of
+        // images, or a video player seeking with range requests, makes many
+        // requests at once; the general unauthenticated limit (10/s) made a
+        // single viewer hit 429. `/blob/` covers every `/blob/:cid`.
+        for blob_path in [BLOB_DOWNLOAD_PATH, BLOB_ROUTE_PREFIX] {
+            config.add_limit(blob_path, EndpointRateLimit::with_burst(100, 1, 200));
+        }
 
         // Account deletion: Single strict limit (very sensitive operation)
         config.add_limit(
@@ -1220,23 +1244,30 @@ async fn limit(
     caller: CallerKey,
     tier: Tier,
 ) -> Response {
-    let path = request.uri().path().to_string();
+    let full_path = request.uri().path().to_string();
+    let path = limit_path(&full_path).to_string();
 
     // PRIORITY 0: cross-instance distributed-rate-limit check
     // (Arc 7 Step 3). In Distributed mode this runs BEFORE the
     // governor's checks so cross-instance correctness is enforced first;
     // the governor still runs as per-instance defense-in-depth. One bucket
-    // per endpoint and caller (#514), at 100 tokens/sec, max 100.
+    // per endpoint and caller (#514), at 100 tokens/sec, max 100; blob
+    // downloads may burst to 200, matching their governor limit.
     if let Some(dist) = ctx.distributed_rate_limiter.as_ref() {
         let bucket_key = format!("endpoint|{path}|{}", caller.bucket());
+        let max_tokens = if path == BLOB_DOWNLOAD_PATH || path == BLOB_ROUTE_PREFIX {
+            200
+        } else {
+            100
+        };
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        match dist.try_consume(&bucket_key, 1, 100, 100, now_ms).await {
+        match dist.try_consume(&bucket_key, 1, 100, max_tokens, now_ms).await {
             Ok(RateLimitOutcome::Allowed { .. }) => {}
             Ok(RateLimitOutcome::RateLimited) => {
-                return refuse(request, Duration::from_secs(1), 100).await;
+                return refuse(request, Duration::from_secs(1), max_tokens as u32).await;
             }
             Err(e) => {
                 // Distributed-store failure is operator-meaningful but
@@ -1939,6 +1970,28 @@ mod tests {
             .check_endpoint("/xrpc/com.atproto.repo.uploadBlob", &caller())
             .unwrap()
             .is_err());
+    }
+
+    /// Blob downloads have their own budget: a burst of 200 per caller (a
+    /// screen of images, a seeking video), shared by every `/blob/:cid`, and
+    /// not taken from the general unauthenticated budget.
+    #[test]
+    fn blob_downloads_have_their_own_generous_budget() {
+        let limiter = RateLimiter::with_bluesky_defaults(RateLimitConfig::default());
+        let viewer = CallerKey::Address(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
+        assert_eq!(limit_path("/blob/bafkreione"), BLOB_ROUTE_PREFIX);
+        assert_eq!(limit_path("/blob/bafkreitwo"), BLOB_ROUTE_PREFIX);
+        assert_eq!(limit_path(BLOB_DOWNLOAD_PATH), BLOB_DOWNLOAD_PATH);
+
+        for request in 0..200 {
+            let result = limiter.check_endpoint(BLOB_DOWNLOAD_PATH, &viewer);
+            assert!(result.unwrap().is_ok(), "getBlob request {request}");
+        }
+        assert!(limiter.check_endpoint(BLOB_DOWNLOAD_PATH, &viewer).unwrap().is_err());
+
+        // `/blob/:cid` is a separate bucket, and the general budget is untouched.
+        assert!(limiter.check_endpoint(BLOB_ROUTE_PREFIX, &viewer).unwrap().is_ok());
+        assert!(limiter.check_unauthenticated(&viewer).is_ok());
     }
 
     #[test]
