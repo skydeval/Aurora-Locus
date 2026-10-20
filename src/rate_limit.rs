@@ -97,9 +97,10 @@ use axum::{
 };
 use dashmap::DashMap;
 use governor::{
-    clock::DefaultClock,
+    clock::{DefaultClock, QuantaInstant},
+    middleware::{StateInformationMiddleware, StateSnapshot},
     state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter as GovernorLimiter,
+    NotUntil, Quota, RateLimiter as GovernorLimiter,
 };
 use std::{
     collections::HashMap,
@@ -111,8 +112,19 @@ use std::{
 };
 
 /// A limiter with one bucket per caller key (#514): an account (`did:…`) or
-/// a client address (`ip:…`).
-type KeyedLimiter = GovernorLimiter<String, DashMap<String, InMemoryState>, DefaultClock>;
+/// a client address (`ip:…`). It reports the bucket's state with each
+/// decision, which the response's rate-limit headers are built from.
+type KeyedLimiter = GovernorLimiter<
+    String,
+    DashMap<String, InMemoryState>,
+    DefaultClock,
+    StateInformationMiddleware,
+>;
+
+/// A [`KeyedLimiter`] enforcing `quota`.
+fn keyed_limiter(quota: Quota) -> KeyedLimiter {
+    GovernorLimiter::keyed(quota).with_middleware::<StateInformationMiddleware>()
+}
 
 /// Type alias for endpoint rate limiters (multiple limiters per endpoint),
 /// each keyed per caller.
@@ -165,22 +177,67 @@ impl CallerKey {
 }
 
 /// The wait a rejected caller is told to observe, from a governor refusal.
-fn retry_after(not_until: governor::NotUntil<governor::clock::QuantaInstant>) -> Duration {
+fn retry_after(not_until: &NotUntil<QuantaInstant>) -> Duration {
     let wait = not_until.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
     // Round up to whole seconds, at least one: Retry-After counts seconds.
     Duration::from_secs(wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(Duration::from_secs(1))
 }
 
-/// Rate limit state information for headers
-#[derive(Debug, Clone)]
+/// The state of the bucket that admitted a request, for its rate-limit
+/// headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RateLimitInfo {
-    /// Maximum requests allowed in the current window
+    /// The most requests the bucket holds: its burst size.
     pub limit: u32,
-    /// Requests remaining in the current window
+    /// Requests the bucket still allows right now.
     pub remaining: u32,
-    /// Seconds until the rate limit window resets
+    /// Whole seconds (rounded up) until the bucket is full again.
     pub reset_seconds: u64,
 }
+
+impl RateLimitInfo {
+    fn from_snapshot(snapshot: &StateSnapshot) -> Self {
+        let quota = snapshot.quota();
+        let limit = quota.burst_size().get();
+        let remaining = snapshot.remaining_burst_capacity().min(limit);
+        let refill = quota.replenish_interval() * (limit - remaining);
+        Self {
+            limit,
+            remaining,
+            reset_seconds: refill.as_secs() + u64::from(refill.subsec_nanos() > 0),
+        }
+    }
+}
+
+/// A request a bucket refused: when to retry, and that bucket's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitRefusal {
+    /// How long the caller must wait before the bucket admits it.
+    pub retry_after: Duration,
+    /// The burst size of the bucket that refused.
+    pub limit: u32,
+}
+
+impl RateLimitRefusal {
+    fn from_not_until(not_until: &NotUntil<QuantaInstant>) -> Self {
+        Self {
+            retry_after: retry_after(not_until),
+            limit: not_until.quota().burst_size().get(),
+        }
+    }
+}
+
+impl From<RateLimitRefusal> for PdsError {
+    fn from(refusal: RateLimitRefusal) -> Self {
+        PdsError::RateLimitExceeded {
+            retry_after: refusal.retry_after,
+        }
+    }
+}
+
+/// A rate-limit decision: the admitting bucket's state (`None` when rate
+/// limits are disabled), or the refusal.
+pub type Admission = Result<Option<RateLimitInfo>, RateLimitRefusal>;
 
 /// Rate limiter configuration
 #[derive(Debug, Clone)]
@@ -679,16 +736,16 @@ impl RateLimiter {
         for (path, limits) in endpoint_config.endpoints.iter() {
             let limiters: Vec<Arc<KeyedLimiter>> = limits
                 .iter()
-                .map(|limit| Arc::new(GovernorLimiter::keyed(limit.to_quota())))
+                .map(|limit| Arc::new(keyed_limiter(limit.to_quota())))
                 .collect();
             endpoint_limiters.insert(path.clone(), limiters);
         }
 
         Self {
-            authenticated: Arc::new(GovernorLimiter::keyed(auth_quota)),
-            unauthenticated: Arc::new(GovernorLimiter::keyed(unauth_quota)),
-            admin: Arc::new(GovernorLimiter::keyed(admin_quota)),
-            cross_pds: Arc::new(GovernorLimiter::keyed(cross_pds_quota)),
+            authenticated: Arc::new(keyed_limiter(auth_quota)),
+            unauthenticated: Arc::new(keyed_limiter(unauth_quota)),
+            admin: Arc::new(keyed_limiter(admin_quota)),
+            cross_pds: Arc::new(keyed_limiter(cross_pds_quota)),
             endpoint_limiters: Arc::new(endpoint_limiters),
             ip_limiter: Arc::new(GovernorLimiter::keyed(ip_quota)),
             trust_proxy: config.trust_proxy,
@@ -709,38 +766,46 @@ impl RateLimiter {
     }
 
     /// Take one request from `caller`'s bucket of `limiter`.
-    fn take(&self, limiter: &KeyedLimiter, kind: &str, caller: &CallerKey) -> PdsResult<()> {
+    fn take(&self, limiter: &KeyedLimiter, kind: &str, caller: &CallerKey) -> Admission {
         if !self.config.enabled {
-            return Ok(());
+            return Ok(None);
         }
         let bucket = caller.bucket();
         self.track_request(&format!("{kind}:{bucket}"));
         limiter
             .check_key(&bucket)
-            .map_err(|not_until| PdsError::RateLimitExceeded {
-                retry_after: retry_after(not_until),
-            })
+            .map(|snapshot| Some(RateLimitInfo::from_snapshot(&snapshot)))
+            .map_err(|not_until| RateLimitRefusal::from_not_until(&not_until))
+    }
+
+    /// Take one request from `caller`'s bucket of `tier`'s limiter.
+    fn admit_tier(&self, tier: Tier, caller: &CallerKey) -> Admission {
+        match tier {
+            Tier::Unauthenticated => self.take(&self.unauthenticated, "unauthenticated", caller),
+            Tier::Authenticated => self.take(&self.authenticated, "authenticated", caller),
+            Tier::Admin => self.take(&self.admin, "admin", caller),
+        }
     }
 
     /// Check rate limit for an authenticated caller: one bucket per account.
     pub fn check_authenticated(&self, caller: &CallerKey) -> PdsResult<()> {
-        self.take(&self.authenticated, "authenticated", caller)
+        self.admit_tier(Tier::Authenticated, caller).map(drop).map_err(PdsError::from)
     }
 
     /// Check rate limit for an unauthenticated caller: one bucket per address.
     pub fn check_unauthenticated(&self, caller: &CallerKey) -> PdsResult<()> {
-        self.take(&self.unauthenticated, "unauthenticated", caller)
+        self.admit_tier(Tier::Unauthenticated, caller).map(drop).map_err(PdsError::from)
     }
 
     /// Check rate limit for an admin caller: one bucket per account.
     pub fn check_admin(&self, caller: &CallerKey) -> PdsResult<()> {
-        self.take(&self.admin, "admin", caller)
+        self.admit_tier(Tier::Admin, caller).map(drop).map_err(PdsError::from)
     }
 
     /// Check rate limit for a cross-PDS authenticated caller (Phase 4): one
     /// bucket per caller, 10x stricter than local authenticated users.
     pub fn check_cross_pds(&self, caller: &CallerKey) -> PdsResult<()> {
-        self.take(&self.cross_pds, "cross_pds", caller)
+        self.take(&self.cross_pds, "cross_pds", caller).map(drop).map_err(PdsError::from)
     }
 
     /// Check rate limit for handle resolution (outbound HTTP/DNS requests)
@@ -832,28 +897,39 @@ impl RateLimiter {
     /// Each limit is counted per caller (#514), and a refusal carries the
     /// time until that caller's bucket has room again.
     pub fn check_endpoint(&self, endpoint: &str, caller: &CallerKey) -> Option<PdsResult<()>> {
-        if !self.config.enabled { return Some(Ok(())); }
+        self.admit_endpoint(endpoint, caller)
+            .map(|admission| admission.map(drop).map_err(PdsError::from))
+    }
+
+    /// [`Self::check_endpoint`], reporting the deciding bucket: the first
+    /// that refuses, or else the one with the fewest requests left.
+    fn admit_endpoint(&self, endpoint: &str, caller: &CallerKey) -> Option<Admission> {
+        if !self.config.enabled { return Some(Ok(None)); }
         let bucket = caller.bucket();
         self.endpoint_limiters.get(endpoint).map(|limiters| {
-            // Check ALL limiters - if any fail, return error
+            let mut tightest: Option<RateLimitInfo> = None;
             for limiter in limiters.iter() {
-                limiter
+                let snapshot = limiter
                     .check_key(&bucket)
-                    .map_err(|not_until| PdsError::RateLimitExceeded {
-                        retry_after: retry_after(not_until),
-                    })?;
+                    .map_err(|not_until| RateLimitRefusal::from_not_until(&not_until))?;
+                let info = RateLimitInfo::from_snapshot(&snapshot);
+                if tightest.as_ref().is_none_or(|t| info.remaining < t.remaining) {
+                    tightest = Some(info);
+                }
             }
-            Ok(())
+            Ok(tightest)
         })
     }
 
     /// Forget the buckets of callers that have been idle long enough to be
     /// full again, so per-caller state does not grow without bound.
     pub fn retain_recent(&self) {
-        for limiter in [&self.authenticated, &self.unauthenticated, &self.admin, &self.cross_pds, &self.ip_limiter] {
+        for limiter in [&self.authenticated, &self.unauthenticated, &self.admin, &self.cross_pds] {
             limiter.retain_recent();
             limiter.shrink_to_fit();
         }
+        self.ip_limiter.retain_recent();
+        self.ip_limiter.shrink_to_fit();
         for limiters in self.endpoint_limiters.values() {
             for limiter in limiters {
                 limiter.retain_recent();
@@ -965,44 +1041,6 @@ impl RateLimiter {
                 }
             })
             .or_insert((window_start, 1));
-    }
-
-    /// Get rate limit info for a specific limiter type
-    ///
-    /// Returns information about the rate limit (limit, remaining, reset) for use in response headers
-    pub fn get_limit_info(&self, identifier: &str, limiter_type: &str) -> RateLimitInfo {
-        let now = Self::current_timestamp();
-
-        // Get the appropriate limit based on limiter type
-        let limit = match limiter_type {
-            "authenticated" => self.config.authenticated_rps,
-            "unauthenticated" => self.config.unauthenticated_rps,
-            "admin" => self.config.admin_rps,
-            "cross_pds" => self.config.cross_pds_rps,
-            _ => self.config.unauthenticated_rps, // Default to most restrictive
-        };
-
-        // Get request count for current window
-        let (remaining, reset_seconds) = self
-            .request_counts
-            .get(identifier)
-            .map(|entry| {
-                let (window_start, count) = *entry;
-                if window_start == now {
-                    let remaining = limit.saturating_sub(count);
-                    (remaining, 1) // Resets in 1 second (per-second quota)
-                } else {
-                    // Old window, reset happened
-                    (limit, 1)
-                }
-            })
-            .unwrap_or((limit, 1)); // No requests yet, full limit available
-
-        RateLimitInfo {
-            limit,
-            remaining,
-            reset_seconds,
-        }
     }
 
     /// Get the current rate limit configuration
@@ -1126,16 +1164,6 @@ enum Tier {
     Unauthenticated,
     Authenticated,
     Admin,
-}
-
-impl Tier {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Unauthenticated => "unauthenticated",
-            Self::Authenticated => "authenticated",
-            Self::Admin => "admin",
-        }
-    }
 }
 
 /// How long a refused request's body is read and discarded so the 429
@@ -1281,44 +1309,39 @@ async fn limit(
         }
     }
 
-    // PRIORITY 1: the endpoint's own limits, else the tier's.
-    let result = ctx
+    // PRIORITY 1: the endpoint's own limits, else the tier's. The headers
+    // describe whichever bucket decided (#527: a blob download reported the
+    // tier's 10/s while its own 100/s bucket admitted it).
+    let admission = ctx
         .rate_limiter
-        .check_endpoint(&path, &caller)
-        .unwrap_or_else(|| match tier {
-            Tier::Admin => ctx.rate_limiter.check_admin(&caller),
-            Tier::Authenticated => ctx.rate_limiter.check_authenticated(&caller),
-            Tier::Unauthenticated => ctx.rate_limiter.check_unauthenticated(&caller),
-        });
-    let identifier = format!("{}:{}", tier.name(), caller.bucket());
-    let info = ctx.rate_limiter.get_limit_info(&identifier, tier.name());
+        .admit_endpoint(&path, &caller)
+        .unwrap_or_else(|| ctx.rate_limiter.admit_tier(tier, &caller));
 
-    match result {
-        Ok(()) => {
+    match admission {
+        Ok(info) => {
             let mut response = next.run(request).await;
-            let headers = response.headers_mut();
-            // Standard headers (draft-polli-ratelimit-headers), then the
-            // legacy X- forms.
-            for (name, value) in [
-                ("RateLimit-Limit", info.limit.to_string()),
-                ("RateLimit-Remaining", info.remaining.to_string()),
-                ("RateLimit-Reset", info.reset_seconds.to_string()),
-                ("X-RateLimit-Limit", info.limit.to_string()),
-                ("X-RateLimit-Remaining", info.remaining.to_string()),
-                ("X-RateLimit-Reset", info.reset_seconds.to_string()),
-            ] {
-                if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
-                    headers.insert(name, value);
-                }
+            if let Some(info) = info {
+                insert_rate_limit_headers(response.headers_mut(), &info);
             }
             response
         }
-        Err(PdsError::RateLimitExceeded { retry_after }) => {
-            refuse(request, retry_after, info.limit).await
-        }
-        Err(other) => {
-            tracing::error!(error = %other, "rate limiter failed");
-            refuse(request, Duration::from_secs(60), info.limit).await
+        Err(refusal) => refuse(request, refusal.retry_after, refusal.limit).await,
+    }
+}
+
+/// The admitting bucket's state as response headers: the standard forms
+/// (draft-polli-ratelimit-headers), then the legacy `X-` ones.
+fn insert_rate_limit_headers(headers: &mut axum::http::HeaderMap, info: &RateLimitInfo) {
+    for (name, value) in [
+        ("RateLimit-Limit", info.limit.to_string()),
+        ("RateLimit-Remaining", info.remaining.to_string()),
+        ("RateLimit-Reset", info.reset_seconds.to_string()),
+        ("X-RateLimit-Limit", info.limit.to_string()),
+        ("X-RateLimit-Remaining", info.remaining.to_string()),
+        ("X-RateLimit-Reset", info.reset_seconds.to_string()),
+    ] {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
         }
     }
 }
@@ -1992,6 +2015,59 @@ mod tests {
         // `/blob/:cid` is a separate bucket, and the general budget is untouched.
         assert!(limiter.check_endpoint(BLOB_ROUTE_PREFIX, &viewer).unwrap().is_ok());
         assert!(limiter.check_unauthenticated(&viewer).is_ok());
+    }
+
+    /// The headers of a blob download describe the blob bucket (burst 200),
+    /// not the general unauthenticated one (burst 10) it never touches.
+    #[test]
+    fn blob_admissions_report_the_blob_bucket() {
+        let limiter = RateLimiter::with_bluesky_defaults(RateLimitConfig::default());
+        let viewer = CallerKey::Address(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)));
+
+        let blob = limiter.admit_endpoint(BLOB_DOWNLOAD_PATH, &viewer).unwrap();
+        assert_eq!(
+            blob,
+            Ok(Some(RateLimitInfo { limit: 200, remaining: 199, reset_seconds: 1 }))
+        );
+        let general = limiter.admit_tier(Tier::Unauthenticated, &viewer).unwrap().unwrap();
+        assert_eq!(general.limit, 10);
+        assert_eq!(general.remaining, 9);
+    }
+
+    /// With several limits on an endpoint, the headers describe the one with
+    /// the fewest requests left, and a refusal names the bucket that refused.
+    #[test]
+    fn endpoint_admissions_report_the_tightest_bucket() {
+        let mut endpoints = EndpointRateLimitConfig::new();
+        endpoints.add_limit("/xrpc/test.two", EndpointRateLimit::new(10, 60));
+        endpoints.add_limit("/xrpc/test.two", EndpointRateLimit::new(3, 60));
+        let limiter = RateLimiter::with_endpoint_config(RateLimitConfig::default(), endpoints);
+
+        let first = limiter.admit_endpoint("/xrpc/test.two", &caller()).unwrap();
+        // The 3-per-minute bucket refills one request every 20 seconds.
+        assert_eq!(
+            first,
+            Ok(Some(RateLimitInfo { limit: 3, remaining: 2, reset_seconds: 20 }))
+        );
+        for _ in 0..2 {
+            assert!(limiter.admit_endpoint("/xrpc/test.two", &caller()).unwrap().is_ok());
+        }
+        let refusal = limiter
+            .admit_endpoint("/xrpc/test.two", &caller())
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(refusal.limit, 3);
+        assert!(refusal.retry_after >= Duration::from_secs(1));
+        assert!(refusal.retry_after <= Duration::from_secs(20));
+    }
+
+    /// With rate limits off nothing is counted, so there is no state to report.
+    #[test]
+    fn disabled_admissions_report_nothing() {
+        let config = RateLimitConfig { enabled: false, ..RateLimitConfig::default() };
+        let limiter = RateLimiter::with_bluesky_defaults(config);
+        assert_eq!(limiter.admit_endpoint(BLOB_DOWNLOAD_PATH, &caller()), Some(Ok(None)));
+        assert_eq!(limiter.admit_tier(Tier::Authenticated, &caller()), Ok(None));
     }
 
     #[test]
