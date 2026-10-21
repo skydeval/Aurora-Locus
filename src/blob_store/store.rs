@@ -503,6 +503,42 @@ impl BlobStore {
         }
     }
 
+    /// A blob's size in bytes and media type, without reading it (#532):
+    /// from its upload record, else from storage as
+    /// `application/octet-stream`, as [`Self::get`] does. `None` when
+    /// neither knows it.
+    ///
+    /// # Errors
+    ///
+    /// A database or storage failure.
+    pub async fn describe(&self, cid: &str) -> PdsResult<Option<(u64, String)>> {
+        if let Some(metadata) = self.get_metadata(cid).await? {
+            let size = u64::try_from(metadata.size).map_err(|_| {
+                PdsError::BlobStorage(format!("blob {cid} records a negative size"))
+            })?;
+            return Ok(Some((size, metadata.mime_type)));
+        }
+        Ok(self
+            .backend
+            .size(cid)
+            .await?
+            .map(|size| (size, "application/octet-stream".to_string())))
+    }
+
+    /// Open a blob's bytes, or the bytes in `range`, for streaming (#532).
+    /// `None` when the blob is not stored.
+    ///
+    /// # Errors
+    ///
+    /// A storage failure.
+    pub async fn open(
+        &self,
+        cid: &str,
+        range: Option<super::BlobRange>,
+    ) -> PdsResult<Option<super::BlobStream>> {
+        self.backend.open(cid, range).await
+    }
+
     /// Delete a blob
     pub async fn delete(&self, cid: &str) -> PdsResult<()> {
         // Delete from backend
