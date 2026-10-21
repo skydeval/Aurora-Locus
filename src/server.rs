@@ -20,7 +20,7 @@ use axum::{
     Router,
 };
 use tower_http::{
-    compression::CompressionLayer,
+    compression::{predicate::DefaultPredicate, CompressionLayer, Predicate},
     cors::{AllowHeaders, Any, CorsLayer},
     services::ServeDir,
     trace::TraceLayer,
@@ -54,20 +54,43 @@ fn no_store(mut resp: Response) -> Response {
 /// cross-origin callers (#469). `atproto-content-labelers` /
 /// `atproto-repo-rev` come back from proxied app.bsky calls, `dpop-nonce` and
 /// `www-authenticate` drive the OAuth DPoP retry, `retry-after` (#514)
-/// with the `ratelimit-*` family lets clients back off, and `content-range`
-/// lets script-driven media players read blob byte ranges.
-const CORS_EXPOSED_HEADERS: [&str; 10] = [
+/// with the `ratelimit-*` family lets clients back off, and `content-range`,
+/// `accept-ranges` and `content-length` let script-driven media players read
+/// blob byte ranges (#531).
+const CORS_EXPOSED_HEADERS: [&str; 12] = [
     "atproto-content-labelers",
     "atproto-repo-rev",
     "dpop-nonce",
     "www-authenticate",
     "retry-after",
     "content-range",
+    "accept-ranges",
+    "content-length",
     "ratelimit-limit",
     "ratelimit-remaining",
     "ratelimit-reset",
     "ratelimit-policy",
 ];
+
+/// Whether a response may be compressed: not when it advertises byte ranges
+/// (blobs, #526). Compressing one drops its `Accept-Ranges` and
+/// `Content-Length`, so a browser cannot seek a video, and re-encodes the
+/// whole blob on every download; the reverse proxy in front asks for gzip by
+/// default, so this happened to every full blob download (#531).
+fn not_ranged(
+    _: StatusCode,
+    _: axum::http::Version,
+    headers: &header::HeaderMap,
+    _: &axum::http::Extensions,
+) -> bool {
+    !headers.contains_key(header::ACCEPT_RANGES)
+}
+
+/// Response compression: tower-http's defaults, except for responses that
+/// advertise byte ranges ([`not_ranged`]).
+fn compression() -> CompressionLayer<impl tower_http::compression::Predicate> {
+    CompressionLayer::new().compress_when(DefaultPredicate::new().and(not_ranged))
+}
 
 /// CORS for the XRPC surface, matching the reference PDS (#469): any origin,
 /// any requested header (reflected, so `atproto-proxy`,
@@ -231,7 +254,7 @@ pub fn build_router(ctx: AppContext, api_router: Router<AppContext>) -> Router {
         // sees all of them.
         .layer(middleware::from_fn(www_authenticate_on_unauthorized))
         .layer(cors)
-        .layer(CompressionLayer::new())
+        .layer(compression())
         .layer(TraceLayer::new_for_http())
     // No `.fallback` here: the API router's fallback (the XRPC service proxy,
     // #471, with a JSON 404 for everything else) must not be overridden.
@@ -477,6 +500,64 @@ mod cors_tests {
         for name in super::CORS_EXPOSED_HEADERS {
             assert!(exposed.contains(name), "{name} not exposed: {exposed}");
         }
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    //! #531: a ranged blob response reaches the client whole, with its
+    //! `Accept-Ranges` and `Content-Length`, even when gzip is accepted;
+    //! other responses are still compressed.
+    use super::compression;
+    use axum::body::Body;
+    use axum::http::{header, HeaderMap, Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    const VIDEO_CID: &str = "bafkreivideo";
+
+    fn app() -> Router {
+        Router::new()
+            .route(
+                "/blob",
+                get(|headers: HeaderMap| async move {
+                    let video = vec![7u8; 64 * 1024];
+                    crate::api::blob::blob_bytes_response(video, "video/mp4", VIDEO_CID, &headers)
+                }),
+            )
+            .route("/json", get(|| async { "{\"items\": [] }".repeat(200) }))
+            .layer(compression())
+    }
+
+    async fn gzip_accepted(uri: &str, range: Option<&str>) -> axum::response::Response {
+        let mut request = Request::builder().uri(uri).header(header::ACCEPT_ENCODING, "gzip");
+        if let Some(range) = range {
+            request = request.header(header::RANGE, range);
+        }
+        app().oneshot(request.body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn ranged_blob_responses_are_not_compressed() {
+        for (range, status, length) in [
+            (None, StatusCode::OK, "65536"),
+            (Some("bytes=0-1023"), StatusCode::PARTIAL_CONTENT, "1024"),
+        ] {
+            let resp = gzip_accepted("/blob", range).await;
+            assert_eq!(resp.status(), status);
+            let h = resp.headers();
+            assert!(h.get(header::CONTENT_ENCODING).is_none(), "{range:?} was compressed");
+            assert_eq!(h.get(header::ACCEPT_RANGES).unwrap(), "bytes", "{range:?}");
+            assert_eq!(h.get(header::CONTENT_LENGTH).unwrap(), length, "{range:?}");
+            assert_eq!(h.get(header::CONTENT_TYPE).unwrap(), "video/mp4", "{range:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn other_responses_are_still_compressed() {
+        let resp = gzip_accepted("/json", None).await;
+        assert_eq!(resp.headers().get(header::CONTENT_ENCODING).unwrap(), "gzip");
     }
 }
 
