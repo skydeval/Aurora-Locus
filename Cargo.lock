@@ -3380,9 +3380,9 @@ dependencies = [
 
 [[package]]
 name = "kryphocron"
-version = "0.3.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa78bf192e7e641385e84971a1d3560c4c989c8fb3be3b4377127d05b948245b"
+checksum = "fc740fb7de4c46a7f859dfb4b1500d2c2ef63ca737ca56e9350cc2cfa12f91d7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3393,7 +3393,9 @@ dependencies = [
  "getrandom 0.2.16",
  "hex",
  "hkdf",
+ "k256",
  "kryphocron-lexicons",
+ "p256 0.13.2",
  "ruzstd",
  "serde_json",
  "sha2",
