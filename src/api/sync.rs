@@ -294,17 +294,10 @@ pub async fn get_blob(
     {
         return Err(PdsError::BlobNotFound(params.cid.clone()));
     }
-    let (data, mime_type) = ctx
-        .blob_store
-        .get(&params.cid)
-        .await?
-        .ok_or_else(|| PdsError::BlobNotFound(params.cid.clone()))?;
-
-    // Byte ranges, ETag and 304 as on `/blob/:cid`: video players need
-    // ranges to play and seek, and private videos play from here. Security
-    // headers as on the reference PDS.
-    let mut response =
-        crate::api::blob::blob_bytes_response(data, &mime_type, &params.cid, &headers);
+    // Byte ranges, ETag and 304 as on `/blob/:cid`, streamed from storage
+    // (#532): video players need ranges to play and seek, and private videos
+    // play from here. Security headers as on the reference PDS.
+    let mut response = crate::api::blob::serve_blob(&ctx.blob_store, &params.cid, &headers).await?;
     let response_headers = response.headers_mut();
     response_headers.insert(
         header::HeaderName::from_static("x-content-type-options"),

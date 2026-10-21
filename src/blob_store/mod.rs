@@ -23,7 +23,48 @@ pub use store::{BlobStore, BlobStoreConfig, UnreferenceOutcome};
 
 use crate::error::PdsResult;
 use async_trait::async_trait;
+use axum::body::Bytes;
 use std::path::PathBuf;
+use std::pin::Pin;
+
+/// A blob's bytes, read from storage as they are sent (#532).
+pub type BlobStream = Pin<Box<dyn futures::Stream<Item = std::io::Result<Bytes>> + Send>>;
+
+/// The bytes `start..=end` of a blob, both inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobRange {
+    /// The first byte.
+    pub start: u64,
+    /// The last byte.
+    pub end: u64,
+}
+
+impl BlobRange {
+    /// How many bytes the range holds.
+    pub fn byte_count(&self) -> u64 {
+        self.end - self.start + 1
+    }
+}
+
+/// How much is read from storage at a time while streaming.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// `reader`'s bytes as a [`BlobStream`], [`STREAM_CHUNK`] at a time.
+pub(crate) fn reader_stream<R>(reader: R) -> BlobStream
+where
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    Box::pin(futures::stream::try_unfold(reader, |mut reader| async move {
+        let mut chunk = vec![0u8; STREAM_CHUNK];
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        chunk.truncate(read);
+        Ok(Some((Bytes::from(chunk), reader)))
+    }))
+}
 
 /// A page of blobs from a paginated storage walk.
 ///
@@ -72,8 +113,34 @@ pub trait BlobBackend: Send + Sync {
     async fn exists(&self, cid: &str) -> PdsResult<bool>;
 
     /// Get the size of a blob in bytes
-    #[allow(dead_code)] // Trait method for future blob backends
     async fn size(&self, cid: &str) -> PdsResult<Option<u64>>;
+
+    /// Open a blob for streaming: the bytes in `range`, or all of them
+    /// (#532). `None` when the blob is not stored. `range` must lie inside
+    /// the blob.
+    ///
+    /// The default reads the whole blob with [`Self::get`] and sends the
+    /// range of it; the disk and S3 backends read only the range, as it is
+    /// sent.
+    async fn open(&self, cid: &str, range: Option<BlobRange>) -> PdsResult<Option<BlobStream>> {
+        let Some(data) = self.get(cid).await? else {
+            return Ok(None);
+        };
+        let bytes = match range {
+            None => Bytes::from(data),
+            Some(range) => {
+                let (start, end) = (to_index(range.start)?, to_index(range.end)?);
+                if start > end || end >= data.len() {
+                    return Err(crate::error::PdsError::BlobStorage(format!(
+                        "range {start}-{end} outside blob {cid} of {} bytes",
+                        data.len()
+                    )));
+                }
+                Bytes::from(data).slice(start..=end)
+            }
+        };
+        Ok(Some(Box::pin(futures::stream::iter([Ok(bytes)]))))
+    }
 
     /// List blobs in storage, paginated.
     ///
@@ -121,6 +188,12 @@ pub trait BlobBackend: Send + Sync {
     async fn fsync(&self, _cid: &str) -> PdsResult<()> {
         Ok(())
     }
+}
+
+/// A byte offset as an index into memory.
+fn to_index(offset: u64) -> PdsResult<usize> {
+    usize::try_from(offset)
+        .map_err(|_| crate::error::PdsError::BlobStorage(format!("byte offset {offset} out of range")))
 }
 
 /// Configuration for blob storage

@@ -1,6 +1,6 @@
 /// Disk-based blob storage backend
 use crate::{
-    blob_store::{BlobBackend, BlobListEntry, BlobListPage},
+    blob_store::{reader_stream, BlobBackend, BlobListEntry, BlobListPage, BlobRange, BlobStream},
     error::{PdsError, PdsResult},
 };
 use async_trait::async_trait;
@@ -105,6 +105,25 @@ impl BlobBackend for DiskBlobBackend {
                 cid, e
             ))),
         }
+    }
+
+    /// Opens the file and, for a range, seeks to its start and reads no
+    /// further than its end, so only the range is read and nothing is held
+    /// beyond one chunk (#532).
+    async fn open(&self, cid: &str, range: Option<BlobRange>) -> PdsResult<Option<BlobStream>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let blob_path = self.get_blob_path(cid);
+        let failed = |e: std::io::Error| PdsError::BlobStorage(format!("Failed to read blob {cid}: {e}"));
+        let mut file = match fs::File::open(&blob_path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(failed(e)),
+        };
+        let Some(range) = range else {
+            return Ok(Some(reader_stream(file)));
+        };
+        file.seek(std::io::SeekFrom::Start(range.start)).await.map_err(failed)?;
+        Ok(Some(reader_stream(file.take(range.byte_count()))))
     }
 
     async fn delete(&self, cid: &str) -> PdsResult<()> {
@@ -319,7 +338,42 @@ fn system_time_to_datetime(t: SystemTime) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::TryStreamExt;
     use tempfile::tempdir;
+
+    async fn read_all(stream: BlobStream) -> Vec<u8> {
+        stream
+            .try_fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                Ok(bytes)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// #532: the whole blob streams in chunks, a range reads exactly its
+    /// bytes (across chunk boundaries), and a missing blob is `None`.
+    #[tokio::test]
+    async fn open_streams_the_blob_or_a_range_of_it() {
+        let dir = tempdir().unwrap();
+        let backend = DiskBlobBackend::new(dir.path().to_path_buf());
+        let data: Vec<u8> = (0..=255u8).cycle().take(300_000).collect();
+        backend.put("bafkreistream", data.clone(), "video/mp4").await.unwrap();
+
+        let whole = backend.open("bafkreistream", None).await.unwrap().unwrap();
+        assert_eq!(read_all(whole).await, data);
+
+        for (start, end) in [(0, 0), (65_535, 65_536), (100_001, 299_999), (299_999, 299_999)] {
+            let part = backend
+                .open("bafkreistream", Some(BlobRange { start, end }))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(read_all(part).await, data[start as usize..=end as usize], "{start}-{end}");
+        }
+
+        assert!(backend.open("bafkreimissing", None).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn test_put_and_get_blob() {

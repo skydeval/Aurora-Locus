@@ -5,7 +5,7 @@
 //! Phase 3 (#73) added the `force_path_style` and `upload_timeout_ms`
 //! parity knobs and exposed `prefix` via env var.
 
-use crate::blob_store::{BlobBackend, BlobListEntry, BlobListPage};
+use crate::blob_store::{BlobBackend, BlobListEntry, BlobListPage, BlobRange, BlobStream};
 use crate::error::{PdsError, PdsResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -216,6 +216,38 @@ impl BlobBackend for S3BlobBackend {
                     Ok(None)
                 } else {
                     error!("Failed to download blob from S3: {}", e);
+                    Err(PdsError::Internal(format!("S3 download failed: {}", e)))
+                }
+            }
+        }
+    }
+
+    /// A ranged `GetObject` for a range, streamed as the object body arrives,
+    /// so neither the blob nor the range is held in memory (#532).
+    async fn open(&self, cid: &str, range: Option<BlobRange>) -> PdsResult<Option<BlobStream>> {
+        let key = self.get_key(cid);
+        let mut request = self.client.get_object().bucket(&self.bucket).key(&key);
+        if let Some(range) = range {
+            request = request.range(format!("bytes={}-{}", range.start, range.end));
+        }
+        match request.send().await {
+            Ok(response) => Ok(Some(Box::pin(futures::stream::try_unfold(
+                response.body,
+                |mut body| async move {
+                    match body.next().await {
+                        None => Ok(None),
+                        Some(Ok(chunk)) => Ok(Some((chunk, body))),
+                        Some(Err(e)) => Err(std::io::Error::other(e)),
+                    }
+                },
+            )))),
+            Err(e) => {
+                let error_msg = format!("{:?}", e);
+                if error_msg.contains("NoSuchKey") || error_msg.contains("NotFound") {
+                    debug!("Blob not found in S3: {}", key);
+                    Ok(None)
+                } else {
+                    error!("Failed to open blob in S3: {}", e);
                     Err(PdsError::Internal(format!("S3 download failed: {}", e)))
                 }
             }

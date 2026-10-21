@@ -1,7 +1,7 @@
 /// com.atproto.repo.uploadBlob and blob serving endpoints
 use crate::{
     api::middleware,
-    blob_store::BlobUploadResponse,
+    blob_store::{BlobRange, BlobUploadResponse},
     context::AppContext,
     error::{PdsError, PdsResult},
 };
@@ -243,15 +243,7 @@ async fn get_blob(
         return Err(PdsError::BlobNotFound(cid));
     }
 
-    // Get blob from store
-    let blob_data = ctx
-        .blob_store
-        .get(&cid)
-        .await?
-        .ok_or_else(|| PdsError::BlobNotFound(cid.clone()))?;
-
-    let (data, mime_type) = blob_data;
-    let mut response = blob_bytes_response(data, &mime_type, &cid, &headers);
+    let mut response = serve_blob(&ctx.blob_store, &cid, &headers).await?;
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static(BLOB_CACHE_CONTROL),
@@ -266,7 +258,7 @@ pub(crate) enum ByteRange {
     /// unit, or several ranges are ignored, as RFC 9110 allows.
     Full,
     /// Serve bytes `start..=end`.
-    Partial { start: usize, end: usize },
+    Partial { start: u64, end: u64 },
     /// A well-formed range wholly outside the blob: answer 416.
     Unsatisfiable,
 }
@@ -274,7 +266,7 @@ pub(crate) enum ByteRange {
 /// Interpret a `Range` header for a blob of `total` bytes (RFC 9110 §14):
 /// `bytes=a-b` (end clamped to the blob), `bytes=a-`, and the suffix form
 /// `bytes=-n` (the last `n` bytes).
-pub(crate) fn byte_range(header: &str, total: usize) -> ByteRange {
+pub(crate) fn byte_range(header: &str, total: u64) -> ByteRange {
     let Some(spec) = header.trim().strip_prefix("bytes=") else {
         return ByteRange::Full;
     };
@@ -284,7 +276,7 @@ pub(crate) fn byte_range(header: &str, total: usize) -> ByteRange {
     let Some((first, last)) = spec.trim().split_once('-') else {
         return ByteRange::Full;
     };
-    let parse = |s: &str| s.trim().parse::<usize>().ok();
+    let parse = |s: &str| s.trim().parse::<u64>().ok();
     match (first.trim().is_empty(), last.trim().is_empty()) {
         // Suffix: the last `n` bytes.
         (true, false) => match parse(last) {
@@ -314,55 +306,105 @@ pub(crate) fn byte_range(header: &str, total: usize) -> ByteRange {
     }
 }
 
-/// The response serving a blob's bytes, shared by `/blob/:cid` and
-/// `com.atproto.sync.getBlob`: an ETag of the CID (a matching
-/// `If-None-Match` answers 304), `Accept-Ranges: bytes`, and byte ranges
-/// (206 with `Content-Range`, or 416 with `Content-Range: bytes */size`).
-/// An `If-Range` naming another ETag gets the whole blob. Callers add their
-/// own cache and security headers.
-pub(crate) fn blob_bytes_response(
-    data: Vec<u8>,
-    mime_type: &str,
-    cid: &str,
-    request: &HeaderMap,
-) -> Response {
-    let etag = format!("\"{cid}\"");
-    let total = data.len();
-    let header_str = |name| request.get(name).and_then(|v: &header::HeaderValue| v.to_str().ok());
+/// How a blob request is answered, decided from the blob's size and the
+/// request's headers before any of its bytes are read (#532).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlobReply {
+    /// 304: the copy the client holds (`If-None-Match`) is current.
+    NotModified,
+    /// 200 with the whole blob.
+    Whole,
+    /// 206 with these bytes.
+    Part(BlobRange),
+    /// 416: the range asked for lies outside the blob.
+    Unsatisfiable,
+}
 
+/// The answer to a request for blob `cid` of `total` bytes. The ETag is the
+/// CID, so a matching `If-None-Match` is a 304. A `Range` is honoured unless
+/// an `If-Range` names another ETag, which gets the whole blob.
+pub(crate) fn blob_reply(cid: &str, total: u64, request: &HeaderMap) -> BlobReply {
+    let etag = format!("\"{cid}\"");
+    let header_str = |name| request.get(name).and_then(|v: &header::HeaderValue| v.to_str().ok());
+    if header_str(header::IF_NONE_MATCH) == Some(etag.as_str()) {
+        return BlobReply::NotModified;
+    }
+    match header_str(header::RANGE) {
+        Some(range) if header_str(header::IF_RANGE).is_none_or(|v| v == etag) => {
+            match byte_range(range, total) {
+                ByteRange::Full => BlobReply::Whole,
+                ByteRange::Partial { start, end } => BlobReply::Part(BlobRange { start, end }),
+                ByteRange::Unsatisfiable => BlobReply::Unsatisfiable,
+            }
+        }
+        _ => BlobReply::Whole,
+    }
+}
+
+/// The response for `reply` about blob `cid` of `total` bytes and type
+/// `mime_type`, with `body` holding the bytes it sends (the whole blob, or
+/// the part; ignored for a 304 or 416). Every answer carries the ETag and
+/// `Accept-Ranges: bytes`; callers add their own cache and security headers.
+pub(crate) fn blob_response(
+    reply: BlobReply,
+    cid: &str,
+    total: u64,
+    mime_type: &str,
+    body: axum::body::Body,
+) -> Response {
     let base = |status: StatusCode| {
         Response::builder()
             .status(status)
-            .header(header::ETAG, &etag)
+            .header(header::ETAG, format!("\"{cid}\""))
             .header(header::ACCEPT_RANGES, "bytes")
     };
-    if header_str(header::IF_NONE_MATCH) == Some(etag.as_str()) {
-        return base(StatusCode::NOT_MODIFIED)
-            .body(axum::body::Body::empty())
-            .expect("static response parts are valid");
-    }
-
-    let range = match header_str(header::RANGE) {
-        Some(range) if header_str(header::IF_RANGE).is_none_or(|v| v == etag) => {
-            byte_range(range, total)
-        }
-        _ => ByteRange::Full,
-    };
-    let response = match range {
-        ByteRange::Full => base(StatusCode::OK)
+    let response = match reply {
+        BlobReply::NotModified => base(StatusCode::NOT_MODIFIED).body(axum::body::Body::empty()),
+        BlobReply::Whole => base(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime_type)
             .header(header::CONTENT_LENGTH, total)
-            .body(axum::body::Body::from(data)),
-        ByteRange::Partial { start, end } => base(StatusCode::PARTIAL_CONTENT)
+            .body(body),
+        BlobReply::Part(range) => base(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, mime_type)
-            .header(header::CONTENT_LENGTH, end - start + 1)
-            .header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"))
-            .body(axum::body::Body::from(data[start..=end].to_vec())),
-        ByteRange::Unsatisfiable => base(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_LENGTH, range.byte_count())
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{total}", range.start, range.end))
+            .body(body),
+        BlobReply::Unsatisfiable => base(StatusCode::RANGE_NOT_SATISFIABLE)
             .header(header::CONTENT_RANGE, format!("bytes */{total}"))
             .body(axum::body::Body::empty()),
     };
     response.expect("blob response parts are valid")
+}
+
+/// Serve blob `cid` from `store` to a request with `request` headers, for
+/// `/blob/:cid` and `com.atproto.sync.getBlob`. Its bytes are streamed from
+/// storage, and for a range only the range is read, so a request never holds
+/// the blob in memory (#532).
+///
+/// # Errors
+///
+/// [`PdsError::BlobNotFound`] when the blob is not stored; a storage or
+/// database failure.
+pub(crate) async fn serve_blob(
+    store: &crate::blob_store::BlobStore,
+    cid: &str,
+    request: &HeaderMap,
+) -> PdsResult<Response> {
+    let not_found = || PdsError::BlobNotFound(cid.to_string());
+    let (total, mime_type) = store.describe(cid).await?.ok_or_else(not_found)?;
+    let reply = blob_reply(cid, total, request);
+    let read = match reply {
+        BlobReply::Whole => Some(None),
+        BlobReply::Part(range) => Some(Some(range)),
+        BlobReply::NotModified | BlobReply::Unsatisfiable => None,
+    };
+    let body = match read {
+        Some(range) => {
+            axum::body::Body::from_stream(store.open(cid, range).await?.ok_or_else(not_found)?)
+        }
+        None => axum::body::Body::empty(),
+    };
+    Ok(blob_response(reply, cid, total, &mime_type, body))
 }
 
 #[cfg(test)]
@@ -422,7 +464,7 @@ mod tests {
         assert_eq!(media_type(" ; charset=x"), None);
     }
 
-    fn partial(start: usize, end: usize) -> ByteRange {
+    fn partial(start: u64, end: u64) -> ByteRange {
         ByteRange::Partial { start, end }
     }
 
@@ -464,45 +506,79 @@ mod tests {
         headers
     }
 
-    /// The response a player needs: 206 with Content-Range for a range,
-    /// 416 outside the blob, 304 for a cached copy, and the whole blob when
+    /// The answer is decided from the size and headers alone: a range, 416
+    /// outside the blob, 304 for a current copy, and the whole blob when
     /// If-Range names another version.
-    #[tokio::test]
-    async fn the_blob_response_serves_ranges() {
-        let data: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    #[test]
+    fn blob_replies_follow_the_request_headers() {
         let cid = "bafkreitest";
+        let reply = |pairs: &[(header::HeaderName, &str)]| blob_reply(cid, 1000, &with(pairs));
+        assert_eq!(reply(&[]), BlobReply::Whole);
+        assert_eq!(
+            reply(&[(header::RANGE, "bytes=10-19")]),
+            BlobReply::Part(BlobRange { start: 10, end: 19 })
+        );
+        assert_eq!(reply(&[(header::RANGE, "bytes=5000-")]), BlobReply::Unsatisfiable);
+        assert_eq!(reply(&[(header::IF_NONE_MATCH, "\"bafkreitest\"")]), BlobReply::NotModified);
+        assert_eq!(
+            reply(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"other\"")]),
+            BlobReply::Whole,
+            "If-Range for another version gets the whole blob"
+        );
+        assert_eq!(
+            reply(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"bafkreitest\"")]),
+            BlobReply::Part(BlobRange { start: 0, end: 9 })
+        );
+    }
 
-        let full = blob_bytes_response(data.clone(), "video/mp4", cid, &HeaderMap::new());
+    /// The response a player needs, streamed from a stored blob (#532): the
+    /// whole blob with its length, 206 with Content-Range and exactly the
+    /// range's bytes, 416 outside the blob, 304 for a current copy, and
+    /// BlobNotFound for a blob that is not stored.
+    #[tokio::test]
+    async fn stored_blobs_are_served_whole_and_in_ranges() {
+        let ctx = crate::api::federation_peers::test_support::create_test_context_with(|_| {}).await;
+        let data: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+        let blob = ctx
+            .blob_store
+            .upload(data.clone(), Some("video/mp4"), "did:plc:streamer")
+            .await
+            .unwrap();
+        let cid = blob.r#ref.link.clone();
+        let serve = |pairs: &[(header::HeaderName, &str)]| {
+            let headers = with(pairs);
+            let store = ctx.blob_store.clone();
+            let cid = cid.clone();
+            async move { serve_blob(&store, &cid, &headers).await }
+        };
+
+        let full = serve(&[]).await.unwrap();
         assert_eq!(full.status(), StatusCode::OK);
+        assert_eq!(full.headers()[header::CONTENT_TYPE], blob.mime_type.as_str());
+        assert_eq!(full.headers()[header::CONTENT_LENGTH], "200000");
         assert_eq!(full.headers()[header::ACCEPT_RANGES], "bytes");
         assert_eq!(body_of(full).await, data);
 
-        let part = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::RANGE, "bytes=10-19")]));
+        // Spans several streamed chunks, starting mid-chunk.
+        let part = serve(&[(header::RANGE, "bytes=70000-150009")]).await.unwrap();
         assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 10-19/1000");
-        assert_eq!(part.headers()[header::CONTENT_LENGTH], "10");
-        assert_eq!(body_of(part).await, data[10..20].to_vec());
+        assert_eq!(part.headers()[header::CONTENT_RANGE], "bytes 70000-150009/200000");
+        assert_eq!(part.headers()[header::CONTENT_LENGTH], "80010");
+        assert_eq!(body_of(part).await, data[70000..=150009].to_vec());
 
-        let out = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::RANGE, "bytes=5000-")]));
+        let tail = serve(&[(header::RANGE, "bytes=-10")]).await.unwrap();
+        assert_eq!(body_of(tail).await, data[199_990..].to_vec());
+
+        let out = serve(&[(header::RANGE, "bytes=200000-")]).await.unwrap();
         assert_eq!(out.status(), StatusCode::RANGE_NOT_SATISFIABLE);
-        assert_eq!(out.headers()[header::CONTENT_RANGE], "bytes */1000");
+        assert_eq!(out.headers()[header::CONTENT_RANGE], "bytes */200000");
+        assert!(body_of(out).await.is_empty());
 
-        let cached = blob_bytes_response(data.clone(), "video/mp4", cid, &with(&[(header::IF_NONE_MATCH, "\"bafkreitest\"")]));
+        let etag = format!("\"{cid}\"");
+        let cached = serve(&[(header::IF_NONE_MATCH, etag.as_str())]).await.unwrap();
         assert_eq!(cached.status(), StatusCode::NOT_MODIFIED);
 
-        let stale = blob_bytes_response(
-            data.clone(),
-            "video/mp4",
-            cid,
-            &with(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"other\"")]),
-        );
-        assert_eq!(stale.status(), StatusCode::OK, "If-Range for another version gets the whole blob");
-        let fresh = blob_bytes_response(
-            data,
-            "video/mp4",
-            cid,
-            &with(&[(header::RANGE, "bytes=0-9"), (header::IF_RANGE, "\"bafkreitest\"")]),
-        );
-        assert_eq!(fresh.status(), StatusCode::PARTIAL_CONTENT);
+        let missing = serve_blob(&ctx.blob_store, "bafkreimissing", &HeaderMap::new()).await;
+        assert!(matches!(missing, Err(PdsError::BlobNotFound(_))));
     }
 }

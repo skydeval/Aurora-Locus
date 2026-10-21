@@ -522,8 +522,16 @@ mod compression_tests {
             .route(
                 "/blob",
                 get(|headers: HeaderMap| async move {
+                    use crate::api::blob::{blob_reply, blob_response};
                     let video = vec![7u8; 64 * 1024];
-                    crate::api::blob::blob_bytes_response(video, "video/mp4", VIDEO_CID, &headers)
+                    let reply = blob_reply(VIDEO_CID, 65536, &headers);
+                    let body = match reply {
+                        crate::api::blob::BlobReply::Part(range) => {
+                            video[range.start as usize..=range.end as usize].to_vec()
+                        }
+                        _ => video,
+                    };
+                    blob_response(reply, VIDEO_CID, 65536, "video/mp4", Body::from(body))
                 }),
             )
             .route("/json", get(|| async { "{\"items\": [] }".repeat(200) }))
