@@ -46,6 +46,7 @@ use kryphocron::audit::{AuditError, UserAuditEvent, UserAuditSink};
 use kryphocron::encryption::{
     AtRestHooks, CodecId, DecodeContext, EncodedRecord, RotationGenerationMark,
 };
+use kryphocron::post_content::{derive_clear_fields, ClearFields, PostContent};
 
 use crate::context::AppContext;
 use crate::error::{PdsError, PdsResult};
@@ -199,10 +200,10 @@ pub(crate) async fn encode_private_content(
 pub(crate) enum PayloadForm {
     /// The post's text alone, as UTF-8: the original form.
     Text,
-    /// [`CONTENT_FORM_MARKER`] then a JSON object `{text, facets?, embed?}`.
-    /// The stored record keeps, in the clear, the embed's blob refs in
-    /// `embedBlobs`, the mentioned DIDs in `mentionDids` and a strong ref to
-    /// a quoted record in `quote`.
+    /// `0xFF` then a JSON object `{text, facets?, embed?}`
+    /// ([`kryphocron::post_content`]). The stored record keeps, in the clear,
+    /// the fields [`derive_clear_fields`] derives from the content:
+    /// `embedBlobs`, `mentionDids`, `quote` and `mediaKinds`.
     Content,
 }
 
@@ -217,12 +218,6 @@ impl PayloadForm {
     }
 }
 
-/// The first byte of a [`PayloadForm::Content`] payload. It never begins
-/// valid UTF-8, and a text payload is always valid UTF-8, so the two forms
-/// cannot be confused, and a reader that knows only the text form fails
-/// (not UTF-8) instead of showing JSON as text.
-pub(crate) const CONTENT_FORM_MARKER: u8 = 0xFF;
-
 /// The fields only this server's encoder writes; a record being written that
 /// already has one is refused (#525).
 const ENCODED_FIELDS: [&str; 3] = [
@@ -230,10 +225,6 @@ const ENCODED_FIELDS: [&str; 3] = [
     "encodedContentCodec",
     "encodedContentGeneration",
 ];
-
-/// The top-level field holding a content-form post's embed blob refs, which
-/// must stay in the clear for the PDS to keep the blobs (#504).
-pub(crate) const EMBED_BLOBS_FIELD: &str = "embedBlobs";
 
 /// [`encode_private_content_as`] in the text form (the tests' shorthand).
 ///
@@ -250,127 +241,6 @@ pub(crate) async fn encode_private_content_with_hooks(
     record: &mut serde_json::Value,
 ) -> PdsResult<bool> {
     encode_private_content_as(hooks, sink, writer_did, nsid, rkey, record, PayloadForm::Text).await
-}
-
-/// The top-level field naming the DIDs a content-form post mentions, kept
-/// in the clear for the AppView's indexing (#504, Prism's ask).
-pub(crate) const MENTION_DIDS_FIELD: &str = "mentionDids";
-
-/// The top-level field holding a strong ref to the record a content-form
-/// post quotes, kept in the clear for the AppView's indexing (#504).
-pub(crate) const QUOTE_FIELD: &str = "quote";
-
-/// The top-level field naming the kinds of media a content-form post's own
-/// embed carries (`"image"`, `"video"`), kept in the clear so the AppView can
-/// filter an author's private posts by media (#529, agreed with Prism).
-pub(crate) const MEDIA_KINDS_FIELD: &str = "mediaKinds";
-
-/// Image embeds, in the stock and the kryphocron vocabularies.
-const IMAGE_EMBED_TYPES: [&str; 4] = [
-    "app.bsky.embed.images",
-    "app.bsky.embed.gallery",
-    "tools.kryphocron.feed.postPublic#embedImage",
-    "tools.kryphocron.feed.postPublic#embedGallery",
-];
-
-/// Video embeds, in the stock and the kryphocron vocabularies.
-const VIDEO_EMBED_TYPES: [&str; 2] = [
-    "app.bsky.embed.video",
-    "tools.kryphocron.feed.postPublic#embedVideo",
-];
-
-/// Record-with-media embeds, in the stock and the kryphocron vocabularies.
-const RECORD_WITH_MEDIA_TYPES: [&str; 2] = [
-    "app.bsky.embed.recordWithMedia",
-    "tools.kryphocron.feed.postPublic#embedRecordWithMedia",
-];
-
-/// The media kinds `embed` itself carries, in the fixed order `image`,
-/// `video`: from an image or video embed, or the `media` of a
-/// record-with-media. Link cards (Bluesky's GIFs among them), plain quotes
-/// and a quoted post's own media are not the post's media, as in stock.
-fn media_kinds(embed: &serde_json::Value) -> Vec<serde_json::Value> {
-    let embed_type = |value: &serde_json::Value| -> Option<String> {
-        Some(value.get("$type")?.as_str()?.to_string())
-    };
-    let media_type = match embed_type(embed) {
-        Some(t) if RECORD_WITH_MEDIA_TYPES.contains(&t.as_str()) => {
-            embed.get("media").and_then(embed_type)
-        }
-        other => other,
-    };
-    let kind = match media_type.as_deref() {
-        Some(t) if IMAGE_EMBED_TYPES.contains(&t) => "image",
-        Some(t) if VIDEO_EMBED_TYPES.contains(&t) => "video",
-        _ => return Vec::new(),
-    };
-    vec![serde_json::Value::String(kind.to_string())]
-}
-
-/// Mention facet features: the stock and the kryphocron vocabularies, and
-/// the bare local form the AppView also reads.
-const MENTION_FEATURE_TYPES: [&str; 3] = [
-    "app.bsky.richtext.facet#mention",
-    "tools.kryphocron.feed.postPublic#mention",
-    "#mention",
-];
-
-/// The DIDs `facets` mention, deduplicated, in first-appearance order.
-fn mention_dids(facets: &serde_json::Value) -> Vec<serde_json::Value> {
-    let mut dids: Vec<serde_json::Value> = Vec::new();
-    let features = facets
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|facet| facet.get("features")?.as_array())
-        .flatten();
-    for feature in features {
-        let is_mention = feature
-            .get("$type")
-            .and_then(|t| t.as_str())
-            .is_some_and(|t| MENTION_FEATURE_TYPES.contains(&t));
-        if let (true, Some(did)) = (is_mention, feature.get("did").and_then(|d| d.as_str())) {
-            let did = serde_json::Value::String(did.to_string());
-            if !dids.contains(&did) {
-                dids.push(did);
-            }
-        }
-    }
-    dids
-}
-
-/// The strong ref (`{uri, cid}`) of the record `embed` quotes: a record
-/// embed's `record`, or a record-with-media embed's `record.record`, in the
-/// stock or the kryphocron vocabulary.
-fn quoted_record(embed: &serde_json::Value) -> Option<serde_json::Value> {
-    let strong_ref = match embed.get("$type")?.as_str()? {
-        "app.bsky.embed.record" | "tools.kryphocron.feed.postPublic#embedRecord" => {
-            embed.get("record")?
-        }
-        "app.bsky.embed.recordWithMedia" | "tools.kryphocron.feed.postPublic#embedRecordWithMedia" => {
-            embed.get("record")?.get("record")?
-        }
-        _ => return None,
-    };
-    Some(serde_json::json!({
-        "uri": strong_ref.get("uri")?.as_str()?,
-        "cid": strong_ref.get("cid")?.as_str()?,
-    }))
-}
-
-/// Every blob object (`$type: blob`) inside `value`, copied whole.
-fn blob_objects(value: &serde_json::Value, found: &mut Vec<serde_json::Value>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            if map.get("$type").and_then(|t| t.as_str()) == Some("blob") {
-                found.push(value.clone());
-            } else {
-                map.values().for_each(|v| blob_objects(v, found));
-            }
-        }
-        serde_json::Value::Array(items) => items.iter().for_each(|v| blob_objects(v, found)),
-        _ => {}
-    }
 }
 
 /// The payload to encode for `record` in `form`, and the content fields it
@@ -417,21 +287,9 @@ fn content_payload(
     let text = text.unwrap_or_default();
     Ok(Some(match form {
         PayloadForm::Text => text.into_bytes(),
-        PayloadForm::Content => {
-            let mut content = serde_json::Map::new();
-            content.insert("text".to_string(), serde_json::Value::String(text));
-            if let Some(facets) = facets {
-                content.insert("facets".to_string(), facets);
-            }
-            if let Some(embed) = embed {
-                content.insert("embed".to_string(), embed);
-            }
-            let mut bytes = vec![CONTENT_FORM_MARKER];
-            serde_json::to_writer(&mut bytes, &content).map_err(|e| {
-                PdsError::Internal(format!("private content serialisation failed: {e}"))
-            })?;
-            bytes
-        }
+        // The lexicon's content form, from kryphocron (#534), shared with
+        // the AppView and Horizon so no copy drifts.
+        PayloadForm::Content => PostContent { text, facets, embed }.to_payload(),
     }))
 }
 
@@ -536,42 +394,25 @@ pub(crate) async fn encode_private_content_as(
     })?;
     // The XOR rule (§5.4): exactly one of `text` | `encodedContent`.
     obj.remove("text");
-    // The client's own `embedBlobs`, if any, is never kept: only the
-    // encoder's, taken from the embed it encoded.
-    obj.remove(EMBED_BLOBS_FIELD);
-    obj.remove(MENTION_DIDS_FIELD);
-    obj.remove(QUOTE_FIELD);
-    obj.remove(MEDIA_KINDS_FIELD);
     // A null content field means absent; none is stored.
     for field in ["facets", "embed"] {
         if obj.get(field).is_some_and(serde_json::Value::is_null) {
             obj.remove(field);
         }
     }
-    if form == PayloadForm::Content {
-        // The clear fields are derived from the same facets and embed the
-        // payload carries, so the two always agree.
-        if let Some(facets) = obj.remove("facets") {
-            let dids = mention_dids(&facets);
-            if !dids.is_empty() {
-                obj.insert(MENTION_DIDS_FIELD.to_string(), serde_json::Value::Array(dids));
-            }
+    // The clear fields are derived from the same facets and embed the
+    // payload carries, so the two always agree; any the client sent is
+    // replaced, and in the text form, where the embed stays in the clear,
+    // none is kept (`apply_to` removes every empty one).
+    let clear = match form {
+        PayloadForm::Content => {
+            let facets = obj.remove("facets");
+            let embed = obj.remove("embed");
+            derive_clear_fields(facets.as_ref(), embed.as_ref())
         }
-        if let Some(embed) = obj.remove("embed") {
-            if let Some(quote) = quoted_record(&embed) {
-                obj.insert(QUOTE_FIELD.to_string(), quote);
-            }
-            let kinds = media_kinds(&embed);
-            if !kinds.is_empty() {
-                obj.insert(MEDIA_KINDS_FIELD.to_string(), serde_json::Value::Array(kinds));
-            }
-            let mut blobs = Vec::new();
-            blob_objects(&embed, &mut blobs);
-            if !blobs.is_empty() {
-                obj.insert(EMBED_BLOBS_FIELD.to_string(), serde_json::Value::Array(blobs));
-            }
-        }
-    }
+        PayloadForm::Text => ClearFields::default(),
+    };
+    clear.apply_to(obj);
     let b64 = base64::engine::general_purpose::STANDARD_NO_PAD.encode(&encoded.content);
     obj.insert(
         "encodedContent".to_string(),
@@ -752,12 +593,9 @@ pub(crate) async fn decode_private_content_with_hooks(
     obj.remove("encodedContent");
     obj.remove("encodedContentCodec");
     obj.remove("encodedContentGeneration");
-    // The clear derivatives of the content are dropped: the restored
-    // record is the one that was written.
-    obj.remove(EMBED_BLOBS_FIELD);
-    obj.remove(MENTION_DIDS_FIELD);
-    obj.remove(QUOTE_FIELD);
-    obj.remove(MEDIA_KINDS_FIELD);
+    // The clear derivatives of the content are dropped (`apply_to` of no
+    // fields removes them all): the restored record is the one written.
+    ClearFields::default().apply_to(obj);
     obj.extend(restored);
 
     tracing::debug!(
@@ -772,53 +610,32 @@ pub(crate) async fn decode_private_content_with_hooks(
     Ok(DecodeOutcome::Decoded)
 }
 
-/// The record fields a decoded payload restores (#504): a text-form payload
-/// (UTF-8) gives `text`; a content-form one ([`CONTENT_FORM_MARKER`] then a
-/// JSON object) gives `text` and, when present, `facets` and `embed`.
+/// The record fields a decoded payload restores (#504), read with
+/// kryphocron's [`PostContent::from_payload`] (#534): a text-form payload
+/// gives `text`; a content-form one gives `text` and, when present, `facets`
+/// and `embed`.
 ///
 /// # Errors
 ///
-/// [`PdsError::Internal`] when a text payload is not UTF-8, or a content
-/// payload is not a JSON object with a string `text`, an array `facets` and
-/// an object `embed`.
+/// [`PdsError::Internal`] when the payload is in neither form: a text payload
+/// that is not UTF-8, or a content payload that is not a JSON object with a
+/// string `text`, an array `facets` and an object `embed`.
 fn restore_content(
     plaintext: Vec<u8>,
 ) -> PdsResult<serde_json::Map<String, serde_json::Value>> {
+    let content = PostContent::from_payload(&plaintext)
+        .map_err(|e| PdsError::Internal(format!("decoded content payload: {e}")))?;
     let mut restored = serde_json::Map::new();
-    let Some(json) = plaintext.strip_prefix(&[CONTENT_FORM_MARKER]) else {
-        let text = String::from_utf8(plaintext)
-            .map_err(|e| PdsError::Internal(format!("decoded content is not valid UTF-8: {e}")))?;
-        restored.insert("text".to_string(), serde_json::Value::String(text));
-        return Ok(restored);
-    };
-    let bad = |what: &str| PdsError::Internal(format!("decoded content payload: {what}"));
-    let serde_json::Value::Object(content) = serde_json::from_slice(json)
-        .map_err(|e| PdsError::Internal(format!("decoded content payload is not JSON: {e}")))?
-    else {
-        return Err(bad("not a JSON object"));
-    };
-    match content.get("text") {
-        Some(text @ serde_json::Value::String(_)) => {
-            restored.insert("text".to_string(), text.clone());
-        }
-        _ => return Err(bad("text missing or not a string")),
+    restored.insert("text".to_string(), serde_json::Value::String(content.text));
+    if let Some(facets) = content.facets {
+        restored.insert("facets".to_string(), facets);
     }
-    match content.get("facets") {
-        None => {}
-        Some(facets @ serde_json::Value::Array(_)) => {
-            restored.insert("facets".to_string(), facets.clone());
-        }
-        Some(_) => return Err(bad("facets not an array")),
-    }
-    match content.get("embed") {
-        None => {}
-        Some(embed @ serde_json::Value::Object(_)) => {
-            restored.insert("embed".to_string(), embed.clone());
-        }
-        Some(_) => return Err(bad("embed not an object")),
+    if let Some(embed) = content.embed {
+        restored.insert("embed".to_string(), embed);
     }
     Ok(restored)
 }
+
 
 /// Aurora-Locus's read-side authorization decision for a private-tier record
 /// (#237a). **Not** kryphocron's sealed `ReadAuthorization` — architecture (Y)
@@ -976,6 +793,59 @@ async fn resolve_list_audience_membership(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kryphocron::post_content::CONTENT_FORM_MARKER;
+
+    /// The clear fields' names in the stored record.
+    const EMBED_BLOBS_FIELD: &str = "embedBlobs";
+    const MENTION_DIDS_FIELD: &str = "mentionDids";
+    const QUOTE_FIELD: &str = "quote";
+    const MEDIA_KINDS_FIELD: &str = "mediaKinds";
+
+    /// The media kinds kryphocron derives for `embed`, as JSON strings.
+    fn media_kinds(embed: &serde_json::Value) -> Vec<serde_json::Value> {
+        derive_clear_fields(None, Some(embed))
+            .media_kinds
+            .into_iter()
+            .map(|kind| serde_json::Value::String(kind.to_string()))
+            .collect()
+    }
+
+    /// #534: the payload kryphocron builds is byte-for-byte the one locus
+    /// built before it moved there (compared within this build, whose
+    /// serde_json sets the key order), for every embed kind, so posts encoded
+    /// before and after decode alike and nothing re-encodes differently.
+    #[test]
+    fn the_shared_content_form_matches_locus_s_own_byte_for_byte() {
+        let locus_payload = |text: &str, facets: Option<&serde_json::Value>, embed: Option<&serde_json::Value>| {
+            let mut content = serde_json::Map::new();
+            content.insert("text".to_string(), serde_json::Value::String(text.to_string()));
+            if let Some(facets) = facets {
+                content.insert("facets".to_string(), facets.clone());
+            }
+            if let Some(embed) = embed {
+                content.insert("embed".to_string(), embed.clone());
+            }
+            let mut bytes = vec![0xFF];
+            serde_json::to_writer(&mut bytes, &content).unwrap();
+            bytes
+        };
+        let facets = serde_json::json!([{ "index": { "byteStart": 0, "byteEnd": 6 },
+            "features": [{ "$type": "app.bsky.richtext.facet#mention", "did": "did:plc:alice" }] }]);
+        for (embed, _) in embeds() {
+            for (text, facets, embed) in [
+                ("@alice look", Some(&facets), Some(&embed)),
+                ("", None, Some(&embed)),
+                ("just text", None, None),
+                ("text and facets", Some(&facets), None),
+            ] {
+                let record = serde_json::json!({ "text": text, "facets": facets, "embed": embed });
+                let shared = content_payload(record.as_object().unwrap(), PayloadForm::Content)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(shared, locus_payload(text, facets, embed), "{text:?} {embed:?}");
+            }
+        }
+    }
 
     /// Build the real default at-rest hooks (Laquna codec + the
     /// substrate `DefaultRotationOracle`) over a throwaway data dir. The
