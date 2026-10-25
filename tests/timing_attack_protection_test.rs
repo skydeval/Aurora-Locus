@@ -238,7 +238,8 @@ async fn test_app_password_timing_protection() {
     let app_password = manager
         .create_app_password(&account.did, "Test App", false)
         .await
-        .unwrap();
+        .unwrap()
+        .password;
 
     // Test invalid app password
     let start = Instant::now();

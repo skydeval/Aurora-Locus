@@ -1198,12 +1198,12 @@ async fn create_app_password(
 
     // Create app password
     let privileged = req.privileged.unwrap_or(false);
-    let app_password = ctx
+    let created = ctx
         .account_manager
         .create_app_password(&validated.did, &req.name, privileged)
         .await?;
 
-    Ok(Json(CreateAppPasswordResponse { app_password }))
+    Ok(Json(created))
 }
 
 /// List app passwords endpoint
@@ -3007,6 +3007,53 @@ mod oauth_scope_tests {
         let _token = get_service_auth(State(ctx.clone()), auth, service_auth_query(None))
             .await
             .expect("a session may mint a method-less token");
+    }
+
+    /// createAppPassword answers with the lexicon's `appPassword` object,
+    /// which clients read the new password from. It answered
+    /// `{"appPassword": "<password>"}`, so Bluesky's app showed the step as
+    /// failed although the password was stored.
+    #[tokio::test]
+    async fn create_app_password_answers_the_lexicon_s_app_password() {
+        let (ctx, did) = ctx_with_account().await;
+        let session = ctx
+            .account_manager
+            .create_session(&did, None)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", session.access_token).parse().unwrap(),
+        );
+        let created = create_app_password(
+            State(ctx.clone()),
+            headers,
+            Json(CreateAppPasswordRequest {
+                name: "phone".to_string(),
+                privileged: Some(true),
+            }),
+        )
+        .await
+        .expect("a session may create an app password")
+        .0;
+
+        let json = serde_json::to_value(&created).unwrap();
+        let mut keys: Vec<&str> = json.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["createdAt", "name", "password", "privileged"]);
+        assert_eq!(json["name"], "phone");
+        assert_eq!(json["privileged"], true);
+        let password = json["password"].as_str().unwrap();
+        assert_eq!(password.len(), 19, "xxxx-xxxx-xxxx-xxxx: {password}");
+        assert_eq!(password.matches('-').count(), 3, "{password}");
+        chrono::DateTime::parse_from_rfc3339(json["createdAt"].as_str().unwrap())
+            .expect("createdAt is a datetime");
+
+        // It was stored under that name.
+        let listed = ctx.account_manager.list_app_passwords(&did).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "phone");
     }
 
     #[test]
