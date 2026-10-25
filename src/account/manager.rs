@@ -2756,7 +2756,7 @@ impl AccountManager {
         did: &str,
         name: &str,
         privileged: bool,
-    ) -> PdsResult<String> {
+    ) -> PdsResult<super::CreateAppPasswordResponse> {
         // Validate name
         if name.is_empty() {
             return Err(PdsError::Validation(
@@ -2785,19 +2785,7 @@ impl AccountManager {
             )));
         }
 
-        // Generate a random password (32 characters, alphanumeric)
-        // Format: xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx (for readability)
-        let raw_password = format!(
-            "{}-{}-{}-{}-{}-{}-{}-{}",
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4),
-            Self::generate_random_string(4)
-        );
+        let raw_password = Self::generate_app_password();
 
         // Hash the password using Argon2id
         let password_hash = crate::auth::PasswordHasher::hash(&raw_password)
@@ -2820,8 +2808,31 @@ impl AccountManager {
 
         tracing::info!("Created app password '{}' for DID: {}", name, did);
 
-        // Return the raw password (only time it's shown to user)
-        Ok(raw_password)
+        // The raw password is returned this once and never again.
+        Ok(super::CreateAppPasswordResponse {
+            name: name.to_string(),
+            password: raw_password,
+            created_at: now,
+            privileged,
+        })
+    }
+
+    /// A fresh app password in the reference PDS's form, `xxxx-xxxx-xxxx-xxxx`:
+    /// sixteen lowercase base32 characters (80 random bits) in four groups.
+    /// Clients recognise app passwords by that pattern; locus's were eight
+    /// groups of mixed-case letters and digits.
+    fn generate_app_password() -> String {
+        use rand::Rng;
+        const BASE32: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut rng = rand::thread_rng();
+        let chars: Vec<char> = (0..16)
+            .map(|_| BASE32[rng.gen_range(0..BASE32.len())] as char)
+            .collect();
+        chars
+            .chunks(4)
+            .map(|group| group.iter().collect::<String>())
+            .collect::<Vec<_>>()
+            .join("-")
     }
 
     /// List all app passwords for a user (without the actual passwords)
@@ -2974,21 +2985,6 @@ impl AccountManager {
         }
 
         result
-    }
-
-    /// Generate random alphanumeric string
-    fn generate_random_string(length: usize) -> String {
-        use rand::Rng;
-        const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
-                                 abcdefghijklmnopqrstuvwxyz\
-                                 0123456789";
-        let mut rng = rand::thread_rng();
-        (0..length)
-            .map(|_| {
-                let idx = rng.gen_range(0..CHARSET.len());
-                CHARSET[idx] as char
-            })
-            .collect()
     }
 
     /// Validate handle format using comprehensive ATProto validation
@@ -4631,6 +4627,20 @@ mod tests {
         );
     }
 
+    /// `password` is `xxxx-xxxx-xxxx-xxxx` over lowercase base32, as the
+    /// reference PDS generates and clients recognise.
+    fn assert_app_password_form(password: &str) {
+        let groups: Vec<&str> = password.split('-').collect();
+        assert_eq!(groups.len(), 4, "{password}");
+        for group in groups {
+            assert_eq!(group.len(), 4, "{password}");
+            assert!(
+                group.chars().all(|c| c.is_ascii_lowercase() || ('2'..='7').contains(&c)),
+                "{password}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_create_app_password() {
         let manager = setup_test_db().await;
@@ -4651,11 +4661,11 @@ mod tests {
         let app_password = manager
             .create_app_password(&account.did, "Test App", false)
             .await
-            .unwrap();
+            .unwrap()
+            .password;
 
-        // Verify format (should be xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx-xxxx)
-        assert_eq!(app_password.len(), 39); // 8 groups of 4 chars + 7 dashes
-        assert_eq!(app_password.matches('-').count(), 7);
+        // The reference PDS's form: four groups of four lowercase base32.
+        assert_app_password_form(&app_password);
 
         // List app passwords
         let passwords = manager.list_app_passwords(&account.did).await.unwrap();
@@ -4663,11 +4673,18 @@ mod tests {
         assert_eq!(passwords[0].name, "Test App");
         assert!(!passwords[0].privileged);
 
-        // Create another app password with privileged flag
-        manager
+        // Create another app password with privileged flag; the answer names
+        // it, flags it and dates it as the stored row does.
+        let created = manager
             .create_app_password(&account.did, "Privileged App", true)
             .await
             .unwrap();
+        assert_eq!(created.name, "Privileged App");
+        assert!(created.privileged);
+        assert_app_password_form(&created.password);
+        let stored = manager.list_app_passwords(&account.did).await.unwrap();
+        let row = stored.iter().find(|p| p.name == "Privileged App").unwrap();
+        assert_eq!(row.created_at.timestamp_millis(), created.created_at.timestamp_millis());
 
         let passwords = manager.list_app_passwords(&account.did).await.unwrap();
         assert_eq!(passwords.len(), 2);
@@ -4691,8 +4708,9 @@ mod tests {
         let pw = manager
             .create_app_password(did, "Test App", false)
             .await
-            .expect("did:web app password now succeeds (v0.10 parity)");
-        assert_eq!(pw.len(), 39);
+            .expect("did:web app password now succeeds (v0.10 parity)")
+            .password;
+        assert_app_password_form(&pw);
         let list = manager.list_app_passwords(did).await.unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Test App");
@@ -4751,7 +4769,8 @@ mod tests {
         let app_password = manager
             .create_app_password(&account.did, "Test Client", false)
             .await
-            .unwrap();
+            .unwrap()
+            .password;
 
         // Login with app password using handle
         let (auth_account, session, name) = manager
@@ -4831,7 +4850,8 @@ mod tests {
         let app_password = manager
             .create_app_password(&account.did, "Test App", false)
             .await
-            .unwrap();
+            .unwrap()
+            .password;
 
         // Create session with app password (capture for the Q9 assertion)
         let (_, app_session, _) = manager
@@ -4970,7 +4990,8 @@ mod tests {
         let app_password = manager
             .create_app_password(&account.did, "Test App", false)
             .await
-            .unwrap();
+            .unwrap()
+            .password;
 
         let (_account, session, _name) = manager
             .login_with_app_password("testuser", &app_password)

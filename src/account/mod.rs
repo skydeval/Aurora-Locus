@@ -143,11 +143,21 @@ pub struct CreateAppPasswordRequest {
     pub privileged: Option<bool>,
 }
 
-/// Create app password response
+/// A newly created app password: `com.atproto.server.createAppPassword`'s
+/// output, the lexicon's `#appPassword` object, and the only time its password
+/// is shown. It was `{"appPassword": "<password>"}`, which clients could not
+/// read, so creation looked failed although the password was stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateAppPasswordResponse {
-    pub app_password: String,
+    /// The name the user gave it.
+    pub name: String,
+    /// The password, `xxxx-xxxx-xxxx-xxxx`.
+    pub password: String,
+    /// When it was created.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Whether it may reach direct messages.
+    pub privileged: bool,
 }
 
 /// List app passwords response
