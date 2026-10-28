@@ -26,7 +26,8 @@ test('Registration page registers its key and reads the real registration mode',
 test('it surfaces the #334 access policies read-only with edit-elsewhere links', () => {
   const src = read('ConfigRegistrationPolicy.js');
   assert.ok(src.includes("getRuntimeSetting('kryphocron.policy.new-account-access')"), 'reads new-account-access');
-  assert.ok(src.includes("getRuntimeSetting('kryphocron.policy.default-audience-mode')"), 'reads default-audience-mode');
+  // #536: the default audience setting is gone (audiences are held by the AppView).
+  assert.ok(!src.includes('default-audience-mode'), 'no default-audience-mode');
   assert.ok(src.includes('#configuration/kryphocron-policy') || /kryphocron-policy/.test(src), 'links to Kryphocron policy to edit');
   assert.ok(src.includes('#ops/invites'), 'links to Operations → Invites');
 });

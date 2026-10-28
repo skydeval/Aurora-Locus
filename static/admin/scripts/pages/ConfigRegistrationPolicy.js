@@ -12,7 +12,7 @@
 //   - registration mode (invites.required) — static startup config, read from
 //     the real describeServer.inviteCodeRequired (NOT the unbacked
 //     general.invite-required key ConfigGeneral reads); deployment-config only.
-//   - new-account access + default audience (#334 kryphocron.policy.* runtime
+//   - new-account access (#334 kryphocron.policy.* runtime
 //     keys) — real values via getRuntimeSetting; edited on Kryphocron policy.
 //   - invite codes — managed on Operations → Invites.
 // Email verification has no accurate admin source (no describeServer field; the
@@ -66,11 +66,6 @@
         'Whether new accounts can post to the private tier immediately or after a delay.',
         { route: 'configuration/kryphocron-policy', label: 'Edit in Kryphocron policy' },
       ) +
-      statusCard(
-        'Default audience for new accounts', 'rp-audience',
-        'The kryphocron audience mode each new account starts with (or none).',
-        { route: 'configuration/kryphocron-policy', label: 'Edit in Kryphocron policy' },
-      ) +
       '  <div class="settings-card">' +
       '    <h3>Invite codes</h3>' +
       '    <p class="settings-help">Generate, view usage, and disable invite codes.</p>' +
@@ -107,12 +102,11 @@
     }
   }
 
-  // New-account access + default audience from the #334 runtime keys (real
+  // New-account access from the #334 runtime keys (real
   // values; edited on the Kryphocron policy page).
   async function loadAccessPolicies() {
     const ep = global.AuroraEndpoints;
     const accessEl = document.getElementById('rp-access');
-    const audienceEl = document.getElementById('rp-audience');
     try {
       const mode = await ep.admin.getRuntimeSetting('kryphocron.policy.new-account-access');
       const value = (mode && typeof mode.value === 'string') ? mode.value : 'immediate';
@@ -128,12 +122,6 @@
       }
     } catch (e) {
       if (accessEl) accessEl.textContent = 'Unavailable';
-    }
-    try {
-      const aud = await ep.admin.getRuntimeSetting('kryphocron.policy.default-audience-mode');
-      if (audienceEl) audienceEl.textContent = (aud && typeof aud.value === 'string') ? aud.value : 'nobody';
-    } catch (e) {
-      if (audienceEl) audienceEl.textContent = 'Unavailable';
     }
   }
 

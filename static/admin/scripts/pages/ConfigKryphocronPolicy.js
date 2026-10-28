@@ -29,7 +29,6 @@
   // consumes + the deployment process-shape declaration.
   const KEY_ACCESS = 'kryphocron.policy.new-account-access'; // immediate | delayed | earned
   const KEY_ACCESS_DELAY = 'kryphocron.policy.access-delay-days'; // integer (delayed)
-  const KEY_DEFAULT_AUDIENCE = 'kryphocron.policy.default-audience-mode'; // list|everyone|followers|following|nobody
   const KEY_CADENCE = 'kryphocron.laquna.rotation-cadence'; // hourly|daily|weekly|manual-only
   const KEY_CADENCE_RANGE = 'kryphocron.laquna.account-cadence-range'; // weekly-to-daily|weekly-to-hourly|no-override
   const KEY_PROCESS_SHAPE = 'kryphocron.deployment.process-shape'; // single-process|multi-process
@@ -127,10 +126,9 @@
   }
 
   async function load(container) {
-    const [access, delay, defAud, cadence, range, shape, substrate] = await Promise.all([
+    const [access, delay, cadence, range, shape, substrate] = await Promise.all([
       readSetting(KEY_ACCESS, 'immediate'),
       readSetting(KEY_ACCESS_DELAY, '7'),
-      readSetting(KEY_DEFAULT_AUDIENCE, 'nobody'),
       readSetting(KEY_CADENCE, 'daily'),
       readSetting(KEY_CADENCE_RANGE, 'weekly-to-daily'),
       readSetting(KEY_PROCESS_SHAPE, 'single-process'),
@@ -166,21 +164,6 @@
           esc(t('kryphocron.policy.access_delay_label')) + '</label>' +
           '<input type="number" id="kp-access-delay" class="form-input" min="1" value="' +
           esc(delay.value) + '"></div>',
-      }) +
-
-      liveCard({
-        key: KEY_DEFAULT_AUDIENCE, selectId: 'kp-defaud',
-        title: t('kryphocron.policy.default_audience_title'),
-        help: t('kryphocron.policy.default_audience_help'),
-        label: t('kryphocron.policy.default_audience_label'),
-        current: defAud.value, source: defAud.source,
-        options: [
-          { value: 'nobody', label: t('kryphocron.audiences.mode_nobody') },
-          { value: 'list', label: t('kryphocron.audiences.mode_list') },
-          { value: 'everyone', label: t('kryphocron.audiences.mode_everyone') },
-          { value: 'followers', label: t('kryphocron.audiences.mode_followers') },
-          { value: 'following', label: t('kryphocron.audiences.mode_following') },
-        ],
       }) +
 
       liveCard({

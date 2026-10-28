@@ -6,7 +6,7 @@
 //! one that is not taken, the `login_hint` as the suggested handle. The form
 //! creates the account exactly as `com.atproto.server.createAccount` does
 //! ([`crate::api::server::provision_account`]: invite code, repository,
-//! firehose announcements, default audience, verification email), starts a
+//! firehose announcements, verification email), starts a
 //! browser session for it, marks the request's prompt as acted on, and returns
 //! to the authorize URL, which goes on to the consent page for the new account.
 //!

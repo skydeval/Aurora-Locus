@@ -4228,13 +4228,6 @@ pub const KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY: &str = "kryphocron.policy.new-accou
 /// The N (in days) for `delayed` access — a positive integer (default 7).
 pub const KRYPHOCRON_ACCESS_DELAY_DAYS_KEY: &str = "kryphocron.policy.access-delay-days";
 
-/// Initial `mode` of the `policy.audience` record Aurora-Locus auto-creates for
-/// a new account (§6.6.2 item 2 / §7.3.3). One of the five kryphocron audience
-/// modes; `nobody` (default) authors no record at all — the account
-/// participates nowhere until its holder opts in. Consumed by
-/// [`crate::kryphocron_policy`] at account creation.
-pub const KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY: &str = "kryphocron.policy.default-audience-mode";
-
 /// Deployment process-shape declaration (§8.3.4): `single-process` (the
 /// standard oracle) or `multi-process` (an operator-coordinated oracle). Pure
 /// host-side bookkeeping — it installs no oracle; it drives a mismatch *warning*
@@ -4305,7 +4298,6 @@ pub const KNOWN_RUNTIME_KEYS: &[&str] = &[
     BRANDING_LOGIN_SUBTITLE_COLOR_KEY,
     KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
     KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
-    KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
     KRYPHOCRON_PROCESS_SHAPE_KEY,
     KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
     MODERATION_DEFAULTS_REPORT_ACTION_KEY,
@@ -4398,7 +4390,6 @@ fn default_for_key(key: &str) -> serde_json::Value {
         | BRANDING_LOGIN_SUBTITLE_COLOR_KEY => serde_json::Value::String(String::new()),
         KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY => serde_json::Value::String("immediate".to_string()),
         KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => serde_json::Value::from(7),
-        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => serde_json::Value::String("nobody".to_string()),
         KRYPHOCRON_PROCESS_SHAPE_KEY => serde_json::Value::String("single-process".to_string()),
         KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY => {
             serde_json::Value::String("weekly-to-daily".to_string())
@@ -4486,9 +4477,6 @@ fn validate_runtime_value(key: &str, value: &serde_json::Value) -> bool {
         KRYPHOCRON_ACCESS_DELAY_DAYS_KEY => {
             value.as_u64().is_some_and(|n| (1..=36500).contains(&n))
         }
-        KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY => value.as_str().is_some_and(|s| {
-            matches!(s, "list" | "everyone" | "followers" | "following" | "nobody")
-        }),
         KRYPHOCRON_PROCESS_SHAPE_KEY => {
             value.as_str().is_some_and(|s| matches!(s, "single-process" | "multi-process"))
         }
@@ -11298,7 +11286,6 @@ mod tests {
         for key in [
             KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY,
             KRYPHOCRON_ACCESS_DELAY_DAYS_KEY,
-            KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY,
             KRYPHOCRON_PROCESS_SHAPE_KEY,
             KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY,
         ] {
@@ -11307,7 +11294,6 @@ mod tests {
         use serde_json::json;
         assert_eq!(default_for_key(KRYPHOCRON_NEW_ACCOUNT_ACCESS_KEY), json!("immediate"));
         assert_eq!(default_for_key(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY), json!(7));
-        assert_eq!(default_for_key(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY), json!("nobody"));
         assert_eq!(default_for_key(KRYPHOCRON_PROCESS_SHAPE_KEY), json!("single-process"));
         assert_eq!(
             default_for_key(KRYPHOCRON_ACCOUNT_CADENCE_RANGE_KEY),
@@ -11381,11 +11367,6 @@ mod tests {
         assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(-3)));
         assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!("7")));
         assert!(!validate_runtime_value(KRYPHOCRON_ACCESS_DELAY_DAYS_KEY, &json!(40000)));
-        // default-audience-mode: the five kryphocron modes; reject anything else.
-        for m in ["list", "everyone", "followers", "following", "nobody"] {
-            assert!(validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!(m)));
-        }
-        assert!(!validate_runtime_value(KRYPHOCRON_DEFAULT_AUDIENCE_MODE_KEY, &json!("public")));
         // process-shape: the two declarations.
         assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("single-process")));
         assert!(validate_runtime_value(KRYPHOCRON_PROCESS_SHAPE_KEY, &json!("multi-process")));
