@@ -29,20 +29,13 @@
 //! move and are now made explicit at the type's defining module.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::actor_store::repository::{WriteOp, WriteOpAction};
-use crate::actor_store::RepositoryManager;
 use crate::admin::events::{LogEventParams, ModerationEventLogger, ModerationEventType};
-use crate::api::kryphocron_endpoints::NSID_AUDIENCE;
-use crate::api::repo::create_actor_signer;
 use crate::context::AppContext;
-use crate::error::{PdsError, PdsResult};
-use crate::kryphocron::KryphocronWriteAuthorization;
 use crate::kryphocron_audit::{BlockChangedPayload, BlockMuteOperation};
 
 /// Cascade source — identifies the originating cascade operation
@@ -472,27 +465,8 @@ impl CascadeContext {
 }
 
 // ===========================================================================
-// Block-cascade orchestration (#282 / §3.1)
+// Private-tier block audit (#282, #536)
 // ===========================================================================
-//
-// This is the production minting site: it lives in `crate::cascade` because
-// `CascadeContext::mint_token` is `pub(in crate::cascade)` (H-5). The endpoint
-// handler (`create_block` / `delete_block`) calls in here; the actual token
-// minting never escapes this module.
-
-/// Audiences fetched per `list_records` page (mirrors the rewrite job's
-/// `RECORD_PAGE`). The pass is paged so a large-audience blocker never holds a
-/// single long transaction (§3.1 M-3).
-const AUDIENCE_PAGE: i64 = 500;
-
-/// The single DID-normalization function applied **uniformly** to the subject,
-/// to every `members` element, and (implicitly via the bind arm) to the
-/// `block_uri` authority — rev3 LB-3's "one function, applied everywhere" so
-/// there is no comparison asymmetry. atproto DIDs are already case-normalized;
-/// this trims incidental whitespace and is the single comparison basis.
-fn normalize_did(d: &str) -> &str {
-    d.trim()
-}
 
 /// Current unix-millis timestamp (mirrors `rotation-history.log`'s `at`).
 fn now_ms() -> u64 {
@@ -608,320 +582,35 @@ pub(crate) async fn read_block_subject(
         .map(str::to_string)
 }
 
-/// Decode one audience record and, if it is a **list-mode** audience that
-/// currently contains `subject_norm`, return the `Update` value with **only**
-/// the subject removed (all occurrences) — every other field carried through
-/// untouched (§2.4.2 / H-6: edit the decoded tree in place, preserve unknown
-/// fields). Returns:
-/// - `Ok(Some(value))` — a removal is needed (subject present in a list audience);
-/// - `Ok(None)` — skip (not list-mode, or subject already absent — H-2 re-scan);
-/// - `Err` — the block was undecodable (caller counts it as a failed audience).
-async fn audience_removal_value(
-    ctx: &AppContext,
-    blocker_did: &str,
-    rec: &crate::actor_store::models::Record,
-    subject_norm: &str,
-) -> PdsResult<Option<serde_json::Value>> {
-    let Some(block) = ctx.actor_store.get_block(blocker_did, &rec.cid).await? else {
-        return Ok(None);
-    };
-    // H-6 (ii): `lex_cbor::decode` rejects duplicate map keys, so the decoded
-    // tree is well-defined; H-6 (i): a generic `LexValue` decode preserves
-    // unknown fields (we edit only `members` below); H-6 (iii): `apply_writes`
-    // re-encodes canonically (DAG-CBOR) for a stable swap CID.
-    let lex = proto_blue::lex_cbor::decode(&block)
-        .map_err(|e| PdsError::Internal(format!("block cascade: decode audience block: {e}")))?;
-    let value = proto_blue::lex_json::lex_to_json(&lex);
-    Ok(apply_subject_removal(value, subject_norm))
-}
-
-/// Pure (no store) audience-member removal — the testable core of §2.4.2 /
-/// LB-3. Given a decoded audience record `value`, returns the edited value with
-/// **all** occurrences of `subject_norm` removed from `members` IFF the
-/// audience is list-mode (D6) and currently contains the subject; otherwise
-/// `None` (skip — not list-mode, or the subject is already absent, the H-2
-/// re-scan case). Only `members` is touched — every other field, including
-/// unknown ones, is carried through unchanged (H-6 (i)); non-subject members
-/// keep their order (the handler never reorders).
-fn apply_subject_removal(
-    mut value: serde_json::Value,
-    subject_norm: &str,
-) -> Option<serde_json::Value> {
-    // D6 (§3.1): the `members` removal binds under `mode == "list"` only;
-    // everyone/followers/nobody have no member list to prune.
-    let mode = value.get("mode").and_then(|m| m.as_str()).unwrap_or("list");
-    if mode != "list" {
-        return None;
-    }
-    let present = value
-        .get("members")
-        .and_then(|m| m.as_array())
-        .map(|arr| {
-            arr.iter()
-                .any(|x| x.as_str().map(normalize_did) == Some(subject_norm))
-        })
-        .unwrap_or(false);
-    if !present {
-        // H-2 re-scan: subject already absent (a prior cascade or manual edit)
-        // → no write, contributes 0 to `removed`.
-        return None;
-    }
-    // Remove ALL occurrences of the subject (LB-3 multiset semantics), preserve
-    // the order of non-subject members, touch nothing else.
-    if let Some(arr) = value.get_mut("members").and_then(|m| m.as_array_mut()) {
-        arr.retain(|x| x.as_str().map(normalize_did) != Some(subject_norm));
-    }
-    Some(value)
-}
-
-/// The block cascade (§3.1). On a successful `createBlock`, walk the blocker's
-/// own list-mode audiences and remove `subject_did` from each, pinned by
-/// `swap_cid` CAS. Best-effort and forward-only: the block-create already
-/// committed, so this never rolls it back. Per-audience routing (§3.2):
-/// - **shape-reject** (`KryphocronCascadeWriteRejected`) → abort the pass loudly,
-///   leaving the `pending` event + `pass_start` log line **unpaired** (the
-///   recovery signal that a cascade hit a bug/attack);
-/// - **swap mismatch** (`SwapCidMismatch`) → a concurrent edit moved the record;
-///   count as failed, skip, continue;
-/// - **transient** (DB/other) → count as failed, skip, continue.
+/// Record a private-tier block's creation or deletion for the audit trail: one
+/// `completed` `KryphocronBlockChanged` event and one `block-cascade.log`
+/// `removed: 0` line. Best-effort.
 ///
-/// The minting happens here (in `crate::cascade`) so the `pub(in crate::cascade)`
-/// confinement on `mint_token` holds end-to-end.
-pub(crate) async fn run_block_cascade(
-    ctx: &AppContext,
-    blocker_did: &str,
-    subject_did: &str,
-    block_uri: &str,
-) -> PdsResult<()> {
-    let mut cascade_ctx =
-        CascadeContext::new_block_cascade(block_uri.to_string(), subject_did.to_string());
-    let cascade_id = cascade_ctx.id().to_string();
-    let subject_norm = normalize_did(subject_did);
-
-    let repo_mgr = RepositoryManager::for_writer(ctx, blocker_did.to_string());
-    let signer = create_actor_signer(&ctx.account_manager, blocker_did).await?;
-
-    // --- pre-pass observability (H-4): pending event + pass_start log line ---
-    emit_block_changed(
-        ctx,
-        BlockChangedPayload {
-            block_uri: block_uri.to_string(),
-            blocker_did: blocker_did.to_string(),
-            subject_did: subject_did.to_string(),
-            operation: BlockMuteOperation::Created,
-            cascade_id: Some(cascade_id.clone()),
-            phase: "pending".to_string(),
-            audiences_total: None,
-            removed: None,
-            failed: None,
-        },
-    )
-    .await;
-    append_block_cascade_log(
-        ctx,
-        &serde_json::json!({
-            "phase": "pass_start",
-            "account": subject_did,
-            "blocker_did": blocker_did,
-            "cascade_id": cascade_id,
-            "operation": "created",
-            "removed": 0,
-            "attempted": 0,
-            "failed": 0,
-            "at_ms": now_ms(),
-        }),
-    );
-
-    let mut removed: i64 = 0;
-    let mut attempted: i64 = 0;
-    let mut failed: i64 = 0;
-    let mut aborted = false;
-    let mut cursor: Option<String> = None;
-
-    'walk: loop {
-        let records = match ctx
-            .actor_store
-            .list_records(
-                blocker_did,
-                NSID_AUDIENCE,
-                AUDIENCE_PAGE,
-                cursor.as_deref(),
-                crate::actor_store::RkeyOrder::Ascending,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                // Transient: stop walking, fall through to a (partial) completed
-                // pair. `removed` is a floor (§4.3 M-7), honest via `failed`.
-                tracing::warn!(
-                    target: "aurora_locus::cascade",
-                    cascade_id = %cascade_id,
-                    error = %e,
-                    "block cascade: list_records page failed; ending walk best-effort",
-                );
-                break;
-            }
-        };
-        if records.is_empty() {
-            break;
-        }
-        let page_len = records.len();
-        let last_rkey = records.last().map(|r| r.rkey.clone());
-
-        for rec in &records {
-            let new_value = match audience_removal_value(ctx, blocker_did, rec, subject_norm).await {
-                Ok(Some(v)) => v,
-                Ok(None) => continue, // not list-mode / subject absent → 0 to removed
-                Err(e) => {
-                    tracing::warn!(
-                        target: "aurora_locus::cascade",
-                        cascade_id = %cascade_id,
-                        audience = %rec.uri,
-                        error = %e,
-                        "block cascade: audience decode failed; counted as failed",
-                    );
-                    attempted += 1;
-                    failed += 1;
-                    continue;
-                }
-            };
-            attempted += 1;
-
-            let token = cascade_ctx.mint_token(CascadeSource::BlockCascade {
-                block_uri: block_uri.to_string(),
-            });
-            let update = WriteOp {
-                action: WriteOpAction::Update,
-                collection: NSID_AUDIENCE.to_string(),
-                rkey: rec.rkey.clone(),
-                value: Some(new_value),
-                validate: None,
-                swap_cid: Some(rec.cid.clone()),
-                kryphocron_authorization: Some(KryphocronWriteAuthorization::Cascade {
-                    source: CascadeSource::BlockCascade {
-                        block_uri: block_uri.to_string(),
-                    },
-                    token,
-                }),
-            };
-
-            match repo_mgr
-                .apply_writes_cascade(
-                    vec![update],
-                    signer.clone(),
-                    Arc::new(crate::blob_store::StrictPromoter),
-                    &mut cascade_ctx,
-                )
-                .await
-            {
-                Ok(_) => {
-                    removed += 1;
-                }
-                Err(PdsError::KryphocronCascadeWriteRejected(msg)) => {
-                    // §3.2 P-1 — shape-reject is a bug or attack, never routine.
-                    // Abort the pass loudly; leave the pending/pass_start unpaired.
-                    tracing::error!(
-                        target: "aurora_locus::cascade",
-                        cascade_id = %cascade_id,
-                        audience = %rec.uri,
-                        reason = %msg,
-                        "block cascade ABORTED: a cascade write was shape-rejected \
-                         (bug or attack); pass left incomplete for recovery tooling",
-                    );
-                    aborted = true;
-                    break 'walk;
-                }
-                Err(PdsError::SwapCidMismatch(_)) => {
-                    // Concurrent edit moved the record between read and apply.
-                    failed += 1;
-                    tracing::warn!(
-                        target: "aurora_locus::cascade",
-                        cascade_id = %cascade_id,
-                        audience = %rec.uri,
-                        "block cascade: swap_cid mismatch (concurrent edit); skipped",
-                    );
-                }
-                Err(e) => {
-                    failed += 1;
-                    tracing::warn!(
-                        target: "aurora_locus::cascade",
-                        cascade_id = %cascade_id,
-                        audience = %rec.uri,
-                        error = %e,
-                        "block cascade: transient write failure; skipped",
-                    );
-                }
-            }
-        }
-
-        if page_len < AUDIENCE_PAGE as usize {
-            break;
-        }
-        cursor = last_rkey;
-    }
-
-    if aborted {
-        // No completed event, no pass_end line — the unpaired pending/pass_start
-        // IS the durable "interrupted" signal (§3.2 / §4.2 / §4.3).
-        return Ok(());
-    }
-
-    // --- post-pass observability (H-4): completed event + pass_end log line ---
-    emit_block_changed(
-        ctx,
-        BlockChangedPayload {
-            block_uri: block_uri.to_string(),
-            blocker_did: blocker_did.to_string(),
-            subject_did: subject_did.to_string(),
-            operation: BlockMuteOperation::Created,
-            cascade_id: Some(cascade_id.clone()),
-            phase: "completed".to_string(),
-            audiences_total: None,
-            removed: Some(removed),
-            failed: Some(failed),
-        },
-    )
-    .await;
-    append_block_cascade_log(
-        ctx,
-        &serde_json::json!({
-            "phase": "pass_end",
-            "account": subject_did,
-            "blocker_did": blocker_did,
-            "cascade_id": cascade_id,
-            "operation": "created",
-            "removed": removed,
-            "attempted": attempted,
-            "failed": failed,
-            "at_ms": now_ms(),
-        }),
-    );
-    Ok(())
-}
-
-/// Record a `deleteBlock` for the audit trail (§3.3, forward-only). Deleting a
-/// block does **not** re-add the subject to any audience; this emits a single
-/// `completed` `KryphocronBlockChanged { operation: Deleted, removed: 0 }` and a
-/// `block-cascade.log` `removed: 0` line so the delete is observable without
-/// reversing membership. Best-effort. `subject` is recovered (best-effort)
-/// before the record is deleted; `None` (record already gone) still records the
-/// event with an empty subject.
-pub(crate) async fn record_block_deleted(
+/// A block no longer edits any audience (#536): audiences are held by the
+/// AppView, whose read rule refuses blocked readers and writers itself, so
+/// there are no audience records here to prune and a deleted block has none
+/// to restore. `subject` is recovered best-effort; `None` (no `subject` in the
+/// record, or the record already gone) records an empty subject.
+pub(crate) async fn record_block_change(
     ctx: &AppContext,
     blocker_did: &str,
     subject: Option<&str>,
     block_uri: &str,
+    operation: BlockMuteOperation,
 ) {
     let subject_did = subject.unwrap_or("").to_string();
     let cascade_id = Uuid::new_v4().to_string();
+    let operation_word = match operation {
+        BlockMuteOperation::Created => "created",
+        BlockMuteOperation::Deleted => "deleted",
+    };
     emit_block_changed(
         ctx,
         BlockChangedPayload {
             block_uri: block_uri.to_string(),
             blocker_did: blocker_did.to_string(),
             subject_did: subject_did.clone(),
-            operation: BlockMuteOperation::Deleted,
+            operation,
             cascade_id: Some(cascade_id.clone()),
             phase: "completed".to_string(),
             audiences_total: None,
@@ -937,7 +626,7 @@ pub(crate) async fn record_block_deleted(
             "account": subject_did,
             "blocker_did": blocker_did,
             "cascade_id": cascade_id,
-            "operation": "deleted",
+            "operation": operation_word,
             "removed": 0,
             "attempted": 0,
             "failed": 0,
@@ -1090,92 +779,5 @@ mod cascade_context_tests {
 
         let _ = ctx.mint_secondary_token(root.clone());
         assert_eq!(ctx.root_source(), &root, "after depth-2 mint");
-    }
-}
-
-#[cfg(test)]
-mod block_cascade_removal_tests {
-    //! #282 — pure audience-member-removal core (§2.4.2 / LB-3 / H-2 / H-6 (i)).
-    use super::*;
-    use serde_json::json;
-
-    const SUBJECT: &str = "did:plc:subject";
-
-    #[test]
-    fn removes_only_the_subject_and_preserves_order() {
-        let v = json!({
-            "mode": "list",
-            "members": ["did:plc:a", SUBJECT, "did:plc:b"],
-        });
-        let out = apply_subject_removal(v, normalize_did(SUBJECT)).expect("subject present");
-        assert_eq!(
-            out["members"],
-            json!(["did:plc:a", "did:plc:b"]),
-            "only the subject removed; non-subject order preserved",
-        );
-    }
-
-    #[test]
-    fn removes_all_occurrences_of_a_duplicated_subject() {
-        // LB-3 multiset semantics — a record that lists the subject twice ends
-        // with zero occurrences.
-        let v = json!({
-            "mode": "list",
-            "members": [SUBJECT, "did:plc:a", SUBJECT],
-        });
-        let out = apply_subject_removal(v, normalize_did(SUBJECT)).expect("subject present");
-        assert_eq!(out["members"], json!(["did:plc:a"]));
-    }
-
-    #[test]
-    fn subject_already_absent_is_skipped() {
-        // H-2 re-scan — no write, the caller contributes 0 to `removed`.
-        let v = json!({ "mode": "list", "members": ["did:plc:a", "did:plc:b"] });
-        assert!(apply_subject_removal(v, normalize_did(SUBJECT)).is_none());
-    }
-
-    #[test]
-    fn non_list_mode_is_skipped() {
-        for mode in ["everyone", "followers", "nobody"] {
-            let v = json!({ "mode": mode, "members": [SUBJECT] });
-            assert!(
-                apply_subject_removal(v, normalize_did(SUBJECT)).is_none(),
-                "mode {mode} has no member list to prune",
-            );
-        }
-    }
-
-    #[test]
-    fn unknown_fields_are_preserved() {
-        // H-6 (i) — the handler edits the decoded tree in place; any field it
-        // doesn't understand is carried through untouched.
-        let v = json!({
-            "mode": "list",
-            "members": [SUBJECT, "did:plc:a"],
-            "name": "close friends",
-            "futureUnknownField": { "nested": [1, 2, 3] },
-            "$type": "tools.kryphocron.policy.audience",
-        });
-        let out = apply_subject_removal(v, normalize_did(SUBJECT)).expect("subject present");
-        assert_eq!(out["members"], json!(["did:plc:a"]));
-        assert_eq!(out["name"], json!("close friends"));
-        assert_eq!(out["futureUnknownField"], json!({ "nested": [1, 2, 3] }));
-        assert_eq!(out["$type"], json!("tools.kryphocron.policy.audience"));
-    }
-
-    #[test]
-    fn normalize_did_trims_whitespace_uniformly() {
-        // The subject and each member pass through the same normalizer, so an
-        // incidentally-padded member still matches.
-        let v = json!({ "mode": "list", "members": ["  did:plc:subject  ", "did:plc:a"] });
-        let out = apply_subject_removal(v, normalize_did("  did:plc:subject  "))
-            .expect("padded subject matches after normalization");
-        assert_eq!(out["members"], json!(["did:plc:a"]));
-    }
-
-    #[test]
-    fn missing_members_array_is_skipped() {
-        let v = json!({ "mode": "list" });
-        assert!(apply_subject_removal(v, normalize_did(SUBJECT)).is_none());
     }
 }
