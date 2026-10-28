@@ -1020,12 +1020,11 @@ async fn update_post_private(
 // the SAME `DedicatedEndpoint{User}` write path as the four endpoints above —
 // not security-sensitive at #282's level (per the #280 design doc §1/§5).
 //
-// ROUTES REGISTERED IN #282 (rev4 F6/M-5). #281 shipped these handlers but left
-// their routes UNMERGED, because a `createBlock` that persisted the block record
-// without removing the blocked DID from the blocker's audiences would be a silent
-// privacy failure. #282 wires the cascade pass into `create_block` (it walks the
-// blocker's list-mode audiences and removes the subject — `crate::cascade`), so
-// the routes are now safe to mount and `routes()` merges them.
+// Routes registered in #282. #282 also walked the blocker's list-mode audience
+// records and removed the blocked DID; #536 dropped that pass, since audiences
+// are held by the AppView, whose read rule refuses blocked readers and writers
+// itself. A block is now written and recorded for audit
+// (`crate::cascade::record_block_change`).
 // ---------------------------------------------------------------------------
 
 /// `tools.kryphocron.graph.createBlock` — create a
@@ -1034,9 +1033,8 @@ async fn update_post_private(
 /// Private-tier, consumed by `BlockOracle` outside the normal capability flow
 /// (§7.2.4). The record is not secret: its commit goes out on the firehose
 /// like any other, so firehose readers can see who blocked whom (private is
-/// friction, not encryption; kryphocron-lexicons 0.3.3). **Route intentionally unregistered until
-/// #282** (see the module note above): this persists the block but does not yet
-/// cascade the audience removals.
+/// friction, not encryption; kryphocron-lexicons 0.3.3). It edits no audience
+/// (#536; see the module note above).
 async fn create_block(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -1045,7 +1043,7 @@ async fn create_block(
     let auth_did =
         authenticated_did_for_repo(&ctx, headers, &req.repo, AtProtoScope::RepoCreate).await?;
     // Recover the blocked subject from the record body before it is moved into
-    // the write helper — the cascade pass and the audience audit both need it.
+    // the write helper, for the audit record.
     let subject = req
         .record
         .get("subject")
@@ -1060,41 +1058,23 @@ async fn create_block(
         req.validate,
     )
     .await?;
-    // #282 — cascade the audience removals (§3.1): walk the blocker's list-mode
-    // audiences, remove `subject` (swap_cid-pinned), mint per-write cascade
-    // tokens, and emit the KryphocronBlockChanged pair + block-cascade.log. The
-    // minting lives in `crate::cascade` (H-5 confinement). Best-effort and
-    // forward-only: the block is already committed, so a cascade failure is
-    // logged loudly and never un-commits the block.
-    match subject {
-        Some(subject) => {
-            if let Err(e) =
-                crate::cascade::run_block_cascade(&ctx, auth_did.value(), &subject, &resp.uri).await
-            {
-                tracing::error!(
-                    target: "aurora_locus::kryphocron",
-                    block_uri = %resp.uri,
-                    error = %e,
-                    "createBlock committed but the block cascade failed (block stays committed)",
-                );
-            }
-        }
-        None => {
-            tracing::warn!(
-                target: "aurora_locus::kryphocron",
-                block_uri = %resp.uri,
-                "createBlock record carries no `subject`; audience cascade skipped",
-            );
-        }
-    }
+    // #536: the block edits no audience. Audiences are held by the AppView,
+    // whose read rule refuses blocked readers and writers itself; this only
+    // records the block (KryphocronBlockChanged + block-cascade.log).
+    crate::cascade::record_block_change(
+        &ctx,
+        auth_did.value(),
+        subject.as_deref(),
+        &resp.uri,
+        crate::kryphocron_audit::BlockMuteOperation::Created,
+    )
+    .await;
     Ok(Json(resp))
 }
 
 /// `tools.kryphocron.graph.deleteBlock` — delete a
-/// `tools.kryphocron.graph.block` record from the caller's repo. Forward-only
-/// per §7.2.4: deleting a block does NOT re-add the subject to audiences (#282
-/// emits the `removed: 0` audit). **Route intentionally unregistered until
-/// #282** (see the module note above).
+/// `tools.kryphocron.graph.block` record from the caller's repo, and records the
+/// delete for audit.
 async fn delete_block(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -1107,10 +1087,15 @@ async fn delete_block(
     // audit can name it (best-effort — `None` if already absent).
     let subject = crate::cascade::read_block_subject(&ctx, auth_did.value(), &block_uri).await;
     apply_single_delete(&ctx, &auth_did, NSID_BLOCK, req.rkey).await?;
-    // §3.3 forward-only: record the delete (KryphocronBlockChanged Deleted +
-    // block-cascade.log removed:0); membership is NOT restored.
-    crate::cascade::record_block_deleted(&ctx, auth_did.value(), subject.as_deref(), &block_uri)
-        .await;
+    // Record the delete (KryphocronBlockChanged Deleted + block-cascade.log).
+    crate::cascade::record_block_change(
+        &ctx,
+        auth_did.value(),
+        subject.as_deref(),
+        &block_uri,
+        crate::kryphocron_audit::BlockMuteOperation::Deleted,
+    )
+    .await;
     Ok(Json(serde_json::json!({})))
 }
 
