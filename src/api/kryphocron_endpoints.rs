@@ -55,10 +55,7 @@ use crate::{
     context::AppContext,
     error::{PdsError, PdsResult},
     kryphocron::{CapabilityClass, KryphocronWriteAuthorization},
-    kryphocron_audience::{
-        audience_owner, audience_reference, parse_record_uri, resolve_write, AudienceRef,
-        AudienceWriteDecision,
-    },
+    kryphocron_audience::{audience_owner, audience_reference, parse_record_uri, AudienceRef},
     kryphocron_audit::{AudienceCheckDeniedPayload, AudienceCheckResult},
     oauth::AtProtoScope,
 };
@@ -429,38 +426,6 @@ async fn apply_single_delete(
     Ok(())
 }
 
-/// Build the default `policy.audience` record for a freshly-created account
-/// (#334 / §7.3.3). Only `list` mode carries a member list (empty — the holder
-/// populates it); the relational modes (`everyone`/`followers`/`following`)
-/// need none. Pure, so the record shape is unit-testable without a repo.
-fn default_audience_record(mode: &str) -> serde_json::Value {
-    let mut record = serde_json::json!({ "$type": NSID_AUDIENCE, "mode": mode });
-    if mode == "list" {
-        record["members"] = serde_json::json!([]);
-    }
-    record
-}
-
-/// Author the deployment's default `policy.audience` record on a newly-created
-/// account's own repo (#334 / §6.6.2 item 2 / §7.3.3). Host-initiated on the
-/// account's behalf at setup: it authors through `apply_writes` directly (not
-/// the request chokepoint, so the new-account-access delay guard doesn't apply
-/// to this host write), signed with the new account's key, emitting a normal
-/// #commit. The caller treats failure as non-fatal — the account already
-/// exists. `mode` must be a participating mode (the `nobody` default never
-/// reaches here; see [`crate::kryphocron_policy::default_audience_mode`]).
-pub async fn author_default_audience(
-    ctx: &AppContext,
-    did: &str,
-    mode: &str,
-) -> PdsResult<String> {
-    let auth = AuthenticatedDid::from_authenticated(did.to_string());
-    let resp =
-        apply_single_create(ctx, &auth, NSID_AUDIENCE, None, default_audience_record(mode), None)
-            .await?;
-    Ok(resp.uri)
-}
-
 /// What both private-post procedures require before they read anything
 /// (#495): the record is a JSON object, the private tier is switched on, and
 /// the writer's repository is held here. Each answer depends on the request
@@ -678,13 +643,11 @@ async fn delete_post_private(
 /// request alone. A post without a reply parent is what `createPostPrivate`
 /// is for.
 ///
-/// **The audience check.** The writer is checked against the audience the
-/// reply itself names ([`check_participate_audience`]): that is the audience
-/// whose readers will be served the reply. On refusal the handler writes
-/// `KryphocronAudienceCheckDenied` in its own short tx on the shared account
-/// DB and answers 403 with one fixed message, whatever the cause: a post that
-/// does not exist, an audience that does not admit the writer, a block, and a
-/// reply outside its thread are the same response.
+/// **The audience.** Who may write under another account's audience is the
+/// AppView's to decide (#536): audiences are held there as member state, not
+/// as records in a repository, so locus has none to read
+/// ([`participate_audience`]). The AppView serves a reply only to readers its
+/// audience rule admits.
 ///
 /// **The thread check (#515, A-12).** A thread's audience is its root's
 /// current one: an audience change applies downthread. The reply must name
@@ -694,12 +657,9 @@ async fn delete_post_private(
 /// author is reached within a few posts. Posts held elsewhere are fetched
 /// from their PDS within a fixed budget ([`crate::kryphocron_thread`]). So a
 /// member added by a move may reply anywhere in the thread, and a member
-/// removed by it nowhere. A reply that fails gets the same 403.
-///
-/// **Audiences held elsewhere.** When the audience's owner is not an account
-/// on this PDS its record cannot be read, so who may write under it is not
-/// checked here (a warning is logged). The thread check still runs, so such a
-/// reply must still name the root's current audience and hang off its thread.
+/// removed by it nowhere. A reply that fails writes
+/// `KryphocronAudienceCheckDenied` in its own short tx on the shared account
+/// DB and gets a 403 with one fixed message, whatever the cause.
 async fn participate_private(
     State(ctx): State<AppContext>,
     headers: HeaderMap,
@@ -713,35 +673,27 @@ async fn participate_private(
     // #335 — instrument the write-side audience-oracle consultation (§6.4.1).
     // Aggregate counts only; surfaced by getOracleActivity.
     use crate::kryphocron_oracle_activity::OracleConsultation;
-    match check_participate_audience(&ctx, &parent_uri, &audience_uri, auth_did.value()).await? {
-        ParticipateAudienceOutcome::Allowed => {
+    match participate_audience(&audience_uri, auth_did.value()) {
+        ParticipateAudienceOutcome::Owner => {
             ctx.audience_oracle_activity.record(OracleConsultation::WriteAllowed);
         }
-        ParticipateAudienceOutcome::DeferredCrossDid { audience_owner } => {
+        ParticipateAudienceOutcome::Deferred { audience_owner } => {
             ctx.audience_oracle_activity.record(OracleConsultation::WriteDeferred);
-            tracing::warn!(
+            tracing::debug!(
                 target: "aurora_locus::kryphocron",
                 event = "participate_private_audience_check_deferred",
                 requester_did = %auth_did.value(),
                 parent_uri = %parent_uri,
                 audience_owner = %audience_owner,
-                reason = "audience_owner_not_local",
-                "audience check deferred: the audience's owner is not an \
-                 account on this PDS, so its audience record cannot be read",
+                "audience check deferred to the AppView, which holds audiences",
             );
-        }
-        ParticipateAudienceOutcome::Denied(payload) => {
-            ctx.audience_oracle_activity.record(OracleConsultation::WriteDenied);
-            return Err(refuse_participation(&ctx, auth_did.value(), payload).await);
         }
     }
 
     // #515, A-12 — the reply must belong to a thread under the audience it
     // names, and that audience must be the thread's: the root's current one.
     // Its chain reaches a post by the root's author through posts under that
-    // author's audiences. Same refusal as the audience check. Run second: the
-    // audience check is local and cheap, and a writer it refuses never makes
-    // this PDS fetch from another.
+    // author's audiences.
     if let Err(reason) = crate::kryphocron_thread::check_reply_thread(
         &ctx,
         auth_did.value(),
@@ -859,83 +811,28 @@ fn participation_refs(record: &serde_json::Value) -> PdsResult<(String, String)>
     Ok((parent_uri.to_string(), audience_uri))
 }
 
-/// Outcome of the host-side audience check that runs before
-/// `participatePrivate` writes. See [`check_participate_audience`].
-#[derive(Debug)]
+/// Who decides whether a writer may reply under an audience (#536).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ParticipateAudienceOutcome {
-    /// The writer may store the reply under the audience it names.
-    Allowed,
-    /// The audience's owner is not an account on this PDS, so the audience
-    /// record cannot be read. The participation is allowed; the handler logs
-    /// the unchecked write.
-    DeferredCrossDid { audience_owner: String },
-    /// The handler writes the audience-check-denied event and returns 403.
-    Denied(AudienceCheckDeniedPayload),
+    /// The writer owns the audience, so may always write under it.
+    Owner,
+    /// Another account's audience. Audiences are held by the AppView as member
+    /// state, not as records in a repository, so locus has nothing to read and
+    /// leaves the decision to the AppView's read rule. The handler logs it.
+    Deferred { audience_owner: String },
 }
 
-/// Host-side audience check for `participatePrivate` (#495).
-///
-/// `audience_uri` is the audience the reply names; `parent_uri` is the post
-/// it replies to (the denial's subject). Both have been syntax-checked by
-/// [`participation_refs`]. Whether the reply belongs to the parent's thread,
-/// and names that thread's audience, is the thread check's question
-/// ([`crate::kryphocron_thread`]); this one asks only who may write under
-/// the audience.
-///
-/// 1. The audience's owner may always write under its own audience.
-/// 2. When the audience's owner is not an account here the check cannot run:
-///    [`ParticipateAudienceOutcome::DeferredCrossDid`].
-/// 3. Otherwise the audience record decides, by its mode
-///    ([`crate::kryphocron_audience::resolve_write`]). A missing or
-///    undecodable audience record denies.
-///
-/// # Errors
-///
-/// A store error. A denial is an `Ok` outcome, never an error, so that every
-/// denial reaches the one refusal the handler gives.
-async fn check_participate_audience(
-    ctx: &AppContext,
-    parent_uri: &str,
-    audience_uri: &str,
-    writer_did: &str,
-) -> PdsResult<ParticipateAudienceOutcome> {
-    let owner_did = audience_owner(audience_uri)
-        .ok_or_else(|| PdsError::Validation("invalid audience URI".to_string()))?;
-    let denied = |mode: &str, result: AudienceCheckResult| {
-        ParticipateAudienceOutcome::Denied(AudienceCheckDeniedPayload {
-            capability_attempted: "ParticipatePrivate".to_string(),
-            subject_uri: parent_uri.to_string(),
-            requester_did: writer_did.to_string(),
-            audience_uri: Some(audience_uri.to_string()),
-            audience_mode: mode.to_string(),
-            audience_check_result: result,
-            trace_id: crate::kryphocron_audit::synthesize_trace_id(),
-            payload_completeness: crate::kryphocron_audit::PayloadCompleteness::Full,
-        })
-    };
-
-    if owner_did == writer_did {
-        return Ok(ParticipateAudienceOutcome::Allowed);
+/// Who decides whether `writer_did` may reply under `audience_uri` (#495,
+/// #536). `audience_uri` was syntax-checked by [`participation_refs`].
+/// Whether the reply belongs to its thread, and names the thread's audience,
+/// is still checked here, by [`crate::kryphocron_thread`].
+fn participate_audience(audience_uri: &str, writer_did: &str) -> ParticipateAudienceOutcome {
+    match audience_owner(audience_uri) {
+        Some(owner) if owner == writer_did => ParticipateAudienceOutcome::Owner,
+        owner => ParticipateAudienceOutcome::Deferred {
+            audience_owner: owner.unwrap_or_default().to_string(),
+        },
     }
-    if !ctx.actor_store.exists(owner_did).await {
-        return Ok(ParticipateAudienceOutcome::DeferredCrossDid {
-            audience_owner: owner_did.to_string(),
-        });
-    }
-
-    let Some(audience) = load_record_json(ctx, owner_did, audience_uri).await? else {
-        return Ok(denied("unknown", AudienceCheckResult::NoAudienceConfigured));
-    };
-    let (mode, decision) = resolve_write(ctx, writer_did, owner_did, &audience).await?;
-    Ok(match decision {
-        AudienceWriteDecision::Allowed => ParticipateAudienceOutcome::Allowed,
-        AudienceWriteDecision::NotInAudience => {
-            denied(mode.as_audit_str(), AudienceCheckResult::NotInAudience)
-        }
-        AudienceWriteDecision::Unresolved => {
-            denied(mode.as_audit_str(), AudienceCheckResult::NoAudienceConfigured)
-        }
-    })
 }
 
 /// Read and decode one stored record. `None` when the record or its block is
@@ -1054,8 +951,8 @@ async fn delete_audience(
 /// Refused with 400 `InvalidRequest`: no such post; a reply (a reply's
 /// audience is its thread's), except a branch root, a private reply to a
 /// public post, which anchors its branch as a root anchors its thread
-/// (A-13); an `audienceList` that is not one of the writer's own audience
-/// records, or names one that does not exist.
+/// (A-13); an `audienceList` that is not the URI of one of the writer's own
+/// audiences (whether it exists is the AppView's to know, #536).
 /// `swapRecord` must be the post's current CID (409 `InvalidSwap`).
 ///
 /// The change applies downthread (A-12): replies already written keep their
@@ -1072,17 +969,13 @@ async fn update_post_private(
     let writer = auth_did.value();
     let reference = serde_json::json!({ "audienceList": req.audience_list });
     private_post_preconditions(&ctx, writer, &reference).await?;
+    // Ownership only: audiences are held by the AppView, not in the repo
+    // (#536), so there is no record here to test for, as in createPostPrivate.
     if audience_owner(&req.audience_list) != Some(writer) {
         return Err(PdsError::Validation(
             "audienceList must be the at:// URI of one of the writer's own audience records"
                 .to_string(),
         ));
-    }
-    if load_record_json(&ctx, writer, &req.audience_list).await?.is_none() {
-        return Err(PdsError::Validation(format!(
-            "audienceList names no audience record: {}",
-            req.audience_list
-        )));
     }
 
     let Some(current) = read_own_record(&ctx, writer, NSID_POST_PRIVATE, &req.rkey).await?
@@ -1222,37 +1115,15 @@ async fn delete_block(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // #334 — the default policy.audience record shape authored at account setup.
-    #[test]
-    fn default_audience_record_shapes_per_mode() {
-        let list = default_audience_record("list");
-        assert_eq!(list["$type"], NSID_AUDIENCE);
-        assert_eq!(list["mode"], "list");
-        assert_eq!(list["members"], serde_json::json!([]), "list mode carries an empty member list");
-
-        for mode in ["everyone", "followers", "following"] {
-            let rec = default_audience_record(mode);
-            assert_eq!(rec["mode"], mode);
-            assert!(rec.get("members").is_none(), "{mode} mode carries no member list");
-        }
-    }
-}
-
-#[cfg(test)]
 mod participate_audience_tests {
-    //! #495: who may reply under whose audience.
+    //! #495, #536: who decides whether a writer may reply under an audience.
     use super::*;
-    use crate::kryphocron_audience::test_support::{ctx_with_repos, seed, seed_bytes};
+    use crate::kryphocron_audience::test_support::ctx_with_repos;
     use serde_json::json;
 
     const OWNER: &str = "did:plc:owner";
     const WRITER: &str = "did:plc:writer";
-    const THIRD: &str = "did:plc:third";
     const REMOTE: &str = "did:plc:elsewhere";
-    const FOLLOW: &str = "app.bsky.graph.follow";
 
     fn audience_uri(did: &str) -> String {
         format!("at://{did}/{NSID_AUDIENCE}/aud")
@@ -1262,208 +1133,24 @@ mod participate_audience_tests {
         format!("at://{did}/{NSID_POST_PRIVATE}/{rkey}")
     }
 
-    /// Owner, writer and a third account, with the owner's audience in
-    /// `mode` and a post by the owner under it. Returns the post's URI.
-    async fn thread(mode: serde_json::Value) -> (AppContext, String) {
-        let ctx = ctx_with_repos(&[OWNER, WRITER, THIRD]).await;
-        seed(&ctx, OWNER, NSID_AUDIENCE, "aud", json!({ "mode": mode, "members": [] })).await;
-        let post = seed(
-            &ctx,
-            OWNER,
-            NSID_POST_PRIVATE,
-            "p1",
-            json!({ "audienceList": audience_uri(OWNER) }),
-        )
-        .await;
-        (ctx, post)
-    }
-
-    async fn check(ctx: &AppContext, parent: &str, audience: &str, writer: &str) -> ParticipateAudienceOutcome {
-        check_participate_audience(ctx, parent, audience, writer)
-            .await
-            .expect("check")
-    }
-
-    fn denial(outcome: ParticipateAudienceOutcome) -> AudienceCheckDeniedPayload {
-        match outcome {
-            ParticipateAudienceOutcome::Denied(payload) => payload,
-            other => panic!("expected a denial, got {other:?}"),
-        }
-    }
-
-    fn assert_allowed(outcome: ParticipateAudienceOutcome) {
-        assert!(
-            matches!(outcome, ParticipateAudienceOutcome::Allowed),
-            "expected allowed, got {outcome:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn followers_audience_admits_a_follower_and_refuses_others() {
-        let (ctx, post) = thread(json!("followers")).await;
-        let audience = audience_uri(OWNER);
-        let follow = seed(&ctx, WRITER, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-
-        assert_allowed(check(&ctx, &post, &audience, WRITER).await);
-
-        let refused = denial(check(&ctx, &post, &audience, THIRD).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        assert_eq!(refused.audience_mode, "followers");
-        assert_eq!(refused.audience_uri.as_deref(), Some(audience.as_str()));
-        assert_eq!(refused.subject_uri, post);
-
-        ctx.actor_store
-            .delete_record(WRITER, &follow)
-            .await
-            .expect("unfollow");
-        let after_unfollow = denial(check(&ctx, &post, &audience, WRITER).await);
+    /// #536: audiences are held by the AppView, so locus reads no audience
+    /// record. The owner may always write under its own audience; any other
+    /// writer is left to the AppView, whoever holds the owner's repository.
+    #[test]
+    fn only_the_owner_is_decided_here_and_every_other_writer_is_deferred() {
         assert_eq!(
-            after_unfollow.audience_check_result,
-            AudienceCheckResult::NotInAudience
+            participate_audience(&audience_uri(OWNER), OWNER),
+            ParticipateAudienceOutcome::Owner
         );
-    }
-
-    #[tokio::test]
-    async fn a_block_refuses_a_follower_and_is_recorded_as_not_in_audience() {
-        let (ctx, post) = thread(json!("followers")).await;
-        seed(&ctx, WRITER, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-        seed(&ctx, OWNER, NSID_BLOCK, "b1", json!({ "subject": WRITER })).await;
-        let refused = denial(check(&ctx, &post, &audience_uri(OWNER), WRITER).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        assert_eq!(refused.audience_mode, "followers");
-    }
-
-    #[tokio::test]
-    async fn everyone_admits_anyone_not_blocked() {
-        let (ctx, post) = thread(json!("everyone")).await;
-        let audience = audience_uri(OWNER);
-        assert_allowed(check(&ctx, &post, &audience, WRITER).await);
-        seed(&ctx, THIRD, "app.bsky.graph.block", "b1", json!({ "subject": OWNER })).await;
-        let refused = denial(check(&ctx, &post, &audience, THIRD).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        assert_eq!(refused.audience_mode, "everyone");
-    }
-
-    #[tokio::test]
-    async fn list_audience_is_members_only_and_unmoved_by_blocks() {
-        let ctx = ctx_with_repos(&[OWNER, WRITER, THIRD]).await;
-        seed(
-            &ctx,
-            OWNER,
-            NSID_AUDIENCE,
-            "aud",
-            json!({ "mode": "list", "members": [WRITER] }),
-        )
-        .await;
-        let post = seed(
-            &ctx,
-            OWNER,
-            NSID_POST_PRIVATE,
-            "p1",
-            json!({ "audienceList": audience_uri(OWNER) }),
-        )
-        .await;
-        let audience = audience_uri(OWNER);
-        seed(&ctx, OWNER, NSID_BLOCK, "b1", json!({ "subject": WRITER })).await;
-        seed(&ctx, THIRD, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-
-        assert_allowed(check(&ctx, &post, &audience, WRITER).await);
-        let refused = denial(check(&ctx, &post, &audience, THIRD).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        assert_eq!(refused.audience_mode, "list");
-    }
-
-    #[tokio::test]
-    async fn following_admits_a_writer_the_owner_follows() {
-        let (ctx, post) = thread(json!("following")).await;
-        let audience = audience_uri(OWNER);
-        seed(&ctx, OWNER, FOLLOW, "f1", json!({ "subject": WRITER })).await;
-        assert_allowed(check(&ctx, &post, &audience, WRITER).await);
-        let refused = denial(check(&ctx, &post, &audience, THIRD).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        assert_eq!(refused.audience_mode, "following");
-    }
-
-    #[tokio::test]
-    async fn nobody_following_and_unknown_modes_refuse_everyone_but_the_owner() {
-        // The writer follows the owner below; `following` needs the reverse.
-        let cases = [
-            (json!("nobody"), AudienceCheckResult::NotInAudience, "nobody"),
-            (json!("following"), AudienceCheckResult::NotInAudience, "following"),
-            (json!("Followers"), AudienceCheckResult::NoAudienceConfigured, "unknown"),
-            (json!(7), AudienceCheckResult::NoAudienceConfigured, "unknown"),
-        ];
-        for (mode, result, word) in cases {
-            let (ctx, post) = thread(mode.clone()).await;
-            let audience = audience_uri(OWNER);
-            seed(&ctx, WRITER, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-            let refused = denial(check(&ctx, &post, &audience, WRITER).await);
-            assert_eq!(refused.audience_check_result, result, "{mode}");
-            assert_eq!(refused.audience_mode, word, "{mode}");
-            assert_allowed(check(&ctx, &post, &audience, OWNER).await);
+        for owner in [OWNER, REMOTE] {
+            assert_eq!(
+                participate_audience(&audience_uri(owner), WRITER),
+                ParticipateAudienceOutcome::Deferred {
+                    audience_owner: owner.to_string()
+                },
+                "{owner}"
+            );
         }
-    }
-
-    #[tokio::test]
-    async fn a_reply_to_a_reply_in_a_third_repository_is_checked_against_the_thread_audience() {
-        let (ctx, _post) = thread(json!("followers")).await;
-        let audience = audience_uri(OWNER);
-        // THIRD replied under the owner's audience; WRITER replies to that.
-        let reply = seed(
-            &ctx,
-            THIRD,
-            NSID_POST_PRIVATE,
-            "r1",
-            json!({ "audienceList": audience }),
-        )
-        .await;
-        let refused = denial(check(&ctx, &reply, &audience, WRITER).await);
-        assert_eq!(refused.audience_mode, "followers");
-        seed(&ctx, WRITER, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-        assert_allowed(check(&ctx, &reply, &audience, WRITER).await);
-    }
-
-    #[tokio::test]
-    async fn a_parent_held_elsewhere_does_not_skip_a_local_audience() {
-        let (ctx, _post) = thread(json!("followers")).await;
-        let parent = post_uri(REMOTE, "p1");
-        let refused = denial(check(&ctx, &parent, &audience_uri(OWNER), WRITER).await);
-        assert_eq!(refused.audience_check_result, AudienceCheckResult::NotInAudience);
-        seed(&ctx, WRITER, FOLLOW, "f1", json!({ "subject": OWNER })).await;
-        assert_allowed(check(&ctx, &parent, &audience_uri(OWNER), WRITER).await);
-    }
-
-    #[tokio::test]
-    async fn an_audience_held_elsewhere_is_deferred() {
-        let (ctx, _post) = thread(json!("everyone")).await;
-        let outcome = check(&ctx, &post_uri(REMOTE, "p1"), &audience_uri(REMOTE), WRITER).await;
-        match outcome {
-            ParticipateAudienceOutcome::DeferredCrossDid { audience_owner } => {
-                assert_eq!(audience_owner, REMOTE);
-            }
-            other => panic!("expected a deferral, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_missing_or_undecodable_audience_record_refuses() {
-        let ctx = ctx_with_repos(&[OWNER, WRITER]).await;
-        let post = seed(
-            &ctx,
-            OWNER,
-            NSID_POST_PRIVATE,
-            "p1",
-            json!({ "audienceList": audience_uri(OWNER) }),
-        )
-        .await;
-        let refused = denial(check(&ctx, &post, &audience_uri(OWNER), WRITER).await);
-        assert_eq!(
-            refused.audience_check_result,
-            AudienceCheckResult::NoAudienceConfigured
-        );
-        seed_bytes(&ctx, OWNER, NSID_AUDIENCE, "aud", b"not cbor").await;
-        let refused = denial(check(&ctx, &post, &audience_uri(OWNER), WRITER).await);
-        assert_eq!(refused.audience_mode, "unknown");
     }
 
     #[test]
@@ -1743,16 +1430,22 @@ mod procedure_tests {
         });
         let reply = post(&ctx, &alice, reply_record).await;
 
-        let missing_audience = format!("at://{alice}/{NSID_AUDIENCE}/nothing-here");
         for (rkey, audience_list) in [
             (rkey_of(&reply.uri), mine.uri.as_str()),
             (rkey_of(&root.uri), theirs.uri.as_str()),
-            (rkey_of(&root.uri), missing_audience.as_str()),
             ("3nosuchpost22", mine.uri.as_str()),
         ] {
             let err = update(&ctx, &alice, rkey, audience_list, None).await.unwrap_err();
             assert!(matches!(err, PdsError::Validation(_)), "{rkey} {audience_list}: {err:?}");
         }
+
+        // #536: an audience of the writer's with no record in the repo is
+        // accepted; audiences are held by the AppView, which knows whether it
+        // exists.
+        let held_elsewhere = format!("at://{alice}/{NSID_AUDIENCE}/held-by-the-appview");
+        update(&ctx, &alice, rkey_of(&root.uri), &held_elsewhere, None)
+            .await
+            .expect("an own audience without a record is accepted");
     }
 
     async fn participate(
@@ -1896,18 +1589,20 @@ mod procedure_tests {
             .await
             .expect("a member added by the move replies anywhere in the thread");
 
-        // Bob, removed by the move, is refused under either audience.
-        for audience_uri in [&close.uri, &followers.uri] {
-            for parent in [&root.uri, &bobs.uri] {
-                let err = participate(&ctx, &bob, reply_record(audience_uri, &root, parent))
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(err, PdsError::Authorization(_)),
-                    "{audience_uri} {parent}: {err:?}"
-                );
-            }
+        // Bob cannot reply under the thread's old audience: it is no longer
+        // the root's.
+        for parent in [&root.uri, &bobs.uri] {
+            let err = participate(&ctx, &bob, reply_record(&followers.uri, &root, parent))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, PdsError::Authorization(_)), "{parent}: {err:?}");
         }
+        // Under the new one, whether the list admits him is the AppView's to
+        // decide (#536): locus stores the reply, and the AppView serves it
+        // only to readers the list admits.
+        participate(&ctx, &bob, reply_record(&close.uri, &root, &root.uri))
+            .await
+            .expect("membership of the list is the AppView's to decide");
 
         // Nor can Bob get in through createPostPrivate under his own audience.
         let bobs_own = audience(&ctx, &bob, "own", json!({ "mode": "everyone" }), None)
@@ -2036,10 +1731,11 @@ mod procedure_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PdsError::Validation(_)), "{err:?}");
-        let err = participate(&ctx, &dave, reply_record(&followers.uri, &public_ref, &branch_root.uri))
+        // D does not follow B, but whether B's followers audience admits D is
+        // the AppView's to decide (#536): locus stores the reply.
+        participate(&ctx, &dave, reply_record(&followers.uri, &public_ref, &branch_root.uri))
             .await
-            .unwrap_err();
-        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
+            .expect("audience membership is the AppView's to decide");
 
         // B moves the branch root to a list with D but not C.
         let close = audience(&ctx, &bob, "close", json!({ "mode": "list", "members": [dave] }), None)
@@ -2063,12 +1759,12 @@ mod procedure_tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
-        for audience_uri in [&close.uri, &followers.uri] {
-            let err = participate(&ctx, &carol, reply_record(audience_uri, &public_ref, &branch_root.uri))
-                .await
-                .unwrap_err();
-            assert!(matches!(err, PdsError::Authorization(_)), "{audience_uri}: {err:?}");
-        }
+        // Nobody replies under the branch's old audience: it is no longer the
+        // branch root's.
+        let err = participate(&ctx, &carol, reply_record(&followers.uri, &public_ref, &branch_root.uri))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PdsError::Authorization(_)), "{err:?}");
 
         // B replies in B's own branch with createPostPrivate, under its
         // current audience; under the old one it is refused.

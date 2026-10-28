@@ -16,11 +16,10 @@ const { test } = require('node:test');
 const PAGES = path.resolve(__dirname, '..');
 const src = fs.readFileSync(path.join(PAGES, 'ConfigKryphocronPolicy.js'), 'utf8');
 
-test('the page declares the five registered policy keys', () => {
+test('the page declares the four registered policy keys', () => {
   for (const key of [
     'kryphocron.policy.new-account-access',
     'kryphocron.policy.access-delay-days',
-    'kryphocron.policy.default-audience-mode',
     'kryphocron.deployment.process-shape',
     'kryphocron.laquna.account-cadence-range',
   ]) {
