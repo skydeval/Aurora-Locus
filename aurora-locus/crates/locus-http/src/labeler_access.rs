@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use locus_core::locus_nsid;
@@ -42,29 +43,93 @@ pub const AUDIT_ACTION: &str = "labeler.createAccount";
 /// Waits before each try at notifying a cairn, in seconds.
 const NOTIFY_BACKOFF_S: &[u64] = &[0, 10, 60, 300, 1800, 3600];
 
-/// One setting item as (DID, cap): `did:...` or `did:... 3`.
-#[must_use]
-pub fn parse_entry(item: &str) -> Option<(String, i64)> {
-    let mut parts = item.split_whitespace();
-    let did = parts.next()?;
-    let cap = match parts.next() {
-        None => DEFAULT_CAP,
-        Some(n) => n.parse().ok().filter(|n: &i64| *n >= 0)?,
-    };
-    if parts.next().is_some() || !did.starts_with("did:") || did.contains('#') {
-        return None;
-    }
-    Some((did.to_owned(), cap))
+/// A registered cairn: its DID, its cap, and the key its tokens must be
+/// signed with, once pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub did: String,
+    pub cap: i64,
+    /// A `did:key`. Until one is pinned, tokens are checked against the
+    /// DID document's `#atproto_label` key.
+    pub key: Option<String>,
 }
 
-/// One setting item for (DID, cap); the default cap is left implicit.
+/// One setting item: the DID, then optionally its cap and its pinned
+/// `did:key`, space-separated (`did:web:c`, `did:web:c 3`,
+/// `did:web:c 3 did:key:z...`).
 #[must_use]
-pub fn format_entry(did: &str, cap: i64) -> String {
-    if cap == DEFAULT_CAP {
-        did.to_owned()
-    } else {
-        format!("{did} {cap}")
+pub fn parse_entry(item: &str) -> Option<Entry> {
+    let mut parts = item.split_whitespace();
+    let did = parts.next()?;
+    if !did.starts_with("did:") || did.starts_with("did:key:") || did.contains('#') {
+        return None;
     }
+    let mut entry = Entry {
+        did: did.to_owned(),
+        cap: DEFAULT_CAP,
+        key: None,
+    };
+    let mut cap_seen = false;
+    for part in parts {
+        if let Some(k) = part.strip_prefix("did:key:") {
+            if entry.key.is_some() || k.is_empty() {
+                return None;
+            }
+            entry.key = Some(part.to_owned());
+        } else {
+            let n: i64 = part.parse().ok().filter(|n: &i64| *n >= 0)?;
+            if cap_seen {
+                return None;
+            }
+            cap_seen = true;
+            entry.cap = n;
+        }
+    }
+    Some(entry)
+}
+
+/// One setting item for an entry; the default cap is left implicit.
+#[must_use]
+pub fn format_entry(e: &Entry) -> String {
+    let mut out = e.did.clone();
+    if e.cap != DEFAULT_CAP || e.key.is_some() {
+        out.push_str(&format!(" {}", e.cap));
+    }
+    if let Some(k) = &e.key {
+        out.push_str(&format!(" {k}"));
+    }
+    out
+}
+
+/// Whether `k` is a `did:key` (secp256k1 or P-256) a cairn can pin.
+#[must_use]
+pub fn valid_key(k: &str) -> bool {
+    proto_blue_crypto::parse_did_key(k).is_ok()
+}
+
+/// Refuses a registered list with an item that doesn't read as an entry, or
+/// a key that isn't a `did:key` (it would silently unregister that cairn).
+pub fn check_list(value: &Value) -> Result<(), String> {
+    for item in value.as_array().into_iter().flatten() {
+        let text = item.as_str().unwrap_or_default();
+        match parse_entry(text) {
+            None => return Err(format!("\"{text}\" isn't a DID, then a cap and a did:key")),
+            Some(Entry { key: Some(k), .. }) if !valid_key(&k) => {
+                return Err(format!("{k} isn't a secp256k1 or P-256 did:key"));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The registered entry for `did`, if any.
+#[must_use]
+pub fn entry_for(snap: &locus_core::settings::Snapshot, did: &str) -> Option<Entry> {
+    snap.list(SETTING)
+        .iter()
+        .filter_map(|item| parse_entry(item))
+        .find(|e| !did.is_empty() && e.did == did)
 }
 
 /// The moderation service DIDs whose console cards can register the cairn
@@ -77,21 +142,18 @@ pub fn trust_of(
     snap: &locus_core::settings::Snapshot,
     did: &str,
 ) -> locus_web::console_pages::Trust {
-    let found = snap
-        .list(SETTING)
-        .iter()
-        .filter_map(|item| parse_entry(item))
-        .find(|(d, _)| !did.is_empty() && d == did);
+    let found = entry_for(snap, did);
     locus_web::console_pages::Trust {
         on: found.is_some(),
-        cap: found.map_or(DEFAULT_CAP, |(_, cap)| cap),
+        cap: found.map_or(DEFAULT_CAP, |e| e.cap),
     }
 }
 
 /// The registered list after a moderation service DID's card is saved: the
 /// card's DID goes from `old` to `new`, registered with `cap` or not at
 /// all. The trust moves with the DID, so `old` is dropped too, unless
-/// `keep` (another card still names it). Items that don't parse are kept.
+/// `keep` (another card still names it). Items that don't parse are kept,
+/// and a DID that stays keeps its pinned key (a new DID starts with none).
 #[must_use]
 pub fn retrust(
     items: &[String],
@@ -106,48 +168,160 @@ pub fn retrust(
     let mut out: Vec<String> = items
         .iter()
         .filter_map(|item| match parse_entry(item) {
-            Some((d, _)) if d == new => match cap {
+            Some(e) if e.did == new => match cap {
                 Some(cap) if !placed => {
                     placed = true;
-                    Some(format_entry(new, cap))
+                    Some(format_entry(&Entry { cap, ..e }))
                 }
                 _ => None,
             },
-            Some((d, _)) if drop_old && d == old => None,
+            Some(e) if drop_old && e.did == old => None,
             _ => Some(item.clone()),
         })
         .collect();
     if let (Some(cap), false) = (cap, placed) {
-        out.push(format_entry(new, cap));
+        out.push(format_entry(&Entry {
+            did: new.to_owned(),
+            cap,
+            key: None,
+        }));
     }
     out
 }
 
-/// The calling cairn's DID and cap, if its service token is good and it is
-/// registered.
-async fn registered(s: &AppState, headers: &HeaderMap, lxm: &str) -> XrpcResult<(String, i64)> {
-    let did = auth::user_service_auth(s, headers, lxm).await?;
-    let cap = s
-        .snapshot()
-        .list(SETTING)
-        .iter()
-        .filter_map(|item| parse_entry(item))
-        .find(|(d, _)| *d == did)
-        .map(|(_, cap)| cap);
-    match cap {
-        Some(cap) => Ok((did, cap)),
-        None => Err(XrpcError::new(
+/// The longest a trust-link token may live, in seconds.
+const MAX_TOKEN_S: i64 = 300;
+
+/// base64url (no padding) SHA-256 of a request body, as `bodyHash`.
+#[must_use]
+pub fn body_hash(body: &[u8]) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(body))
+}
+
+/// A JSON request body, read after its hash was checked.
+fn json_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> XrpcResult<T> {
+    serde_json::from_slice(body)
+        .map_err(|e| XrpcError::invalid_request(format!("Invalid request body: {e}")))
+}
+
+fn unauthorized(name: &str, message: &str) -> XrpcError {
+    XrpcError::new(StatusCode::UNAUTHORIZED, name, message)
+}
+
+/// The calling cairn's entry, if its token is good and it is registered.
+///
+/// A cairn with a pinned key signs as its bare DID with that key, and every
+/// POST carries `bodyHash`; its DID document is never read. Until a key is
+/// pinned, the token's `iss` is `<did>#atproto_labeler`, checked against
+/// the document's `#atproto_label` key, and `bodyHash` is checked when
+/// present. `needs_key`: the method only serves a pinned cairn
+/// (`KeyNotPinned` otherwise). Every token is single-use and lives at most
+/// five minutes. `body` is the POST body (None for a GET).
+async fn cairn_auth(
+    s: &AppState,
+    headers: &HeaderMap,
+    lxm: &str,
+    body: Option<&[u8]>,
+    needs_key: bool,
+) -> XrpcResult<Entry> {
+    use locus_auth::service_jwt;
+    let token = auth::bearer(headers)?;
+    let now = locus_core::time::now_ms() / 1000;
+    let jwt = service_jwt::parse(token, Some(lxm), now)
+        .map_err(|e| unauthorized(e.name(), &e.to_string()))?;
+    if !jwt.lifetime_ok(now) || jwt.exp - now > MAX_TOKEN_S + service_jwt::SKEW_S {
+        return Err(unauthorized(
+            "BadJwt",
+            "jwt lifetime is longer than five minutes",
+        ));
+    }
+    let Some(jti) = jwt.jti.clone() else {
+        return Err(unauthorized("BadJwt", "jwt has no jti"));
+    };
+    let did = jwt.iss.split('#').next().unwrap_or_default();
+    let Some(entry) = entry_for(&s.snapshot(), did) else {
+        return Err(XrpcError::new(
             StatusCode::FORBIDDEN,
             "NotRegisteredLabeler",
             "This labeler isn't registered with this PDS",
-        )),
+        ));
+    };
+    let bad_iss = || unauthorized("BadJwtIss", "jwt iss is not this cairn's");
+    let bad_sig = || unauthorized("BadJwtSignature", "jwt signature does not match jwt issuer");
+    match &entry.key {
+        Some(key) => {
+            if jwt.iss != entry.did {
+                return Err(bad_iss());
+            }
+            if !jwt.verifies_with(key) {
+                return Err(bad_sig());
+            }
+        }
+        None => {
+            if needs_key {
+                return Err(XrpcError::new(
+                    StatusCode::FORBIDDEN,
+                    "KeyNotPinned",
+                    "This cairn has no key pinned here yet",
+                ));
+            }
+            if jwt.iss != format!("{}#atproto_labeler", entry.did) {
+                return Err(bad_iss());
+            }
+            let mut verified = false;
+            for force in [false, true] {
+                let Some(doc) = s.resolve_did_doc(&entry.did, force).await? else {
+                    return Err(XrpcError::auth_required("could not resolve iss did"));
+                };
+                let key =
+                    proto_blue_common::did_doc::get_verification_material(&doc, "atproto_label")
+                        .map(|k| format!("did:key:{}", k.public_key_multibase));
+                if key.is_some_and(|k| jwt.verifies_with(&k)) {
+                    verified = true;
+                    break;
+                }
+            }
+            if !verified {
+                return Err(bad_sig());
+            }
+        }
     }
+    if !s.accepts_aud(&jwt.aud) {
+        return Err(unauthorized(
+            "BadJwtAudience",
+            "jwt audience does not match service did",
+        ));
+    }
+    if let Some(body) = body {
+        let ok = match &jwt.body_hash {
+            Some(h) => *h == body_hash(body),
+            None => entry.key.is_none(),
+        };
+        if !ok {
+            return Err(unauthorized(
+                "BadJwtBodyHash",
+                "jwt bodyHash does not match the request body",
+            ));
+        }
+    }
+    let ttl = (jwt.exp - now + service_jwt::SKEW_S).max(1) * 1000;
+    if !s
+        .unique(&format!("ServiceAuth@{}", jwt.iss), &jti, ttl)
+        .await?
+    {
+        return Err(unauthorized("BadJwt", "jwt replayed"));
+    }
+    Ok(entry)
 }
 
 /// `getLabelerAccess`: whether the calling cairn is registered here, and
 /// how many of its accounts are left.
 pub async fn get_labeler_access(State(s): St, headers: HeaderMap) -> XrpcResult<Json<Value>> {
-    let (cairn, cap) = registered(&s, &headers, GET_ACCESS).await?;
+    let Entry {
+        did: cairn, cap, ..
+    } = cairn_auth(&s, &headers, GET_ACCESS, None, false).await?;
     let used = s.store.audit_count(&cairn, AUDIT_ACTION).await?;
     Ok(Json(json!({
         "registered": true,
@@ -176,7 +350,7 @@ static CREATING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub async fn create_labeler_account(
     State(s): St,
     headers: HeaderMap,
-    Json(input): Json<CreateLabelerAccountInput>,
+    body: Bytes,
 ) -> XrpcResult<Json<Value>> {
     if s.role == locus_core::bootstrap::Role::Entryway {
         return Err(XrpcError::new(
@@ -185,7 +359,10 @@ pub async fn create_labeler_account(
             "Create labeler accounts on a shard",
         ));
     }
-    let (cairn, cap) = registered(&s, &headers, CREATE_ACCOUNT).await?;
+    let Entry {
+        did: cairn, cap, ..
+    } = cairn_auth(&s, &headers, CREATE_ACCOUNT, Some(&body), false).await?;
+    let input: CreateLabelerAccountInput = json_body(&body)?;
     let did = input
         .did
         .filter(|d| !d.is_empty())
@@ -274,7 +451,7 @@ pub struct DeleteLabelerAccountInput {
 pub async fn delete_labeler_account(
     State(s): St,
     headers: HeaderMap,
-    Json(input): Json<DeleteLabelerAccountInput>,
+    body: Bytes,
 ) -> XrpcResult<Json<Value>> {
     if s.role == locus_core::bootstrap::Role::Entryway {
         return Err(XrpcError::new(
@@ -283,7 +460,9 @@ pub async fn delete_labeler_account(
             "Delete labeler accounts on a shard",
         ));
     }
-    let (cairn, _) = registered(&s, &headers, DELETE_ACCOUNT).await?;
+    let Entry { did: cairn, .. } =
+        cairn_auth(&s, &headers, DELETE_ACCOUNT, Some(&body), false).await?;
+    let input: DeleteLabelerAccountInput = json_body(&body)?;
     if !s.store.audit_has(&cairn, AUDIT_ACTION, &input.did).await? {
         return Err(XrpcError::new(
             StatusCode::FORBIDDEN,
@@ -376,15 +555,31 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
 mod tests {
     use super::*;
 
+    fn e(did: &str, cap: i64, key: Option<&str>) -> Entry {
+        Entry {
+            did: did.into(),
+            cap,
+            key: key.map(Into::into),
+        }
+    }
+
     #[test]
-    fn entries_name_a_did_and_maybe_a_cap() {
+    fn entries_name_a_did_and_maybe_a_cap_and_key() {
         assert_eq!(
             parse_entry("did:web:cairn.example"),
-            Some(("did:web:cairn.example".into(), DEFAULT_CAP))
+            Some(e("did:web:cairn.example", DEFAULT_CAP, None))
         );
         assert_eq!(
             parse_entry("  did:plc:abc   2 "),
-            Some(("did:plc:abc".into(), 2))
+            Some(e("did:plc:abc", 2, None))
+        );
+        assert_eq!(
+            parse_entry("did:plc:abc 2 did:key:zQ3abc"),
+            Some(e("did:plc:abc", 2, Some("did:key:zQ3abc")))
+        );
+        assert_eq!(
+            parse_entry("did:plc:abc did:key:zQ3abc"),
+            Some(e("did:plc:abc", DEFAULT_CAP, Some("did:key:zQ3abc")))
         );
         for bad in [
             "",
@@ -393,11 +588,34 @@ mod tests {
             "did:plc:abc x",
             "did:plc:abc 1 2",
             "did:plc:abc#atproto_labeler",
+            "did:plc:abc did:key:a did:key:b",
+            "did:plc:abc did:key:",
+            "did:key:zQ3abc",
         ] {
             assert_eq!(parse_entry(bad), None, "{bad}");
         }
-        assert_eq!(format_entry("did:plc:abc", DEFAULT_CAP), "did:plc:abc");
-        assert_eq!(format_entry("did:plc:abc", 9), "did:plc:abc 9");
+        assert_eq!(
+            format_entry(&e("did:plc:abc", DEFAULT_CAP, None)),
+            "did:plc:abc"
+        );
+        assert_eq!(format_entry(&e("did:plc:abc", 9, None)), "did:plc:abc 9");
+        let pinned = e("did:plc:abc", DEFAULT_CAP, Some("did:key:zQ3abc"));
+        assert_eq!(format_entry(&pinned), "did:plc:abc 5 did:key:zQ3abc");
+        assert_eq!(parse_entry(&format_entry(&pinned)), Some(pinned));
+    }
+
+    #[test]
+    fn a_card_keeps_the_pinned_key_of_a_did_that_stays() {
+        let list = vec!["did:web:a 5 did:key:zQ3abc".to_owned()];
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:a", Some(2), false),
+            vec!["did:web:a 2 did:key:zQ3abc".to_owned()]
+        );
+        // A new DID is a different cairn: no key carried over.
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:b", Some(5), false),
+            vec!["did:web:b".to_owned()]
+        );
     }
 
     #[test]

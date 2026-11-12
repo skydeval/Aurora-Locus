@@ -405,7 +405,8 @@ async fn service_token_for(
 ) -> XrpcResult<String> {
     let key = s.signing_key(iss).await?;
     let now = locus_core::time::now_ms() / 1000;
-    locus_auth::service_jwt::create_with(&key, iss, aud, None, Some(lxm), now, client_id)
+    let extra: Vec<(&str, &str)> = client_id.map(|c| ("client_id", c)).into_iter().collect();
+    locus_auth::service_jwt::create_with(&key, iss, aud, None, Some(lxm), now, &extra)
         .map_err(|e| XrpcError::internal(e.to_string()))
 }
 

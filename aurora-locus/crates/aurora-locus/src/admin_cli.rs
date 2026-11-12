@@ -314,10 +314,17 @@ pub enum CairnCmd {
         /// How many accounts it may create here.
         #[arg(long, default_value_t = locus_http::labeler_access::DEFAULT_CAP)]
         max_accounts: i64,
+        /// The did:key its requests must be signed with (the key the
+        /// cairn shows for this PDS).
+        #[arg(long)]
+        key: Option<String>,
     },
     /// Changes how many accounts a cairn labeler may create here.
     SetCap { did: String, max_accounts: i64 },
-    /// The registered cairn labelers and their caps.
+    /// Pins the did:key a cairn's requests must be signed with, replacing
+    /// any earlier one.
+    SetKey { did: String, key: String },
+    /// The registered cairn labelers, their caps and keys.
     List,
     /// Stops a cairn labeler from creating accounts here.
     Remove { did: String },
@@ -932,16 +939,16 @@ fn subject_query(s: &str, blob: Option<&str>) -> Vec<(String, String)> {
 }
 
 async fn cairn(c: &Client, cmd: CairnCmd) -> Result<(), String> {
-    use locus_http::labeler_access::{SETTING, format_entry, parse_entry};
+    use locus_http::labeler_access::{Entry, SETTING, format_entry, parse_entry, valid_key};
     let items: Vec<String> = settings(c)
         .await?
         .into_iter()
         .find(|(k, _)| k == SETTING)
         .and_then(|(_, v)| serde_json::from_value(v).ok())
         .unwrap_or_default();
-    let mut cairns: Vec<(String, i64)> = items.iter().filter_map(|i| parse_entry(i)).collect();
-    let save = |cairns: Vec<(String, i64)>| async move {
-        let value: Vec<String> = cairns.iter().map(|(d, n)| format_entry(d, *n)).collect();
+    let mut cairns: Vec<Entry> = items.iter().filter_map(|i| parse_entry(i)).collect();
+    let save = |cairns: Vec<Entry>| async move {
+        let value: Vec<String> = cairns.iter().map(format_entry).collect();
         c.call(
             &format!("{NS}.admin.setSetting"),
             &[],
@@ -960,42 +967,75 @@ async fn cairn(c: &Client, cmd: CairnCmd) -> Result<(), String> {
         }
         Ok(did.to_owned())
     };
+    let checked_key = |key: &str| -> Result<String, String> {
+        let key = key.trim();
+        if valid_key(key) {
+            Ok(key.to_owned())
+        } else {
+            Err(format!("{key} isn't a secp256k1 or P-256 did:key"))
+        }
+    };
     match cmd {
         CairnCmd::List => {
             if cairns.is_empty() {
                 println!("No cairn labelers are registered.");
             }
-            for (d, cap) in cairns {
-                println!("{d}  (up to {cap} accounts)");
+            for e in cairns {
+                let key = e.key.as_deref().unwrap_or("no key pinned");
+                println!("{}  (up to {} accounts; {key})", e.did, e.cap);
             }
             Ok(())
         }
-        CairnCmd::Add { did, max_accounts } => {
+        CairnCmd::Add {
+            did,
+            max_accounts,
+            key,
+        } => {
             let did = checked(&did, max_accounts)?;
-            if cairns.iter().any(|(d, _)| *d == did) {
+            let key = key.as_deref().map(checked_key).transpose()?;
+            if cairns.iter().any(|e| e.did == did) {
                 return Err(format!(
-                    "{did} is already registered; use set-cap to change its cap"
+                    "{did} is already registered; use set-cap or set-key to change it"
                 ));
             }
-            cairns.push((did.clone(), max_accounts));
+            cairns.push(Entry {
+                did: did.clone(),
+                cap: max_accounts,
+                key: key.clone(),
+            });
             save(cairns).await?;
             println!("Registered {did}. It can create up to {max_accounts} labeler accounts here.");
+            if key.is_none() {
+                println!("No key is pinned yet: run set-key with the key the cairn shows.");
+            }
             Ok(())
         }
         CairnCmd::SetCap { did, max_accounts } => {
             let did = checked(&did, max_accounts)?;
             let entry = cairns
                 .iter_mut()
-                .find(|(d, _)| *d == did)
+                .find(|e| e.did == did)
                 .ok_or(format!("{did} isn't registered"))?;
-            entry.1 = max_accounts;
+            entry.cap = max_accounts;
             save(cairns).await?;
             println!("{did} can create up to {max_accounts} labeler accounts here.");
             Ok(())
         }
+        CairnCmd::SetKey { did, key } => {
+            let did = checked(&did, 0)?;
+            let key = checked_key(&key)?;
+            let entry = cairns
+                .iter_mut()
+                .find(|e| e.did == did)
+                .ok_or(format!("{did} isn't registered"))?;
+            entry.key = Some(key.clone());
+            save(cairns).await?;
+            println!("{did}'s requests must now be signed with {key}.");
+            Ok(())
+        }
         CairnCmd::Remove { did } => {
             let before = cairns.len();
-            cairns.retain(|(d, _)| d != did.trim());
+            cairns.retain(|e| e.did != did.trim());
             if cairns.len() == before {
                 return Err(format!("{did} isn't registered"));
             }

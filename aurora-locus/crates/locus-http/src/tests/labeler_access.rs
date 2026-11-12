@@ -421,3 +421,180 @@ async fn the_moderation_service_card_trusts_its_cairn() {
     save("did:web:cairn2.example", None).await;
     assert_eq!(list(&h), ["did:web:other.example 1"]);
 }
+
+/// A token for the trust link: `iss`, signed by `key`, for `lxm`, living
+/// `ttl` seconds, with `bodyHash` over `body` when given.
+fn link_jwt(key: &K256Keypair, iss: &str, lxm: &str, ttl: i64, body: Option<&Value>) -> String {
+    let now = locus_core::time::now_ms() / 1000;
+    let hash = body.map(|b| crate::labeler_access::body_hash(b.to_string().as_bytes()));
+    let extra: Vec<(&str, &str)> = hash
+        .as_deref()
+        .map(|h| ("bodyHash", h))
+        .into_iter()
+        .collect();
+    locus_auth::service_jwt::create_with(key, iss, AUD, Some(now + ttl), Some(lxm), now, &extra)
+        .unwrap()
+}
+
+/// Once a key is pinned, only it signs (as the bare DID, with no DID
+/// document read) and every POST's body is bound to its token; before,
+/// the label key under `#atproto_labeler`, with a bare `iss` refused.
+#[tokio::test]
+async fn the_trust_link_takes_only_the_pinned_key_and_bound_bodies() {
+    let h = harness(false).await;
+    let label_key = K256Keypair::generate();
+    put_did(
+        &h,
+        CAIRN,
+        json!({"atproto": label_key.did(), "atproto_label": label_key.did()}),
+        json!({}),
+    );
+    h.state
+        .settings
+        .set(SETTING, json!([CAIRN]), "test")
+        .await
+        .unwrap();
+    let probe = |token: String| {
+        let h = &h;
+        async move {
+            h.call("GET", &format!("/xrpc/{GET_ACCESS}"), Some(&token), None)
+                .await
+        }
+    };
+    let err = |r: (StatusCode, Value)| (r.0, r.1["error"].as_str().unwrap_or("").to_owned());
+    let labeler = format!("{CAIRN}#atproto_labeler");
+
+    // Not pinned: the label key as #atproto_labeler; a bare iss is refused,
+    // even signed with the #atproto key (a session's getServiceAuth).
+    assert_eq!(
+        probe(link_jwt(&label_key, &labeler, GET_ACCESS, 60, None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        err(probe(link_jwt(&label_key, CAIRN, GET_ACCESS, 60, None)).await),
+        (StatusCode::UNAUTHORIZED, "BadJwtIss".into())
+    );
+    // At most five minutes, and once only.
+    assert_eq!(
+        err(probe(link_jwt(&label_key, &labeler, GET_ACCESS, 3600, None)).await),
+        (StatusCode::UNAUTHORIZED, "BadJwt".into())
+    );
+    let once = link_jwt(&label_key, &labeler, GET_ACCESS, 60, None);
+    assert_eq!(probe(once.clone()).await.0, StatusCode::OK);
+    assert_eq!(
+        err(probe(once).await),
+        (StatusCode::UNAUTHORIZED, "BadJwt".into())
+    );
+    // A bodyHash, when sent before pinning, must match.
+    let body = json!({"did": "did:plc:nobodynobodynobodynobody"});
+    let other = json!({"did": "did:plc:otherotherotherotherothe"});
+    let (st, v) = h
+        .post(
+            DELETE_ACCOUNT,
+            Some(&link_jwt(
+                &label_key,
+                &labeler,
+                DELETE_ACCOUNT,
+                60,
+                Some(&other),
+            )),
+            body.clone(),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("BadJwtBodyHash"))
+    );
+
+    // Pinned: a key of its own. The DID document is gone, so nothing is
+    // read from it.
+    let pinned = K256Keypair::generate();
+    h.state
+        .settings
+        .set(
+            SETTING,
+            json!([format!("{CAIRN} 5 {}", pinned.did())]),
+            "test",
+        )
+        .await
+        .unwrap();
+    h.plc.lock().unwrap().log.remove(CAIRN);
+    assert_eq!(
+        probe(link_jwt(&pinned, CAIRN, GET_ACCESS, 60, None))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for (token, want) in [
+        // The old way, or the label key, no longer works.
+        (
+            link_jwt(&label_key, &labeler, GET_ACCESS, 60, None),
+            "BadJwtIss",
+        ),
+        (
+            link_jwt(&label_key, CAIRN, GET_ACCESS, 60, None),
+            "BadJwtSignature",
+        ),
+        (
+            link_jwt(&pinned, &labeler, GET_ACCESS, 60, None),
+            "BadJwtIss",
+        ),
+    ] {
+        assert_eq!(
+            err(probe(token).await),
+            (StatusCode::UNAUTHORIZED, want.to_owned())
+        );
+    }
+    // Every POST carries the hash of its exact body.
+    for token in [
+        link_jwt(&pinned, CAIRN, DELETE_ACCOUNT, 60, None),
+        link_jwt(&pinned, CAIRN, DELETE_ACCOUNT, 60, Some(&other)),
+    ] {
+        let (st, v) = h.post(DELETE_ACCOUNT, Some(&token), body.clone()).await;
+        assert_eq!(
+            (st, v["error"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("BadJwtBodyHash")),
+            "{v}"
+        );
+    }
+    let (st, v) = h
+        .post(
+            DELETE_ACCOUNT,
+            Some(&link_jwt(&pinned, CAIRN, DELETE_ACCOUNT, 60, Some(&body))),
+            body,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("NotCreatedByThisCairn")),
+        "past the token check"
+    );
+}
+
+/// The registered list refuses an item that would silently unregister its
+/// cairn, such as a key that isn't a did:key.
+#[tokio::test]
+async fn a_bad_key_is_refused_before_it_is_saved() {
+    let h = harness(false).await;
+    let admin = format!("Bearer {}", h.operator("ad", "admin").await);
+    let path = format!("/xrpc/{}.admin.setSetting", locus_core::LOCUS_NS);
+    let set = |value: Value| {
+        let (h, admin, path) = (&h, &admin, &path);
+        async move {
+            h.admin_call(
+                "POST",
+                path,
+                admin,
+                Some(json!({"key": SETTING, "value": value})),
+            )
+            .await
+        }
+    };
+    let (st, v) = set(json!(["did:web:c 5 did:key:znotakey"])).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let good = K256Keypair::generate().did();
+    let (st, v) = set(json!([format!("did:web:c 5 {good}")])).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+}

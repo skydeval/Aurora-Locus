@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   spot an account it didn't ask for.
   `app.nearhorizon.locus.deleteLabelerAccount` deletes an account the cairn
   created, as `deleteAccount` does but with no password or email token.
+  Each cairn's requests can be pinned to a key of its own (`cairn add
+  --key`, `cairn set-key`): its tokens are then checked against that key
+  alone, never its DID document, and bind each request body with
+  `bodyHash`. Until a key is pinned, tokens must come from the cairn's
+  `#atproto_labeler` service and its label key. Every token works once and
+  lives at most five minutes.
 - A `createReport` proxied for an OAuth session carries the session's
   client in the service JWT's `client_id` claim, so a labeler can take
   reports only from the apps it chooses. Password sessions and other

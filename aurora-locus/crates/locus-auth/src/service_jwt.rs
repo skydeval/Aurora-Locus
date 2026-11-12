@@ -69,10 +69,10 @@ pub fn create(
     lxm: Option<&str>,
     now: i64,
 ) -> Result<String, ServiceJwtError> {
-    create_with(key, iss, aud, exp, lxm, now, None)
+    create_with(key, iss, aud, exp, lxm, now, &[])
 }
 
-/// [`create`], plus the OAuth `client_id` of the session it's signed for.
+/// [`create`], plus string claims such as `client_id` or `bodyHash`.
 pub fn create_with(
     key: &dyn Keypair,
     iss: &str,
@@ -80,7 +80,7 @@ pub fn create_with(
     exp: Option<i64>,
     lxm: Option<&str>,
     now: i64,
-    client_id: Option<&str>,
+    extra: &[(&str, &str)],
 ) -> Result<String, ServiceJwtError> {
     let header = json!({"typ": "JWT", "alg": key.jwt_alg()});
     let mut payload = json!({
@@ -93,8 +93,8 @@ pub fn create_with(
     if let Some(lxm) = lxm {
         payload["lxm"] = json!(lxm);
     }
-    if let Some(c) = client_id {
-        payload["client_id"] = json!(c);
+    for (k, v) in extra {
+        payload[*k] = json!(v);
     }
     let signing_input = format!(
         "{}.{}",
@@ -116,6 +116,8 @@ pub struct Unverified {
     pub iat: Option<i64>,
     pub lxm: Option<String>,
     pub jti: Option<String>,
+    /// `bodyHash`: base64url (no padding) SHA-256 of the request body.
+    pub body_hash: Option<String>,
     signing_input: String,
     sig: Vec<u8>,
 }
@@ -203,6 +205,7 @@ pub fn parse(token: &str, lxm: Option<&str>, now: i64) -> Result<Unverified, Ser
         iat: payload["iat"].as_i64(),
         lxm: claimed,
         jti: payload["jti"].as_str().map(str::to_owned),
+        body_hash: payload["bodyHash"].as_str().map(str::to_owned),
         signing_input: format!("{h}.{p}"),
         sig: URL_SAFE_NO_PAD
             .decode(s)

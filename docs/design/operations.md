@@ -478,7 +478,7 @@ shared advisory lock. `migrate storage` and `import reference-pds` accept
 | `settings get/set/list/export/import` | Runtime settings |
 | `operator add [--role] / remove / list / reset-password / set-role` | Operators |
 | `moderation status/takedown/restore` | Subject status of accounts, records and blobs |
-| `cairn add <did> [--max-accounts] / set-cap <did> <n> / list / remove <did>` | [Cairn labelers](#cairn-labelers) that may create accounts here |
+| `cairn add <did> [--max-accounts] [--key] / set-cap <did> <n> / set-key <did> <did:key> / list / remove <did>` | [Cairn labelers](#cairn-labelers) that may create accounts here |
 | `crawl request` | Ask every relay to crawl now |
 | `jobs list / run <name> / pause <name> [--resume]` | Background jobs |
 | `kryphocron status / rotate-now / audit` | Private-tier controls |
@@ -513,10 +513,26 @@ this. The console's `moderation.service_did` and
 and cap that register the DID they name. Saving a new DID while it's
 checked moves the trust to the new one, unless the other card still names
 the old one. The cairn's DID to register is its labeler's: the one it signs
-requests as. A cairn calls:
+requests as.
 
-- `app.nearhorizon.locus.getLabelerAccess` (GET), with a service JWT from
-  the labeler's DID (`iss` the DID or `<did>#atproto_labeler`). It answers
+Each cairn should have a key pinned: `cairn add <did> --key did:key:z…` or
+`cairn set-key <did> <did:key>`, with the key the cairn shows for this PDS
+(secp256k1 or P-256). The key is stored in the cairn's entry, after its cap.
+Every request a cairn makes is a service JWT with `lxm` the method, a `jti`
+(each token works once) and at most five minutes to live:
+
+- **Key pinned:** `iss` is the bare DID and the token is checked against
+  the pinned key alone. The DID document isn't read, so a takeover of the
+  cairn's domain or of an account on its DID can't act as it. Every POST's
+  token carries `bodyHash`, the base64url (no padding) SHA-256 of the exact
+  body; a mismatch or a missing one is 401 `BadJwtBodyHash`.
+- **No key yet:** `iss` must be `<did>#atproto_labeler`, checked against
+  the DID document's `#atproto_label` key; a bare `iss` is 401 `BadJwtIss`.
+  `bodyHash` is checked when present.
+
+A wrong key is 401 `BadJwtSignature`. A cairn calls:
+
+- `app.nearhorizon.locus.getLabelerAccess` (GET). It answers
   `{registered, cap, used, handleDomains}`, or 403 `NotRegisteredLabeler`.
 - `app.nearhorizon.locus.createLabelerAccount` (POST), with the same kind of
   token and `{did, handle, email, password, didProof}`. `didProof` is the

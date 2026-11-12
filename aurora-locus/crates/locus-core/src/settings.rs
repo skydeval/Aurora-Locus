@@ -500,7 +500,7 @@ pub static REGISTRY: &[Def] = &[
         kind: Kind::TextList { max_len: 2048 },
         default: "[]",
         env: None,
-        description: "Cairn labelers that may create labeler accounts here without an invite code: each is a DID, optionally followed by a space and how many accounts it may create (5 if not given).",
+        description: "Cairn labelers that may create labeler accounts here without an invite code: each is a DID, optionally followed by how many accounts it may create (5 if not given) and the did:key its requests must be signed with.",
     },
     Def {
         key: "proxy.allow_http2",

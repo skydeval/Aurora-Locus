@@ -634,6 +634,9 @@ pub async fn set_setting(
     if input.key == "http.internal_hosts" {
         check_internal_hosts(&s, &value).await?;
     }
+    if input.key == crate::labeler_access::SETTING {
+        crate::labeler_access::check_list(&value).map_err(XrpcError::invalid_request)?;
+    }
     // Plain HTTP to an operator-configured endpoint only when asked for
     // (the reference takes any http:// URL; an env value allows itself).
     let snap = s.snapshot();
