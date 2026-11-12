@@ -193,6 +193,16 @@ impl Store {
         Ok(n)
     }
 
+    /// Whether `actor` wrote an `action` row about `target`.
+    pub async fn audit_has(&self, actor: &str, action: &str, target: &str) -> CoreResult<bool> {
+        let q = sql(
+            "SELECT COUNT(*) FROM audit_log WHERE actor = {1} AND action = {2} AND target = {3}",
+            self.is_postgres(),
+        );
+        let (n,): (i64,) = run!(self, q, fetch_one, actor, action, target)?;
+        Ok(n > 0)
+    }
+
     /// Audit-log entries, newest first, before `before` (an id) if given.
     pub async fn audit_entries(
         &self,

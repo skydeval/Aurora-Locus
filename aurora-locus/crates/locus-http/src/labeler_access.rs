@@ -25,6 +25,9 @@ type St = State<Arc<AppState>>;
 
 pub const GET_ACCESS: &str = locus_nsid!("getLabelerAccess");
 pub const CREATE_ACCOUNT: &str = locus_nsid!("createLabelerAccount");
+pub const DELETE_ACCOUNT: &str = locus_nsid!("deleteLabelerAccount");
+/// The audit action each deletion is logged under.
+pub const DELETE_AUDIT_ACTION: &str = "labeler.deleteAccount";
 /// What Locus calls on the cairn after creating an account for it.
 pub const NOTIFY: &str = "tools.cairn.labeler.notifyAccountCreated";
 
@@ -259,6 +262,51 @@ pub async fn create_labeler_account(
     })))
 }
 
+#[derive(Deserialize)]
+pub struct DeleteLabelerAccountInput {
+    did: String,
+}
+
+/// `deleteLabelerAccount`: deletes an account this cairn created here, as
+/// `deleteAccount` does (repo, blobs, sessions, `#account deleted`), with
+/// no password or email token: the cairn's registration stands in for
+/// them. 404 `AccountNotFound` once it's gone, so a retry is safe.
+pub async fn delete_labeler_account(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<DeleteLabelerAccountInput>,
+) -> XrpcResult<Json<Value>> {
+    if s.role == locus_core::bootstrap::Role::Entryway {
+        return Err(XrpcError::new(
+            StatusCode::NOT_IMPLEMENTED,
+            "MethodNotImplemented",
+            "Delete labeler accounts on a shard",
+        ));
+    }
+    let (cairn, _) = registered(&s, &headers, DELETE_ACCOUNT).await?;
+    if !s.store.audit_has(&cairn, AUDIT_ACTION, &input.did).await? {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "NotCreatedByThisCairn",
+            "This labeler didn't create that account here",
+        ));
+    }
+    if crate::admin::any_account(&s, &input.did).await?.is_none() {
+        return Err(XrpcError::new(
+            StatusCode::NOT_FOUND,
+            "AccountNotFound",
+            "Account not found",
+        ));
+    }
+    let job = crate::account::start_deletion(&s, &input.did).await?;
+    crate::account::spawn_deletion(&s, job);
+    s.store.oauth_delete_account_tokens(&input.did).await?;
+    s.store
+        .audit(&cairn, DELETE_AUDIT_ACTION, Some(&input.did), None)
+        .await?;
+    Ok(Json(json!({})))
+}
+
 /// Tells the cairn about a new account, retrying with backoff.
 fn spawn_notify(s: Arc<AppState>, cairn: String, body: Value) {
     tokio::spawn(async move {
@@ -317,6 +365,10 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(
             concat!("/xrpc/", locus_nsid!("createLabelerAccount")),
             post(create_labeler_account),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("deleteLabelerAccount")),
+            post(delete_labeler_account),
         )
 }
 

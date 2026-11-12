@@ -526,6 +526,14 @@ requests as. A cairn calls:
   `signingKey` to put in the DID document as `#atproto`, and `pdsEndpoint`;
   the cairn then calls `activateAccount`. Past the cap it is 403
   `LabelerAccountCapReached`; a bad `didProof` is 401 `InvalidDidProof`.
+- `app.nearhorizon.locus.deleteLabelerAccount` (POST), with the same kind of
+  token and `{did}`. Deletes an account this cairn created here, the same
+  way `deleteAccount` does: repo, blobs and sessions are removed, and
+  `#account deleted` is announced. It needs no password or email token. An
+  account the cairn didn't create is 403 `NotCreatedByThisCairn`; one
+  that's already gone is 404 `AccountNotFound`, so a retry is safe. The
+  deletion is in the audit log as `labeler.deleteAccount`, and a deleted
+  account still counts toward the cap.
 
 After each account, Locus calls the cairn's
 `tools.cairn.labeler.notifyAccountCreated` (at its `#atproto_labeler`

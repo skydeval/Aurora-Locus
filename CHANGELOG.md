@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered and how many accounts it has left. After each account, Locus
   calls the cairn's `tools.cairn.labeler.notifyAccountCreated`, so it can
   spot an account it didn't ask for.
+  `app.nearhorizon.locus.deleteLabelerAccount` deletes an account the cairn
+  created, as `deleteAccount` does but with no password or email token.
 - A `createReport` proxied for an OAuth session carries the session's
   client in the service JWT's `client_id` claim, so a labeler can take
   reports only from the apps it chooses. Password sessions and other

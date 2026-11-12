@@ -3,10 +3,11 @@
 
 use std::time::Duration;
 
+use locus_store::accounts::Status;
 use proto_blue_crypto::K256Keypair;
 
 use super::*;
-use crate::labeler_access::{CREATE_ACCOUNT, GET_ACCESS, NOTIFY, SETTING};
+use crate::labeler_access::{CREATE_ACCOUNT, DELETE_ACCOUNT, GET_ACCESS, NOTIFY, SETTING};
 
 const CAIRN: &str = "did:plc:cairncairncairncairncair";
 const AUD: &str = "did:web:pds.example.com";
@@ -255,6 +256,82 @@ async fn a_registered_cairn_creates_labeler_accounts_up_to_its_cap() {
         )
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Deleting: only accounts this cairn created, with its own token.
+    h.state
+        .settings
+        .set("accounts.invite_required", json!(false), "test")
+        .await
+        .unwrap();
+    let other = h
+        .create_account("plain.pds.example.com", "plain@example.com", "pw")
+        .await;
+    let other = other["did"].as_str().unwrap();
+    let delete = |did: &str, token: String| {
+        let did = did.to_owned();
+        let h = &h;
+        async move {
+            h.post(DELETE_ACCOUNT, Some(&token), json!({"did": did}))
+                .await
+        }
+    };
+    let (st, v) = delete(other, as_cairn(DELETE_ACCOUNT)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("NotCreatedByThisCairn")),
+        "{v}"
+    );
+    let (st, _) = delete(labeler, as_cairn(CREATE_ACCOUNT)).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED, "another method's token");
+    let stranger = K256Keypair::generate();
+    let stranger_did = "did:plc:strangerstrangerstrangers";
+    put_did(
+        &h,
+        stranger_did,
+        json!({"atproto_label": stranger.did()}),
+        json!({}),
+    );
+    let (st, v) = delete(
+        labeler,
+        jwt(
+            &stranger,
+            &format!("{stranger_did}#atproto_labeler"),
+            DELETE_ACCOUNT,
+        ),
+    )
+    .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("NotRegisteredLabeler")),
+        "{v}"
+    );
+    for did in [labeler, other] {
+        let a = h.state.store.account_by_did(did).await.unwrap().unwrap();
+        assert_ne!(a.status, Status::Deleted, "{did} untouched so far");
+    }
+
+    let (st, v) = delete(labeler, as_cairn(DELETE_ACCOUNT)).await;
+    assert_eq!((st, &v), (StatusCode::OK, &json!({})));
+    let gone = h.state.store.account_by_did(labeler).await.unwrap();
+    assert!(gone.is_none_or(|a| a.status == Status::Deleted), "deleted");
+    assert!(
+        h.outbox_kinds(labeler)
+            .await
+            .contains(&"account".to_owned()),
+        "#account deleted is announced"
+    );
+    // Already gone: 404, so a retry is safe; the other cairn account stays.
+    let (st, v) = delete(labeler, as_cairn(DELETE_ACCOUNT)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::NOT_FOUND, Some("AccountNotFound")),
+        "{v}"
+    );
+    let kept = h.state.store.account_by_did(second).await.unwrap().unwrap();
+    assert_ne!(kept.status, Status::Deleted);
+    // A deleted account still counts toward the cap.
+    let (_, v) = probe().await;
+    assert_eq!(v["used"], 2);
 }
 
 /// The moderation service DID cards' trust checkbox keeps the registered
