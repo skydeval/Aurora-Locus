@@ -48,6 +48,16 @@ pub struct SettingField {
     pub is_default: bool,
     /// The reference env var it maps from, if any.
     pub env: String,
+    /// A moderation service DID's card: whether that DID may create
+    /// labeler accounts here, and up to how many.
+    pub trust: Option<Trust>,
+}
+
+/// A moderation service DID's cairn trust, as its card shows it.
+#[derive(Debug, Clone)]
+pub struct Trust {
+    pub on: bool,
+    pub cap: i64,
 }
 
 /// Settings under one heading.

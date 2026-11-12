@@ -64,6 +64,62 @@ pub fn format_entry(did: &str, cap: i64) -> String {
     }
 }
 
+/// The moderation service DIDs whose console cards can register the cairn
+/// they name.
+pub const TRUST_KEYS: &[&str] = &["moderation.service_did", "moderation.report_service_did"];
+
+/// Whether `did` is registered, and its cap (the default if it isn't).
+#[must_use]
+pub fn trust_of(
+    snap: &locus_core::settings::Snapshot,
+    did: &str,
+) -> locus_web::console_pages::Trust {
+    let found = snap
+        .list(SETTING)
+        .iter()
+        .filter_map(|item| parse_entry(item))
+        .find(|(d, _)| !did.is_empty() && d == did);
+    locus_web::console_pages::Trust {
+        on: found.is_some(),
+        cap: found.map_or(DEFAULT_CAP, |(_, cap)| cap),
+    }
+}
+
+/// The registered list after a moderation service DID's card is saved: the
+/// card's DID goes from `old` to `new`, registered with `cap` or not at
+/// all. The trust moves with the DID, so `old` is dropped too, unless
+/// `keep` (another card still names it). Items that don't parse are kept.
+#[must_use]
+pub fn retrust(
+    items: &[String],
+    old: &str,
+    new: &str,
+    cap: Option<i64>,
+    keep: bool,
+) -> Vec<String> {
+    let drop_old = old != new && !old.is_empty() && !keep;
+    let cap = cap.filter(|_| !new.is_empty());
+    let mut placed = false;
+    let mut out: Vec<String> = items
+        .iter()
+        .filter_map(|item| match parse_entry(item) {
+            Some((d, _)) if d == new => match cap {
+                Some(cap) if !placed => {
+                    placed = true;
+                    Some(format_entry(new, cap))
+                }
+                _ => None,
+            },
+            Some((d, _)) if drop_old && d == old => None,
+            _ => Some(item.clone()),
+        })
+        .collect();
+    if let (Some(cap), false) = (cap, placed) {
+        out.push(format_entry(new, cap));
+    }
+    out
+}
+
 /// The calling cairn's DID and cap, if its service token is good and it is
 /// registered.
 async fn registered(s: &AppState, headers: &HeaderMap, lxm: &str) -> XrpcResult<(String, i64)> {
@@ -290,5 +346,36 @@ mod tests {
         }
         assert_eq!(format_entry("did:plc:abc", DEFAULT_CAP), "did:plc:abc");
         assert_eq!(format_entry("did:plc:abc", 9), "did:plc:abc 9");
+    }
+
+    #[test]
+    fn a_card_moves_its_trust_with_its_did() {
+        let items = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let list = items(&["did:web:a", "did:web:other 2", "not a did"]);
+        // Checked, same DID, new cap: replaced where it was.
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:a", Some(3), false),
+            items(&["did:web:a 3", "did:web:other 2", "not a did"])
+        );
+        // Checked, new DID: the old one's trust moves to it.
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:b", Some(5), false),
+            items(&["did:web:other 2", "not a did", "did:web:b"])
+        );
+        // ...unless another card still names the old one.
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:b", Some(5), true),
+            items(&["did:web:a", "did:web:other 2", "not a did", "did:web:b"])
+        );
+        // Unchecked: removed; other cairns stay.
+        assert_eq!(
+            retrust(&list, "did:web:a", "did:web:a", None, false),
+            items(&["did:web:other 2", "not a did"])
+        );
+        // An emptied card registers nothing.
+        assert_eq!(
+            retrust(&list, "did:web:a", "", Some(5), false),
+            items(&["did:web:other 2", "not a did"])
+        );
     }
 }

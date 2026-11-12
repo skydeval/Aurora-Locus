@@ -256,3 +256,91 @@ async fn a_registered_cairn_creates_labeler_accounts_up_to_its_cap() {
         .await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+/// The moderation service DID cards' trust checkbox keeps the registered
+/// list in step with the DID they name.
+#[tokio::test]
+async fn the_moderation_service_card_trusts_its_cairn() {
+    let h = harness(false).await;
+    h.console_operator("own", "owner", "an owner password")
+        .await;
+    let o = Browser::default();
+    h.console_sign_in(&o, "own", "an owner password").await;
+    let (_, _, page) = o.get(&h, "/admin/moderation").await;
+    assert!(
+        page.contains("Trust this cairn")
+            && page.contains(r#"name="trust_cap" value="5""#)
+            && !page.contains(r#"name="trust" value="1" checked"#),
+        "{page}"
+    );
+    let csrf = hidden(&page, "csrf");
+    let list = |h: &Harness| {
+        h.state
+            .snapshot()
+            .list(SETTING)
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let save = |did: &'static str, trust: Option<&'static str>| {
+        let csrf = csrf.clone();
+        let o = &o;
+        let h = &h;
+        async move {
+            let mut f = vec![
+                ("csrf", csrf.as_str()),
+                ("key", "moderation.report_service_did"),
+                ("back", "/admin/moderation"),
+                ("value", did),
+                ("trust_shown", "1"),
+            ];
+            if let Some(cap) = trust {
+                f.extend([("trust", "1"), ("trust_cap", cap)]);
+            }
+            o.post(h, "/admin/settings/save", &f).await
+        }
+    };
+    // A cairn trusted by some other means stays put throughout.
+    h.state
+        .settings
+        .set(SETTING, json!(["did:web:other.example 1"]), "test")
+        .await
+        .unwrap();
+
+    let (st, _, _) = save("did:web:cairn.example", Some("3")).await;
+    assert_eq!(st, StatusCode::SEE_OTHER);
+    assert_eq!(
+        list(&h),
+        ["did:web:other.example 1", "did:web:cairn.example 3"]
+    );
+    let (_, _, page) = o.get(&h, "/admin/moderation").await;
+    assert!(
+        page.contains(r#"name="trust" value="1" checked"#)
+            && page.contains(r#"name="trust_cap" value="3""#),
+        "{page}"
+    );
+
+    // A new DID takes the trust with it.
+    save("did:web:cairn2.example", Some("3")).await;
+    assert_eq!(
+        list(&h),
+        ["did:web:other.example 1", "did:web:cairn2.example 3"]
+    );
+
+    // A bad cap saves nothing.
+    let (st, _, page) = save("did:web:cairn3.example", Some("lots")).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(page.contains("a whole number"), "{page}");
+    assert_eq!(
+        h.state.snapshot().text("moderation.report_service_did"),
+        "did:web:cairn2.example"
+    );
+    assert_eq!(
+        list(&h),
+        ["did:web:other.example 1", "did:web:cairn2.example 3"]
+    );
+
+    // Unchecked: no longer trusted.
+    save("did:web:cairn2.example", None).await;
+    assert_eq!(list(&h), ["did:web:other.example 1"]);
+}

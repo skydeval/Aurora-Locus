@@ -23,6 +23,12 @@
 <label for="v-{{ f.key }}">Value</label>
 <input type="text" id="v-{{ f.key }}" name="value" value="{{ f.value }}" spellcheck="false"{% if !can_edit %} disabled{% endif %}>
 {% endif %}
+{% if let Some(t) = f.trust %}<input type="hidden" name="trust_shown" value="1">
+<label class="check"><input type="checkbox" name="trust" value="1"{% if t.on %} checked{% endif %}{% if !can_edit %} disabled{% endif %}> Trust this cairn: let it create its labelers' accounts here with no invite code</label>
+<label for="c-{{ f.key }}">Up to this many accounts</label>
+<input type="number" id="c-{{ f.key }}" name="trust_cap" value="{{ t.cap }}" min="0"{% if !can_edit %} disabled{% endif %}>
+<div class="hint">The cairn sets up each labeler's account itself. Locus tells the cairn about every account made, and the audit log records it. Changing the DID moves the trust to the new one.</div>
+{% endif %}
 <div class="fact"><span class="l">Default</span><span class="v">{{ f.default }}</span></div>
 {% if !f.env.is_empty() %}<div class="fact"><span class="l">Set from env by</span><span class="v"><code>{{ f.env }}</code></span></div>{% endif %}
 {% if can_edit %}<div class="row"><button type="submit" class="secondary">Save</button></div>{% endif %}

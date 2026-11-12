@@ -33,6 +33,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::admin_auth::Role;
+use crate::labeler_access;
 use crate::state::AppState;
 use crate::web;
 
@@ -974,6 +975,9 @@ pub fn setting_field(snap: &locus_core::settings::Snapshot, def: &settings::Def)
         is_default: current == default,
         default: default_text,
         env: def.env.unwrap_or("").into(),
+        trust: crate::labeler_access::TRUST_KEYS
+            .contains(&def.key)
+            .then(|| crate::labeler_access::trust_of(snap, current.as_str().unwrap_or(""))),
     }
 }
 
@@ -1093,19 +1097,57 @@ pub async fn save_setting(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
             .parse_env(raw.unwrap_or("").trim())
             .map_err(|e| e.to_string()),
     };
-    let result = match value {
-        Ok(v) => crate::locus_admin::set_setting(
-            State(Arc::clone(&s)),
-            op.api_headers(),
-            axum::Json(
-                serde_json::from_value(serde_json::json!({"key": key, "value": v}))
-                    .expect("setting input"),
-            ),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|e| e.message),
-        Err(e) => Err(e),
+    let trust = trust_choice(&key, &form);
+    // Only the DID cards' old value matters, and those are text.
+    let old = s.snapshot().get(&key).as_str().unwrap_or("").to_owned();
+    let set = |key: String, v: Value| {
+        let s = Arc::clone(&s);
+        let headers = op.api_headers();
+        async move {
+            crate::locus_admin::set_setting(
+                State(s),
+                headers,
+                axum::Json(
+                    serde_json::from_value(serde_json::json!({"key": key, "value": v}))
+                        .expect("setting input"),
+                ),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.message)
+        }
+    };
+    let result = match (value, trust) {
+        (Ok(v), Ok(trust)) => match set(key.clone(), v).await {
+            Ok(()) => match trust {
+                Some(cap) => {
+                    let _ = s.settings.refresh().await;
+                    let snap = s.snapshot();
+                    let items: Vec<String> = snap
+                        .list(labeler_access::SETTING)
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect();
+                    let keep = labeler_access::TRUST_KEYS
+                        .iter()
+                        .any(|k| *k != key && snap.text(k) == old);
+                    let after =
+                        labeler_access::retrust(&items, &old, snap.text(&key).trim(), cap, keep);
+                    if after == items {
+                        Ok(())
+                    } else {
+                        set(
+                            labeler_access::SETTING.to_owned(),
+                            Value::Array(after.into_iter().map(Value::String).collect()),
+                        )
+                        .await
+                    }
+                }
+                None => Ok(()),
+            },
+            Err(e) => Err(e),
+        },
+        (Err(e), _) | (_, Err(e)) => Err(e),
     };
     match result {
         Ok(()) => {
@@ -1140,6 +1182,25 @@ pub async fn save_setting(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
                 StatusCode::BAD_REQUEST,
             )
         }
+    }
+}
+
+/// A moderation service DID card's trust checkbox: `None` when the form has
+/// none, else the cap the DID is registered with (`None` unchecked).
+fn trust_choice(key: &str, form: &[(String, String)]) -> Result<Option<Option<i64>>, String> {
+    if !labeler_access::TRUST_KEYS.contains(&key) || web::field(form, "trust_shown") != "1" {
+        return Ok(None);
+    }
+    if web::field(form, "trust") != "1" {
+        return Ok(Some(None));
+    }
+    let cap = web::field(form, "trust_cap").trim();
+    if cap.is_empty() {
+        return Ok(Some(Some(labeler_access::DEFAULT_CAP)));
+    }
+    match cap.parse::<i64>() {
+        Ok(n) if n >= 0 => Ok(Some(Some(n))),
+        _ => Err("The number of accounts is a whole number, 0 or more.".into()),
     }
 }
 

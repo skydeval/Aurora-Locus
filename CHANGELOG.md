@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Cairn labelers can be registered with `aurora-locus cairn add <did>`
   (`list`, `set-cap`, `remove`; the `moderation.cairn_labelers` setting on
-  the console's Moderation page). A registered cairn creates its labeler
+  the console's Moderation page), or with the "Trust this cairn" checkbox
+  on the moderation and report service DID cards, which moves the trust
+  when the DID changes. A registered cairn creates its labeler
   accounts with `app.nearhorizon.locus.createLabelerAccount`, without an
   invite code, up to its cap (5 unless set). The labeler's DID still proves
   it owns the account, as `createAccount` requires for an existing DID.

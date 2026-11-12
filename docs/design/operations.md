@@ -498,7 +498,12 @@ A cairn labeler registered with
 `cairn add <did>` can create its labeler accounts here without an invite
 code, up to its cap (5 unless `--max-accounts` or `set-cap` says otherwise;
 every account it has created counts). Other moderation services can't use
-this. A cairn calls:
+this. The console's `moderation.service_did` and
+`moderation.report_service_did` cards have a "Trust this cairn" checkbox
+and cap that register the DID they name. Saving a new DID while it's
+checked moves the trust to the new one, unless the other card still names
+the old one. The cairn's DID to register is its labeler's: the one it signs
+requests as. A cairn calls:
 
 - `app.nearhorizon.locus.getLabelerAccess` (GET), with a service JWT from
   the labeler's DID (`iss` the DID or `<did>#atproto_labeler`). It answers
