@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls the cairn's `tools.cairn.labeler.notifyAccountCreated`, so it can
   spot an account it didn't ask for.
 
+## [0.1.3] - 2026-11-12
+
+### Added
+
+- Email setup asks who your email provider is. Resend, SendGrid, Mailgun,
+  Postmark, Amazon SES and Brevo need only the credentials the provider
+  gives you; "Other" takes an SMTP server's host, port, security, username
+  and password; a whole SMTP URL still works. In the setup wizard, the
+  console's Email page and `aurora-locus setup`. Each is stored as the
+  SMTP URL, so `PDS_EMAIL_SMTP_URL` works as before. For servers whose host
+  blocks the usual mail ports (25, 465, 587), a box uses the provider's
+  alternate port, and a server that can't be reached on a usual port gets
+  a message suggesting it.
+
 ## [0.1.2] - 2026-11-11
 
 ### Changed
