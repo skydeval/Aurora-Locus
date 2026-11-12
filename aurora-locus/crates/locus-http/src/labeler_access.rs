@@ -532,7 +532,16 @@ pub const NOTIFY_WRITTEN: &str = "tools.cairn.labeler.notifyRecordWritten";
 /// What Locus calls on the cairn when an operator releases its account.
 pub const NOTIFY_RELEASED: &str = "tools.cairn.labeler.notifyAccountReleased";
 /// The only records a cairn writes, each at `self`.
-pub const WRITABLE: &[&str] = &["app.bsky.labeler.service", "app.bsky.actor.profile"];
+pub const WRITABLE: &[&str] = &[
+    "app.bsky.labeler.service",
+    "app.bsky.actor.profile",
+    REASON_SET,
+];
+/// A moderation labeler's report reasons. Its lexicon is cairn's, so Locus
+/// checks only its `$type` and size.
+pub const REASON_SET: &str = "tools.cairn.report.reasonSet";
+/// The largest reason set, as JSON.
+const MAX_REASON_SET_BYTES: usize = 64 * 1024;
 /// The largest image a cairn uploads.
 pub const MAX_BLOB_BYTES: u64 = 1_000_000;
 
@@ -583,11 +592,20 @@ pub struct PutLabelerRecordInput {
     collection: String,
     rkey: String,
     record: Value,
+    /// Absent: no check; `null`: the record must not exist yet; a CID: the
+    /// record must be that one.
+    #[serde(default, deserialize_with = "present")]
     swap_record: Option<Value>,
 }
 
-/// `putLabelerRecord`: the labeler service or profile record of an account
-/// this cairn manages, validated against its lexicon.
+/// A field that was sent, even as `null` (absent stays `None`).
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+/// `putLabelerRecord`: the labeler service, profile or report-reason record
+/// of an account this cairn manages, validated against its lexicon (the
+/// reason set by its type and size).
 pub async fn put_labeler_record(
     State(s): St,
     headers: HeaderMap,
@@ -596,12 +614,24 @@ pub async fn put_labeler_record(
     let Entry { did: cairn, .. } = cairn_auth(&s, &headers, PUT_RECORD, Some(&body), true).await?;
     let input: PutLabelerRecordInput = json_body(&body)?;
     writable(&input.collection, &input.rkey)?;
+    let reasons = input.collection == REASON_SET;
+    if reasons
+        && (input.record["$type"] != REASON_SET
+            || input.record.to_string().len() > MAX_REASON_SET_BYTES)
+    {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidRecord",
+            "A reason set is a tools.cairn.report.reasonSet of at most 64 KB",
+        ));
+    }
     let account = managed_target(&s, &cairn, &input.did, true).await?;
     let put = crate::repo::PutRecordInput {
         repo: account.did.clone(),
         collection: input.collection.clone(),
         rkey: input.rkey.clone(),
-        validate: Some(true),
+        // Locus has no lexicon for the reason set: it's checked above.
+        validate: if reasons { None } else { Some(true) },
         record: input.record,
         swap_record: input.swap_record,
         swap_commit: None,

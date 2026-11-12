@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Accounts a cairn creates are managed by it: no password, and no sign-in
   of any kind (password, app password, OAuth, refresh, email or password
   changes) once activated. The cairn writes their labeler and profile
-  records (`app.nearhorizon.locus.putLabelerRecord`, `deleteLabelerRecord`)
+  records and report reasons (`app.nearhorizon.locus.putLabelerRecord`,
+  `deleteLabelerRecord`)
   and uploads their images (`uploadLabelerBlob`), and Locus reports each
   write back through `tools.cairn.labeler.notifyRecordWritten`. `aurora-locus
   cairn manage` locks an older account to its cairn; `cairn release`

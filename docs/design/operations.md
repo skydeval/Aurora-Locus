@@ -567,11 +567,14 @@ instead, with a pinned key (403 `KeyNotPinned` without one), only for
 accounts it manages (403 `NotManagedByThisCairn` otherwise):
 
 - `app.nearhorizon.locus.putLabelerRecord` (POST) `{did, collection, rkey,
-  record, swapRecord?}` and `deleteLabelerRecord` (POST) `{did, collection,
-  rkey, swapRecord?}`: only `app.bsky.labeler.service` and
-  `app.bsky.actor.profile`, at `self` (400 `CollectionNotAllowed`
-  otherwise), validated against their lexicons. They answer `{uri, cid}`
-  and `{}`.
+  record, swapRecord?}` (`null` = it must not exist yet) and
+  `deleteLabelerRecord` (POST) `{did, collection, rkey, swapRecord?}`: only
+  `app.bsky.labeler.service`, `app.bsky.actor.profile` and the report
+  reasons `tools.cairn.report.reasonSet`, at `self` (400
+  `CollectionNotAllowed` otherwise). The first two are validated against
+  their lexicons; the reason set, whose lexicon is the cairn's, must have
+  its `$type` and be at most 64 KB (400 `InvalidRecord`). They answer
+  `{uri, cid}` and `{}`.
 - `app.nearhorizon.locus.uploadLabelerBlob?did=` (POST, the bytes as the
   body; `bodyHash` covers them): a PNG or JPEG of at most 1,000,000 bytes,
   30 an hour per account. It answers `{blob}`, as `uploadBlob` does; a blob

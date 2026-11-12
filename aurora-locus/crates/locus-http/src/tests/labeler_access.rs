@@ -849,6 +849,30 @@ async fn a_cairn_manages_its_labeler_accounts_and_no_one_signs_in() {
         (st, &rec["value"]["displayName"], &rec["cid"]),
         (StatusCode::OK, &json!("A labeler"), &profile_cid)
     );
+    // The report reasons: by type and size; `swapRecord: null` creates only.
+    let reasons = json!({"$type": "tools.cairn.report.reasonSet", "reasons": ["spam"]});
+    let create = |record: Value| {
+        json!({"did": labeler, "collection": "tools.cairn.report.reasonSet", "rkey": "self",
+               "record": record, "swapRecord": null})
+    };
+    let (st, v) = call(PUT_RECORD, create(reasons.clone())).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = call(PUT_RECORD, create(reasons)).await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidSwap")),
+        "it exists now: {v}"
+    );
+    let (st, v) = call(
+        PUT_RECORD,
+        create(json!({"$type": "app.bsky.actor.profile", "displayName": "sneaky"})),
+    )
+    .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("InvalidRecord"))
+    );
+
     let (st, v) = call(
         DELETE_RECORD,
         json!({"did": labeler, "collection": "app.bsky.actor.profile", "rkey": "self"}),
@@ -877,9 +901,10 @@ async fn a_cairn_manages_its_labeler_accounts_and_no_one_signs_in() {
     );
 
     // Each write was reported, with what it changed.
-    let writes = told(&seen, NOTIFY_WRITTEN, 3).await;
+    let writes = told(&seen, NOTIFY_WRITTEN, 4).await;
     let ops: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();
-    assert_eq!(ops, ["blob", "put", "delete"], "{writes:?}");
+    assert_eq!(ops, ["blob", "put", "put", "delete"], "{writes:?}");
+    assert_eq!(writes[2]["collection"], "tools.cairn.report.reasonSet");
     assert_eq!(writes[1]["cid"], profile_cid);
     assert!(
         writes
