@@ -68,7 +68,10 @@ pub struct CreateAccountInput {
     pub(crate) password: Option<String>,
     pub(crate) recovery_key: Option<String>,
     /// Locus extension, ignored by stock clients: `plc` or `web`.
-    locus_did_method: Option<String>,
+    pub(crate) locus_did_method: Option<String>,
+    /// Set only in-process, for a registered cairn labeler: no invite needed.
+    #[serde(skip)]
+    pub(crate) skip_invite: bool,
 }
 
 /// Disposable-address domains (the list the reference uses, CC0;
@@ -223,7 +226,7 @@ pub async fn create_account(
     };
     let snap = s.snapshot();
     let invite = input.invite_code.clone();
-    if snap.bool("accounts.invite_required") && invite.is_none() {
+    if snap.bool("accounts.invite_required") && invite.is_none() && !input.skip_invite {
         return Err(XrpcError::named(
             "InvalidInviteCode",
             "No invite code provided",

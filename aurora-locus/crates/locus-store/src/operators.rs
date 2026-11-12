@@ -183,6 +183,16 @@ impl Store {
         tx.commit().await
     }
 
+    /// How many audit-log rows `actor` wrote with `action`.
+    pub async fn audit_count(&self, actor: &str, action: &str) -> CoreResult<i64> {
+        let q = sql(
+            "SELECT COUNT(*) FROM audit_log WHERE actor = {1} AND action = {2}",
+            self.is_postgres(),
+        );
+        let (n,): (i64,) = run!(self, q, fetch_one, actor, action)?;
+        Ok(n)
+    }
+
     /// Audit-log entries, newest first, before `before` (an id) if given.
     pub async fn audit_entries(
         &self,

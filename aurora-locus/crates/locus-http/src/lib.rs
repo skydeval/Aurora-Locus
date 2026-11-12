@@ -30,6 +30,7 @@ pub mod identity;
 pub mod import;
 pub mod keys;
 pub mod kryphocron;
+pub mod labeler_access;
 pub mod lexicon;
 pub mod locus_admin;
 pub mod media_gate;
@@ -430,6 +431,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         // Locus's operator methods, and the console.
         .merge(locus_admin::routes())
+        .merge(labeler_access::routes())
         .merge(console::routes())
         .merge(console_people::routes())
         .merge(console_sections::routes())

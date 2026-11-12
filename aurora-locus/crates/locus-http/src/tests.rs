@@ -10,6 +10,7 @@ mod getrepo_race;
 mod identity;
 mod keys;
 mod keys_shard;
+mod labeler_access;
 mod protocol;
 mod security;
 
@@ -101,18 +102,36 @@ async fn mock_plc() -> (String, Plc) {
 
 /// The DID document the directory serves for an op's state.
 fn plc_document(did: &str, op: &Value) -> Value {
-    let key = op["verificationMethods"]["atproto"]
-        .as_str()
+    let mut methods: Vec<Value> = op["verificationMethods"]
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(id, key)| {
+                    let key = key.as_str().unwrap_or_default();
+                    json!({
+                        "id": format!("{did}#{id}"),
+                        "type": "Multikey",
+                        "controller": did,
+                        "publicKeyMultibase": key.strip_prefix("did:key:").unwrap_or_default(),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
-    json!({
-        "id": did,
-        "alsoKnownAs": op["alsoKnownAs"],
-        "verificationMethod": [{
+    // #atproto first, as before.
+    methods.sort_by_key(|m| !m["id"].as_str().unwrap_or_default().ends_with("#atproto"));
+    if methods.is_empty() {
+        methods.push(json!({
             "id": format!("{did}#atproto"),
             "type": "Multikey",
             "controller": did,
-            "publicKeyMultibase": key.strip_prefix("did:key:").unwrap_or_default(),
-        }],
+            "publicKeyMultibase": "",
+        }));
+    }
+    json!({
+        "id": did,
+        "alsoKnownAs": op["alsoKnownAs"],
+        "verificationMethod": methods,
         "service": op["services"]
             .as_object()
             .map(|m| m.iter().map(|(id, svc)| json!({

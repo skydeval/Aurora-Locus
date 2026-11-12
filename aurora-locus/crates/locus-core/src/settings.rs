@@ -496,6 +496,13 @@ pub static REGISTRY: &[Def] = &[
         description: "The report service's DID.",
     },
     Def {
+        key: "moderation.cairn_labelers",
+        kind: Kind::TextList { max_len: 2048 },
+        default: "[]",
+        env: None,
+        description: "Cairn labelers that may create labeler accounts here without an invite code: each is a DID, optionally followed by a space and how many accounts it may create (5 if not given).",
+    },
+    Def {
         key: "proxy.allow_http2",
         kind: Kind::Bool,
         default: "false",

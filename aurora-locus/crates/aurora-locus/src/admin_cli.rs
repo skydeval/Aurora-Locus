@@ -306,6 +306,24 @@ pub enum SettingsCmd {
 }
 
 #[derive(Subcommand)]
+pub enum CairnCmd {
+    /// Lets a cairn labeler create its account here without an invite code.
+    Add {
+        /// The labeler's DID.
+        did: String,
+        /// How many accounts it may create here.
+        #[arg(long, default_value_t = locus_http::labeler_access::DEFAULT_CAP)]
+        max_accounts: i64,
+    },
+    /// Changes how many accounts a cairn labeler may create here.
+    SetCap { did: String, max_accounts: i64 },
+    /// The registered cairn labelers and their caps.
+    List,
+    /// Stops a cairn labeler from creating accounts here.
+    Remove { did: String },
+}
+
+#[derive(Subcommand)]
 pub enum OperatorCmd {
     /// A new operator (the password is asked for).
     Add {
@@ -811,6 +829,9 @@ pub enum AdminCmd {
     Operator(OperatorCmd),
     #[command(subcommand)]
     Moderation(ModerationCmd),
+    /// Cairn labelers that may create their accounts here.
+    #[command(subcommand)]
+    Cairn(CairnCmd),
     #[command(subcommand)]
     Crawl(CrawlCmd),
     #[command(subcommand)]
@@ -907,6 +928,81 @@ fn subject_query(s: &str, blob: Option<&str>) -> Vec<(String, String)> {
         q(&[("did", s), ("blob", cid)])
     } else {
         q(&[("did", s)])
+    }
+}
+
+async fn cairn(c: &Client, cmd: CairnCmd) -> Result<(), String> {
+    use locus_http::labeler_access::{SETTING, format_entry, parse_entry};
+    let items: Vec<String> = settings(c)
+        .await?
+        .into_iter()
+        .find(|(k, _)| k == SETTING)
+        .and_then(|(_, v)| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let mut cairns: Vec<(String, i64)> = items.iter().filter_map(|i| parse_entry(i)).collect();
+    let save = |cairns: Vec<(String, i64)>| async move {
+        let value: Vec<String> = cairns.iter().map(|(d, n)| format_entry(d, *n)).collect();
+        c.call(
+            &format!("{NS}.admin.setSetting"),
+            &[],
+            Some(json!({"key": SETTING, "value": value})),
+        )
+        .await
+        .map(|_| ())
+    };
+    let checked = |did: &str, cap: i64| -> Result<String, String> {
+        let did = did.trim();
+        if parse_entry(did).is_none() {
+            return Err(format!("{did} isn't a DID"));
+        }
+        if cap < 0 {
+            return Err("The cap can't be negative".into());
+        }
+        Ok(did.to_owned())
+    };
+    match cmd {
+        CairnCmd::List => {
+            if cairns.is_empty() {
+                println!("No cairn labelers are registered.");
+            }
+            for (d, cap) in cairns {
+                println!("{d}  (up to {cap} accounts)");
+            }
+            Ok(())
+        }
+        CairnCmd::Add { did, max_accounts } => {
+            let did = checked(&did, max_accounts)?;
+            if cairns.iter().any(|(d, _)| *d == did) {
+                return Err(format!(
+                    "{did} is already registered; use set-cap to change its cap"
+                ));
+            }
+            cairns.push((did.clone(), max_accounts));
+            save(cairns).await?;
+            println!("Registered {did}. It can create up to {max_accounts} labeler accounts here.");
+            Ok(())
+        }
+        CairnCmd::SetCap { did, max_accounts } => {
+            let did = checked(&did, max_accounts)?;
+            let entry = cairns
+                .iter_mut()
+                .find(|(d, _)| *d == did)
+                .ok_or(format!("{did} isn't registered"))?;
+            entry.1 = max_accounts;
+            save(cairns).await?;
+            println!("{did} can create up to {max_accounts} labeler accounts here.");
+            Ok(())
+        }
+        CairnCmd::Remove { did } => {
+            let before = cairns.len();
+            cairns.retain(|(d, _)| d != did.trim());
+            if cairns.len() == before {
+                return Err(format!("{did} isn't registered"));
+            }
+            save(cairns).await?;
+            println!("Removed {did}.");
+            Ok(())
+        }
     }
 }
 
@@ -2029,6 +2125,7 @@ pub async fn run(c: &Client, cmd: AdminCmd) -> Result<(), String> {
                 Ok(())
             }
         },
+        AdminCmd::Cairn(cmd) => cairn(c, cmd).await,
         AdminCmd::Operator(o) => match o {
             OperatorCmd::Add { username, role } => {
                 let pw = secret(&format!("Password for {username} (12 characters or more)"))?;

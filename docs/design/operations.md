@@ -468,6 +468,7 @@ shared advisory lock. `migrate storage` and `import reference-pds` accept
 | `settings get/set/list/export/import` | Runtime settings |
 | `operator add [--role] / remove / list / reset-password / set-role` | Operators |
 | `moderation status/takedown/restore` | Subject status of accounts, records and blobs |
+| `cairn add <did> [--max-accounts] / set-cap <did> <n> / list / remove <did>` | [Cairn labelers](#cairn-labelers) that may create accounts here |
 | `crawl request` | Ask every relay to crawl now |
 | `jobs list / run <name> / pause <name> [--resume]` | Background jobs |
 | `kryphocron status / rotate-now / audit` | Private-tier controls |
@@ -490,6 +491,32 @@ shared advisory lock. `migrate storage` and `import reference-pds` accept
 
 Every `aurora-locus <command> --help` lists its flags. The reference's
 `pdsadmin` operations all have equivalents, so existing habits translate.
+
+### Cairn labelers
+
+A cairn labeler registered with
+`cairn add <did>` can create its labeler accounts here without an invite
+code, up to its cap (5 unless `--max-accounts` or `set-cap` says otherwise;
+every account it has created counts). Other moderation services can't use
+this. A cairn calls:
+
+- `app.nearhorizon.locus.getLabelerAccess` (GET), with a service JWT from
+  the labeler's DID (`iss` the DID or `<did>#atproto_labeler`). It answers
+  `{registered, cap, used, handleDomains}`, or 403 `NotRegisteredLabeler`.
+- `app.nearhorizon.locus.createLabelerAccount` (POST), with the same kind of
+  token and `{did, handle, email, password, didProof}`. `didProof` is the
+  token `createAccount` takes for an existing DID, signed by that DID's
+  current key, so the labeler's DID still proves it owns the account. The
+  account starts deactivated. The answer gives the session, the repo
+  `signingKey` to put in the DID document as `#atproto`, and `pdsEndpoint`;
+  the cairn then calls `activateAccount`. Past the cap it is 403
+  `LabelerAccountCapReached`; a bad `didProof` is 401 `InvalidDidProof`.
+
+After each account, Locus calls the cairn's
+`tools.cairn.labeler.notifyAccountCreated` (at its `#atproto_labeler`
+endpoint, with a service JWT from this PDS) with `{did, handle, createdAt,
+pds}`, retrying for about an hour and a half. Each account is also in the
+audit log as `labeler.createAccount`.
 
 ### Importing a reference PDS
 
