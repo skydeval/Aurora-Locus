@@ -594,6 +594,8 @@ pub async fn update_account_password(
     any_account(&s, &input.did)
         .await?
         .ok_or_else(|| XrpcError::invalid_request("Account not found"))?;
+    // Release a managed account first (`cairn release`).
+    crate::labeler_access::refuse_managed(&s, &input.did).await?;
     let hash = password::hash(&input.password).map_err(XrpcError::internal)?;
     let mut tx = s.store.begin().await?;
     tx.set_password_hash(&input.did, &hash).await?;

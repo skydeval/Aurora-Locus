@@ -287,13 +287,13 @@ pub async fn create_record(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutRecordInput {
-    repo: String,
-    collection: String,
-    rkey: String,
-    validate: Option<bool>,
-    record: Value,
-    swap_record: Option<Value>,
-    swap_commit: Option<String>,
+    pub(crate) repo: String,
+    pub(crate) collection: String,
+    pub(crate) rkey: String,
+    pub(crate) validate: Option<bool>,
+    pub(crate) record: Value,
+    pub(crate) swap_record: Option<Value>,
+    pub(crate) swap_commit: Option<String>,
 }
 
 /// `swapRecord` as the reference reads it: absent = no check, `null` = the
@@ -324,8 +324,18 @@ pub async fn put_record(
         let w = crate::audience::update(&s, &account.did, &input.rkey, &input.record, swap).await?;
         return Ok(Json(json!({"uri": w.uri, "cid": w.cid})));
     }
+    put_record_for(&s, &account, &input).await
+}
+
+/// `putRecord` after its auth: validated, through kryphocron's step,
+/// committed. Also a cairn's write to an account it manages.
+pub(crate) async fn put_record_for(
+    s: &Arc<AppState>,
+    account: &Account,
+    input: &PutRecordInput,
+) -> XrpcResult<Json<Value>> {
     let value = kr_value(
-        &s,
+        s,
         &account.did,
         &input.collection,
         &input.rkey,
@@ -337,7 +347,7 @@ pub async fn put_record(
         &input.rkey,
         value,
         input.validate,
-        record_limit(&s),
+        record_limit(s),
     )
     .map_err(invalid_record)?;
     let swap = swap_record(input.swap_record.as_ref())?;
@@ -353,15 +363,7 @@ pub async fn put_record(
         "cid": rec.cid.to_string_base32(),
     });
     // Putting the record the path already holds commits nothing.
-    match commit(
-        &s,
-        &account,
-        vec![write],
-        input.swap_commit.as_deref(),
-        false,
-    )
-    .await
-    {
+    match commit(s, account, vec![write], input.swap_commit.as_deref(), false).await {
         Ok(outcome) => out["commit"] = commit_json(&outcome),
         Err(e) if e.message == "no changes" => {}
         Err(e) => return Err(e),
@@ -372,11 +374,11 @@ pub async fn put_record(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteRecordInput {
-    repo: String,
-    collection: String,
-    rkey: String,
-    swap_record: Option<String>,
-    swap_commit: Option<String>,
+    pub(crate) repo: String,
+    pub(crate) collection: String,
+    pub(crate) rkey: String,
+    pub(crate) swap_record: Option<String>,
+    pub(crate) swap_commit: Option<String>,
 }
 
 pub async fn delete_record(
@@ -394,8 +396,18 @@ pub async fn delete_record(
         crate::audience::delete(&s, &account.did, &input.rkey).await?;
         return Ok(Json(json!({})));
     }
+    delete_record_for(&s, &account, &input).await
+}
+
+/// `deleteRecord` after its auth. Also a cairn's delete on an account it
+/// manages.
+pub(crate) async fn delete_record_for(
+    s: &Arc<AppState>,
+    account: &Account,
+    input: &DeleteRecordInput,
+) -> XrpcResult<Json<Value>> {
     kr::prepare_write(
-        &s,
+        s,
         &account.did,
         &input.collection,
         &input.rkey,
@@ -416,15 +428,7 @@ pub async fn delete_record(
         swap,
     );
     // Deleting a missing record commits nothing, as the reference.
-    match commit(
-        &s,
-        &account,
-        vec![write],
-        input.swap_commit.as_deref(),
-        false,
-    )
-    .await
-    {
+    match commit(s, account, vec![write], input.swap_commit.as_deref(), false).await {
         Ok(outcome) => Ok(Json(json!({ "commit": commit_json(&outcome) }))),
         Err(e) if e.message == "no changes" => Ok(Json(json!({}))),
         Err(e) => Err(e),
@@ -836,15 +840,28 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         .await?
         .did
     };
-    // A deactivated account can upload (a migration's blobs arrive before
-    // activation), as the reference's `checkTakedown` only.
-    let account = auth::account_checked(&s, &did, false).await?;
     crate::ratelimit::limit_ip(&s, &[crate::ratelimit::buckets::UPLOAD_BLOB]).await?;
     let limit = u64::try_from(s.snapshot().int("blobs.upload_limit")).unwrap_or(u64::MAX);
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    store_blob(&s, &did, content_type.as_deref(), body, limit).await
+}
+
+/// Stores an uploaded blob for `did` (temp until a record uses it), at most
+/// `limit` bytes: `uploadBlob` after its auth, and a cairn's upload for an
+/// account it manages.
+pub(crate) async fn store_blob(
+    s: &Arc<AppState>,
+    did: &str,
+    content_type: Option<&str>,
+    body: Body,
+    limit: u64,
+) -> XrpcResult<Json<Value>> {
+    // A deactivated account can upload (a migration's blobs arrive before
+    // activation), as the reference's `checkTakedown` only.
+    let account = auth::account_checked(s, did, false).await?;
 
     // Bytes first, to a temp key; no transaction is open meanwhile.
     let temp = locus_store::blob::temp_key();
@@ -861,13 +878,13 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
             other => XrpcError::hidden(&other),
         })?;
     let cid = written.cid.to_string_base32();
-    let mime = locus_blob::mime_type(&written.head, content_type.as_deref());
+    let mime = locus_blob::mime_type(&written.head, content_type);
     let size = i64::try_from(written.size).unwrap_or(i64::MAX);
     locus_core::metrics::inc("locus_blob_bytes_total", &[], written.size);
 
     // Scanned in temp storage, before it can be used.
     use crate::scanner::Scan;
-    let scan = crate::scanner::scan_key(&s, &account.did, &cid, &mime, &temp).await;
+    let scan = crate::scanner::scan_key(s, &account.did, &cid, &mime, &temp).await;
     let scan_status = match &scan {
         Scan::NotConfigured => "none",
         Scan::Allowed => "allowed",
@@ -891,7 +908,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
 
     // Metadata under the repo lock (serialized with commits for this account).
     let mut newly_matched = false;
-    let gate_on = crate::media_gate::gate_on(&s);
+    let gate_on = crate::media_gate::gate_on(s);
     let result: XrpcResult<Vec<locus_store::blob::PendingMove>> = async {
         let (_lock, mut tx) = s.repo.locked_tx(&account.did).await.map_err(commit_error)?;
         let backend = tx.blob_backend().await?;
@@ -901,7 +918,7 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
             tx.queue_blob_delete(&temp, s.blobs.epoch()).await?;
             tx.commit().await?;
             if backend.epoch != s.blobs.epoch() {
-                crate::keys::reload_soon(&s);
+                crate::keys::reload_soon(s);
             }
             return Err(XrpcError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -962,12 +979,11 @@ pub async fn upload_blob(State(s): St, headers: HeaderMap, body: Body) -> XrpcRe
         tracing::debug!("upload metadata refused: {}", e.message);
     }
     if let (true, Scan::Matched { result: r, reason }) = (newly_matched, &scan) {
-        crate::scanner::record_match(&s, &account.did, &cid, "upload", r, reason.as_deref())
-            .await?;
+        crate::scanner::record_match(s, &account.did, &cid, "upload", r, reason.as_deref()).await?;
         // Its bytes go to quarantine.
-        place_blob(&s, &account.did, &cid).await;
+        place_blob(s, &account.did, &cid).await;
     }
-    finish_moves(&s, &result?).await;
+    finish_moves(s, &result?).await;
     Ok(Json(json!({
         "blob": {
             "$type": "blob",

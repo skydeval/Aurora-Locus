@@ -39,6 +39,12 @@ pub struct Bucket {
 pub mod buckets {
     use super::{Bucket, DAY, HOUR, MINUTE};
 
+    /// A cairn's image uploads, per managed account.
+    pub const LABELER_BLOB_HOUR: Bucket = Bucket {
+        name: "app.nearhorizon.locus.uploadLabelerBlob-0",
+        window_ms: HOUR,
+        points: 30,
+    };
     pub const CREATE_SESSION_DAY: Bucket = Bucket {
         name: "com.atproto.server.createSession-0",
         window_ms: DAY,

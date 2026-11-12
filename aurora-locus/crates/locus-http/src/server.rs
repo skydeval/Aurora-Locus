@@ -526,6 +526,7 @@ pub(crate) async fn check_password(
     account: &Account,
     pw: &str,
 ) -> XrpcResult<Option<Credential>> {
+    crate::labeler_access::refuse_managed(s, &account.did).await?;
     if let Some(hash) = &account.password_hash
         && password::verify(pw, hash)
     {
@@ -713,6 +714,11 @@ pub async fn refresh_session(
         crate::error::no_body(&body)?;
     }
     let (tokens, did) = s.sessions.refresh(token).await?;
+    if s.store.managed_by(&did).await?.is_some() {
+        // A managed account keeps no session: the one just made ends too.
+        crate::labeler_access::end_sessions(&s, &did).await?;
+        return Err(crate::labeler_access::managed_error());
+    }
     let account = s.store.account_by_did(&did).await?.ok_or_else(|| {
         XrpcError::new(
             StatusCode::FORBIDDEN,
@@ -758,6 +764,7 @@ pub async fn create_app_password(
         auth::forbid(auth::OAUTH_UNSUPPORTED),
     )
     .await?;
+    crate::labeler_access::refuse_managed(&s, &authed.did).await?;
     let name = input.name.trim();
     if name.is_empty() || name.len() > 32 {
         return Err(XrpcError::invalid_request("Invalid app password name"));

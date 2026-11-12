@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bodyHash`. Until a key is pinned, tokens must come from the cairn's
   `#atproto_labeler` service and its label key. Every token works once and
   lives at most five minutes.
+  Accounts a cairn creates are managed by it: no password, and no sign-in
+  of any kind (password, app password, OAuth, refresh, email or password
+  changes) once activated. The cairn writes their labeler and profile
+  records (`app.nearhorizon.locus.putLabelerRecord`, `deleteLabelerRecord`)
+  and uploads their images (`uploadLabelerBlob`), and Locus reports each
+  write back through `tools.cairn.labeler.notifyRecordWritten`. `aurora-locus
+  cairn manage` locks an older account to its cairn; `cairn release`
+  unlocks one.
 - A `createReport` proxied for an OAuth session carries the session's
   client in the service JWT's `client_id` claim, so a labeler can take
   reports only from the apps it chooses. Password sessions and other

@@ -217,6 +217,7 @@ pub async fn request_email_update(
     )
     .await?;
     crate::error::no_body(&body)?;
+    crate::labeler_access::refuse_managed(&s, &authed.did).await?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestEmailUpdate-0";
@@ -257,6 +258,7 @@ pub async fn update_email(
     Json(input): Json<UpdateEmailInput>,
 ) -> XrpcResult<()> {
     let authed = auth::full_access(&s, &headers).await?;
+    crate::labeler_access::refuse_managed(&s, &authed.did).await?;
     let account = auth::account_checked(&s, &authed.did, false).await?;
     let did = account.did.as_str();
     let email = input.email.trim().to_ascii_lowercase();
@@ -345,8 +347,10 @@ pub async fn request_password_reset(
     }
     require_email(&s).await?;
     let email = input.email.trim().to_ascii_lowercase();
+    // A managed account gets no reset mail, with the same answer.
     if let Some(account) = s.store.account_by_email(&email).await?
         && account.status != locus_store::accounts::Status::Deleted
+        && s.store.managed_by(&account.did).await?.is_none()
     {
         let token = issue(&s, &account.did, TokenPurpose::ResetPassword).await?;
         send(&s, Template::ResetPassword, &email, &token, &account.handle).await?;
@@ -366,6 +370,7 @@ pub async fn reset_password(State(s): St, Json(input): Json<ResetPasswordInput>)
         return Err(XrpcError::invalid_request("Invalid password length."));
     }
     let did = owner(&s, TokenPurpose::ResetPassword, &input.token).await?;
+    crate::labeler_access::refuse_managed(&s, &did).await?;
     let hash = password::hash(&input.password).map_err(XrpcError::internal)?;
     let mut tx = s.store.begin().await?;
     tx.set_password_hash(&did, &hash).await?;

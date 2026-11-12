@@ -478,7 +478,7 @@ shared advisory lock. `migrate storage` and `import reference-pds` accept
 | `settings get/set/list/export/import` | Runtime settings |
 | `operator add [--role] / remove / list / reset-password / set-role` | Operators |
 | `moderation status/takedown/restore` | Subject status of accounts, records and blobs |
-| `cairn add <did> [--max-accounts] [--key] / set-cap <did> <n> / set-key <did> <did:key> / list / remove <did>` | [Cairn labelers](#cairn-labelers) that may create accounts here |
+| `cairn add <did> [--max-accounts] [--key] / set-cap <did> <n> / set-key <did> <did:key> / list / remove <did> / manage <account> / release <account>` | [Cairn labelers](#cairn-labelers) that may create accounts here |
 | `crawl request` | Ask every relay to crawl now |
 | `jobs list / run <name> / pause <name> [--resume]` | Background jobs |
 | `kryphocron status / rotate-now / audit` | Private-tier controls |
@@ -535,12 +535,13 @@ A wrong key is 401 `BadJwtSignature`. A cairn calls:
 - `app.nearhorizon.locus.getLabelerAccess` (GET). It answers
   `{registered, cap, used, handleDomains}`, or 403 `NotRegisteredLabeler`.
 - `app.nearhorizon.locus.createLabelerAccount` (POST), with the same kind of
-  token and `{did, handle, email, password, didProof}`. `didProof` is the
-  token `createAccount` takes for an existing DID, signed by that DID's
-  current key, so the labeler's DID still proves it owns the account. The
-  account starts deactivated. The answer gives the session, the repo
-  `signingKey` to put in the DID document as `#atproto`, and `pdsEndpoint`;
-  the cairn then calls `activateAccount`. Past the cap it is 403
+  token and `{did, handle, email, didProof}` (a `password` is ignored).
+  `didProof` is the token `createAccount` takes for an existing DID, signed
+  by that DID's current key, so the labeler's DID still proves it owns the
+  account. The account starts deactivated and is managed by the cairn (see
+  below). The answer gives a session, the repo `signingKey` to put in the
+  DID document as `#atproto`, and `pdsEndpoint`; the cairn then calls
+  `activateAccount`, which ends that session. Past the cap it is 403
   `LabelerAccountCapReached`; a bad `didProof` is 401 `InvalidDidProof`.
 - `app.nearhorizon.locus.deleteLabelerAccount` (POST), with the same kind of
   token and `{did}`. Deletes an account this cairn created here, the same
@@ -556,6 +557,35 @@ After each account, Locus calls the cairn's
 endpoint, with a service JWT from this PDS) with `{did, handle, createdAt,
 pds}`, retrying for about an hour and a half. Each account is also in the
 audit log as `labeler.createAccount`.
+
+**Managed accounts.** An account a cairn creates is managed by it: it has
+no password, and every way in answers 400 `AccountManaged` (password
+sign-in, app passwords, refreshing a session, email and password changes,
+the email-code account delete, an operator's password reset); OAuth sign-in
+is refused, and a password-reset request sends no mail. Its cairn writes it
+instead, with a pinned key (403 `KeyNotPinned` without one), only for
+accounts it manages (403 `NotManagedByThisCairn` otherwise):
+
+- `app.nearhorizon.locus.putLabelerRecord` (POST) `{did, collection, rkey,
+  record, swapRecord?}` and `deleteLabelerRecord` (POST) `{did, collection,
+  rkey, swapRecord?}`: only `app.bsky.labeler.service` and
+  `app.bsky.actor.profile`, at `self` (400 `CollectionNotAllowed`
+  otherwise), validated against their lexicons. They answer `{uri, cid}`
+  and `{}`.
+- `app.nearhorizon.locus.uploadLabelerBlob?did=` (POST, the bytes as the
+  body; `bodyHash` covers them): a PNG or JPEG of at most 1,000,000 bytes,
+  30 an hour per account. It answers `{blob}`, as `uploadBlob` does; a blob
+  no record uses is cleaned up.
+
+After each write Locus calls the cairn's
+`tools.cairn.labeler.notifyRecordWritten` with `{did, op: "put" | "delete"
+| "blob", collection?, rkey?, cid?, at}`, so it can spot a write it didn't
+make. An admin can lock an older account a cairn created with `aurora-locus
+cairn manage <account>`, or unlock one with `cairn release <account>` (it
+then has no password until an operator sets one); the cairn hears of a
+release through `tools.cairn.labeler.notifyAccountReleased {did, at}`. Both
+are in the audit log. After `cairn remove`, the cairn's calls are refused,
+and its accounts stay locked until released.
 
 When Locus proxies `com.atproto.moderation.createReport` for an OAuth
 session, the service JWT it signs for the labeler carries the session's

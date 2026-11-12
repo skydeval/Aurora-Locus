@@ -170,6 +170,36 @@ impl Store {
         Ok(exec!(self, q, id)? == 1)
     }
 
+    /// The cairn that manages `did`, if one does.
+    pub async fn managed_by(&self, did: &str) -> CoreResult<Option<String>> {
+        let q = sql(
+            "SELECT cairn FROM managed_account WHERE did = {1}",
+            self.is_postgres(),
+        );
+        let row: Option<(String,)> = run!(self, q, fetch_optional, did)?;
+        Ok(row.map(|(c,)| c))
+    }
+
+    /// Marks `did` as managed by `cairn`.
+    pub async fn set_managed(&self, did: &str, cairn: &str) -> CoreResult<()> {
+        let q = sql(
+            "INSERT INTO managed_account (did, cairn, managed_at) VALUES ({1}, {2}, {3}) \
+             ON CONFLICT (did) DO UPDATE SET cairn = excluded.cairn, managed_at = excluded.managed_at",
+            self.is_postgres(),
+        );
+        exec!(self, q, did, cairn, locus_core::time::now_ms())?;
+        Ok(())
+    }
+
+    /// Releases `did` from its cairn; whether it was managed.
+    pub async fn release_managed(&self, did: &str) -> CoreResult<bool> {
+        let q = sql(
+            "DELETE FROM managed_account WHERE did = {1}",
+            self.is_postgres(),
+        );
+        Ok(exec!(self, q, did)? == 1)
+    }
+
     /// Appends an audit-log row outside any other transaction.
     pub async fn audit(
         &self,
@@ -191,6 +221,16 @@ impl Store {
         );
         let (n,): (i64,) = run!(self, q, fetch_one, actor, action)?;
         Ok(n)
+    }
+
+    /// Who wrote the earliest `action` row about `target`.
+    pub async fn audit_actor(&self, action: &str, target: &str) -> CoreResult<Option<String>> {
+        let q = sql(
+            "SELECT actor FROM audit_log WHERE action = {1} AND target = {2} ORDER BY id LIMIT 1",
+            self.is_postgres(),
+        );
+        let row: Option<(String,)> = run!(self, q, fetch_optional, action, target)?;
+        Ok(row.map(|(a,)| a))
     }
 
     /// Whether `actor` wrote an `action` row about `target`.

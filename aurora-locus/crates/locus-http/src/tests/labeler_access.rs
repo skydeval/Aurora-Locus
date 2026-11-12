@@ -598,3 +598,325 @@ async fn a_bad_key_is_refused_before_it_is_saved() {
     let (st, v) = set(json!([format!("did:web:c 5 {good}")])).await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
+
+/// Every notice a cairn got: (method, authorization, body).
+type AllNotices = Arc<Mutex<Vec<(String, String, Value)>>>;
+
+async fn mock_cairn_all() -> (String, AllNotices) {
+    let seen: AllNotices = Arc::default();
+    let app = Router::new()
+        .route(
+            "/xrpc/{nsid}",
+            post(
+                |State(seen): State<AllNotices>,
+                 axum::extract::Path(nsid): axum::extract::Path<String>,
+                 headers: axum::http::HeaderMap,
+                 axum::Json(body): axum::Json<Value>| async move {
+                    let auth = headers["authorization"].to_str().unwrap_or("").to_owned();
+                    seen.lock().unwrap().push((nsid, auth, body));
+                    StatusCode::OK
+                },
+            ),
+        )
+        .with_state(seen.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// Waits for the cairn to have been told `nsid`, `n` times in all.
+async fn told(seen: &AllNotices, nsid: &str, n: usize) -> Vec<Value> {
+    for _ in 0..50 {
+        let got: Vec<Value> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, _, _)| m == nsid)
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        if got.len() >= n {
+            return got;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the cairn wasn't told {nsid} {n} times");
+}
+
+/// The smallest bytes a PNG sniffer accepts.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89";
+
+/// A labeler account made through the trust link is locked to its cairn:
+/// no sign-in of any kind once activated, and the cairn writes its labeler
+/// and profile records (and their images) itself, each write reported back.
+#[tokio::test]
+async fn a_cairn_manages_its_labeler_accounts_and_no_one_signs_in() {
+    use crate::labeler_access::{
+        DELETE_RECORD, NOTIFY_RELEASED, NOTIFY_WRITTEN, PUT_RECORD, RELEASE, UPLOAD_BLOB,
+    };
+    let h = harness_build(HarnessOpts {
+        ssrf_protection: false,
+        ..HarnessOpts::default()
+    })
+    .await;
+    let (cairn_url, seen) = mock_cairn_all().await;
+    put_did(
+        &h,
+        CAIRN,
+        json!({"atproto_label": K256Keypair::generate().did()}),
+        json!({"atproto_labeler": {"type": "AtprotoLabeler", "endpoint": cairn_url}}),
+    );
+    let pinned = K256Keypair::generate();
+    h.state
+        .settings
+        .set(
+            SETTING,
+            json!([format!("{CAIRN} 5 {}", pinned.did())]),
+            "test",
+        )
+        .await
+        .unwrap();
+    let call = |lxm: &'static str, body: Value| {
+        let h = &h;
+        let token = link_jwt(&pinned, CAIRN, lxm, 60, Some(&body));
+        async move { h.post(lxm, Some(&token), body).await }
+    };
+
+    // Created through the link: the password sent is ignored.
+    let labeler = "did:plc:managedmanagedmanagedmana";
+    let temp = K256Keypair::generate();
+    put_did(&h, labeler, json!({"atproto": temp.did()}), json!({}));
+    let proof = jwt(&temp, labeler, "com.atproto.server.createAccount");
+    let (st, v) = call(
+        CREATE_ACCOUNT,
+        json!({"did": labeler, "handle": "managed.pds.example.com",
+               "email": "managed@example.com", "password": "a password", "didProof": proof}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let access = v["accessJwt"].as_str().unwrap().to_owned();
+    let refresh = v["refreshJwt"].as_str().unwrap().to_owned();
+    let signing = v["signingKey"].as_str().unwrap().to_owned();
+    assert_eq!(
+        h.state.store.managed_by(labeler).await.unwrap().as_deref(),
+        Some(CAIRN)
+    );
+    let (st, v) = h
+        .post(
+            "com.atproto.server.createSession",
+            None,
+            json!({"identifier": labeler, "password": "a password"}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("AccountManaged")),
+        "{v}"
+    );
+
+    // Its DID points here; activating ends the creation session.
+    {
+        use locus_identity::plc::{Operation, Service};
+        use std::collections::BTreeMap;
+        let op = Operation {
+            rotation_keys: vec![h.state.secrets.plc_keys.current_did().unwrap()],
+            verification_methods: BTreeMap::from([("atproto".to_owned(), signing.clone())]),
+            also_known_as: vec!["at://managed.pds.example.com".into()],
+            services: BTreeMap::from([(
+                "atproto_pds".to_owned(),
+                Service {
+                    kind: "AtprotoPersonalDataServer".into(),
+                    endpoint: "https://pds.example.com".into(),
+                },
+            )]),
+            prev: None,
+        };
+        let signed = h
+            .state
+            .secrets
+            .plc_keys
+            .current()
+            .unwrap()
+            .sign_op(&op)
+            .await
+            .unwrap();
+        h.plc
+            .lock()
+            .unwrap()
+            .log
+            .insert(labeler.into(), vec![signed.to_json()]);
+    }
+    let (st, v) = h
+        .post(
+            "com.atproto.server.activateAccount",
+            Some(&access),
+            json!({}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let (st, v) = h
+        .call(
+            "GET",
+            "/xrpc/com.atproto.server.getSession",
+            Some(&access),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("ExpiredToken")),
+        "the session ended (revoked): {v}"
+    );
+    let (st, _) = h
+        .post(
+            "com.atproto.server.refreshSession",
+            Some(&refresh),
+            json!({}),
+        )
+        .await;
+    assert!(!st.is_success(), "no refresh");
+
+    // Writes: only its labeler and profile records, at self.
+    let (st, v) = call(
+        PUT_RECORD,
+        json!({"did": labeler, "collection": "app.bsky.feed.post", "rkey": "self",
+               "record": {"$type": "app.bsky.feed.post", "text": "hi", "createdAt": "2026-11-12T00:00:00Z"}}),
+    )
+    .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("CollectionNotAllowed"))
+    );
+    let blob_token = |bytes: &[u8]| {
+        let now = locus_core::time::now_ms() / 1000;
+        let hash = crate::labeler_access::body_hash(bytes);
+        locus_auth::service_jwt::create_with(
+            &pinned,
+            CAIRN,
+            AUD,
+            Some(now + 60),
+            Some(UPLOAD_BLOB),
+            now,
+            &[("bodyHash", hash.as_str())],
+        )
+        .unwrap()
+    };
+    let upload = |bytes: &'static [u8]| {
+        let h = &h;
+        let token = blob_token(bytes);
+        async move {
+            let auth = format!("Bearer {token}");
+            let (st, _, out) = h
+                .raw(
+                    "POST",
+                    &format!("/xrpc/{UPLOAD_BLOB}?did={labeler}"),
+                    None,
+                    bytes.to_vec(),
+                    &[("authorization", &auth), ("content-type", "image/png")],
+                )
+                .await;
+            (
+                st,
+                serde_json::from_slice::<Value>(&out).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let (st, v) = upload(b"not an image at all").await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let (st, v) = upload(PNG).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let avatar = v["blob"].clone();
+    let (st, v) = call(
+        PUT_RECORD,
+        json!({"did": labeler, "collection": "app.bsky.actor.profile", "rkey": "self",
+               "record": {"$type": "app.bsky.actor.profile", "displayName": "A labeler",
+                          "avatar": avatar}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let profile_cid = v["cid"].clone();
+    let (st, rec) = h
+        .call(
+            "GET",
+            &format!(
+                "/xrpc/com.atproto.repo.getRecord?repo={labeler}&collection=app.bsky.actor.profile&rkey=self"
+            ),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(
+        (st, &rec["value"]["displayName"], &rec["cid"]),
+        (StatusCode::OK, &json!("A labeler"), &profile_cid)
+    );
+    let (st, v) = call(
+        DELETE_RECORD,
+        json!({"did": labeler, "collection": "app.bsky.actor.profile", "rkey": "self"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // Another account is out of reach.
+    h.state
+        .settings
+        .set("accounts.invite_required", json!(false), "test")
+        .await
+        .unwrap();
+    let other = h
+        .create_account("plainer.pds.example.com", "plainer@example.com", "pw")
+        .await;
+    let (st, v) = call(
+        PUT_RECORD,
+        json!({"did": other["did"], "collection": "app.bsky.actor.profile", "rkey": "self",
+               "record": {"$type": "app.bsky.actor.profile", "displayName": "mine now"}}),
+    )
+    .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("NotManagedByThisCairn"))
+    );
+
+    // Each write was reported, with what it changed.
+    let writes = told(&seen, NOTIFY_WRITTEN, 3).await;
+    let ops: Vec<&str> = writes.iter().filter_map(|w| w["op"].as_str()).collect();
+    assert_eq!(ops, ["blob", "put", "delete"], "{writes:?}");
+    assert_eq!(writes[1]["cid"], profile_cid);
+    assert!(
+        writes
+            .iter()
+            .all(|w| w["did"] == labeler && w["at"].is_string())
+    );
+
+    // Without a pinned key the write methods refuse.
+    h.state
+        .settings
+        .set(SETTING, json!([CAIRN]), "test")
+        .await
+        .unwrap();
+    let (st, v) = h
+        .post(
+            PUT_RECORD,
+            Some(&jwt(&pinned, &format!("{CAIRN}#atproto_labeler"), PUT_RECORD)),
+            json!({"did": labeler, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {}}),
+        )
+        .await;
+    assert_eq!(
+        (st, v["error"].as_str()),
+        (StatusCode::FORBIDDEN, Some("KeyNotPinned"))
+    );
+
+    // An operator releases it; the cairn hears.
+    let admin = format!("Bearer {}", h.operator("ad", "admin").await);
+    let (st, v) = h
+        .admin_call(
+            "POST",
+            &format!("/xrpc/{RELEASE}"),
+            &admin,
+            Some(json!({"did": labeler})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(h.state.store.managed_by(labeler).await.unwrap().is_none());
+    let released = told(&seen, NOTIFY_RELEASED, 1).await;
+    assert_eq!(released[0]["did"], labeler);
+}

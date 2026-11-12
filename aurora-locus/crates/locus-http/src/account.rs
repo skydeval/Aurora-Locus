@@ -119,6 +119,10 @@ pub async fn activate_account(
     )
     .await?;
     tx.commit().await?;
+    // A managed account's one session was for this: it ends here.
+    if s.store.managed_by(did).await?.is_some() {
+        crate::labeler_access::end_sessions(&s, did).await?;
+    }
     Ok(())
 }
 
@@ -240,6 +244,7 @@ pub async fn request_account_delete(
     )
     .await?;
     crate::error::no_body(&body)?;
+    crate::labeler_access::refuse_managed(&s, &authed.did).await?;
     {
         use crate::ratelimit::buckets::{email_day, email_hour};
         let n = "com.atproto.server.requestAccountDelete-0";
@@ -288,6 +293,7 @@ pub async fn delete_account(State(s): St, Json(input): Json<DeleteAccountInput>)
         .await?
         .filter(|a| a.status != Status::Deleted)
         .ok_or_else(|| XrpcError::invalid_request("account not found"))?;
+    crate::labeler_access::refuse_managed(&s, &account.did).await?;
     let valid = account
         .password_hash
         .as_deref()

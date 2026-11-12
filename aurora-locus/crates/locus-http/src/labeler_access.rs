@@ -337,7 +337,6 @@ pub struct CreateLabelerAccountInput {
     did: Option<String>,
     handle: String,
     email: Option<String>,
-    password: Option<String>,
     did_proof: Option<String>,
 }
 
@@ -390,7 +389,8 @@ pub async fn create_labeler_account(
         handle: input.handle,
         did: Some(did.clone()),
         invite_code: None,
-        password: input.password,
+        // Managed accounts have no password: no one signs in to them.
+        password: None,
         recovery_key: None,
         locus_did_method: None,
         skip_invite: true,
@@ -416,12 +416,16 @@ pub async fn create_labeler_account(
             Some(&json!({"handle": handle})),
         )
         .await?;
+    // Locked to the cairn from the start; the session below is for
+    // activateAccount only, and ends when the account is activated.
+    s.store.set_managed(&did, &cairn).await?;
     drop(_one_at_a_time);
 
     let signing = s.signing_key(&did).await?;
     spawn_notify(
         Arc::clone(&s),
         cairn,
+        NOTIFY,
         json!({
             "did": did,
             "handle": handle,
@@ -480,27 +484,330 @@ pub async fn delete_labeler_account(
     let job = crate::account::start_deletion(&s, &input.did).await?;
     crate::account::spawn_deletion(&s, job);
     s.store.oauth_delete_account_tokens(&input.did).await?;
+    s.store.release_managed(&input.did).await?;
     s.store
         .audit(&cairn, DELETE_AUDIT_ACTION, Some(&input.did), None)
         .await?;
     Ok(Json(json!({})))
 }
 
-/// Tells the cairn about a new account, retrying with backoff.
-fn spawn_notify(s: Arc<AppState>, cairn: String, body: Value) {
+// ---------------------------------------------------------------- managed accounts
+
+/// What every way into a managed account answers.
+#[must_use]
+pub fn managed_error() -> XrpcError {
+    XrpcError::new(
+        StatusCode::BAD_REQUEST,
+        "AccountManaged",
+        "This account is managed by its cairn and can't be signed in to",
+    )
+}
+
+/// Refuses when a cairn manages `did`.
+pub async fn refuse_managed(s: &AppState, did: &str) -> XrpcResult<()> {
+    if s.store.managed_by(did).await?.is_some() {
+        return Err(managed_error());
+    }
+    Ok(())
+}
+
+/// Ends every way `did` is signed in: sessions (app passwords' too) and
+/// OAuth tokens.
+pub async fn end_sessions(s: &AppState, did: &str) -> XrpcResult<()> {
+    let mut tx = s.store.begin().await?;
+    tx.revoke_sessions(did, locus_store::accounts::SessionFilter::All)
+        .await?;
+    tx.commit().await?;
+    s.store.oauth_delete_account_tokens(did).await?;
+    Ok(())
+}
+
+pub const PUT_RECORD: &str = locus_nsid!("putLabelerRecord");
+pub const DELETE_RECORD: &str = locus_nsid!("deleteLabelerRecord");
+pub const UPLOAD_BLOB: &str = locus_nsid!("uploadLabelerBlob");
+pub const MANAGE: &str = locus_nsid!("admin.manageLabelerAccount");
+pub const RELEASE: &str = locus_nsid!("admin.releaseLabelerAccount");
+/// What Locus calls on the cairn after each write to an account it manages.
+pub const NOTIFY_WRITTEN: &str = "tools.cairn.labeler.notifyRecordWritten";
+/// What Locus calls on the cairn when an operator releases its account.
+pub const NOTIFY_RELEASED: &str = "tools.cairn.labeler.notifyAccountReleased";
+/// The only records a cairn writes, each at `self`.
+pub const WRITABLE: &[&str] = &["app.bsky.labeler.service", "app.bsky.actor.profile"];
+/// The largest image a cairn uploads.
+pub const MAX_BLOB_BYTES: u64 = 1_000_000;
+
+/// The account `did` if `cairn` manages it, active or not as `active` asks.
+async fn managed_target(
+    s: &AppState,
+    cairn: &str,
+    did: &str,
+    active: bool,
+) -> XrpcResult<locus_store::accounts::Account> {
+    if s.store.managed_by(did).await?.as_deref() != Some(cairn) {
+        return Err(XrpcError::new(
+            StatusCode::FORBIDDEN,
+            "NotManagedByThisCairn",
+            "This cairn doesn't manage that account here",
+        ));
+    }
+    auth::account_checked(s, did, active).await
+}
+
+fn writable(collection: &str, rkey: &str) -> XrpcResult<()> {
+    if !WRITABLE.contains(&collection) {
+        return Err(XrpcError::new(
+            StatusCode::BAD_REQUEST,
+            "CollectionNotAllowed",
+            format!("A cairn writes only {}", WRITABLE.join(" and ")),
+        ));
+    }
+    if rkey != "self" {
+        return Err(XrpcError::invalid_request("The record key is self"));
+    }
+    Ok(())
+}
+
+/// Tells the cairn about a write it made (or one it should know of).
+fn notify_written(s: &Arc<AppState>, cairn: String, body: Value) {
+    spawn_notify(Arc::clone(s), cairn, NOTIFY_WRITTEN, body);
+}
+
+fn now_iso() -> String {
+    locus_core::time::iso8601(locus_core::time::now_ms())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutLabelerRecordInput {
+    did: String,
+    collection: String,
+    rkey: String,
+    record: Value,
+    swap_record: Option<Value>,
+}
+
+/// `putLabelerRecord`: the labeler service or profile record of an account
+/// this cairn manages, validated against its lexicon.
+pub async fn put_labeler_record(
+    State(s): St,
+    headers: HeaderMap,
+    body: Bytes,
+) -> XrpcResult<Json<Value>> {
+    let Entry { did: cairn, .. } = cairn_auth(&s, &headers, PUT_RECORD, Some(&body), true).await?;
+    let input: PutLabelerRecordInput = json_body(&body)?;
+    writable(&input.collection, &input.rkey)?;
+    let account = managed_target(&s, &cairn, &input.did, true).await?;
+    let put = crate::repo::PutRecordInput {
+        repo: account.did.clone(),
+        collection: input.collection.clone(),
+        rkey: input.rkey.clone(),
+        validate: Some(true),
+        record: input.record,
+        swap_record: input.swap_record,
+        swap_commit: None,
+    };
+    let Json(out) = crate::repo::put_record_for(&s, &account, &put).await?;
+    notify_written(
+        &s,
+        cairn,
+        json!({"did": account.did, "op": "put", "collection": input.collection,
+               "rkey": input.rkey, "cid": out["cid"], "at": now_iso()}),
+    );
+    Ok(Json(json!({"uri": out["uri"], "cid": out["cid"]})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteLabelerRecordInput {
+    did: String,
+    collection: String,
+    rkey: String,
+    swap_record: Option<String>,
+}
+
+/// `deleteLabelerRecord`: removes one of those records.
+pub async fn delete_labeler_record(
+    State(s): St,
+    headers: HeaderMap,
+    body: Bytes,
+) -> XrpcResult<Json<Value>> {
+    let Entry { did: cairn, .. } =
+        cairn_auth(&s, &headers, DELETE_RECORD, Some(&body), true).await?;
+    let input: DeleteLabelerRecordInput = json_body(&body)?;
+    writable(&input.collection, &input.rkey)?;
+    let account = managed_target(&s, &cairn, &input.did, true).await?;
+    let del = crate::repo::DeleteRecordInput {
+        repo: account.did.clone(),
+        collection: input.collection.clone(),
+        rkey: input.rkey.clone(),
+        swap_record: input.swap_record,
+        swap_commit: None,
+    };
+    let _ = crate::repo::delete_record_for(&s, &account, &del).await?;
+    notify_written(
+        &s,
+        cairn,
+        json!({"did": account.did, "op": "delete", "collection": input.collection,
+               "rkey": input.rkey, "at": now_iso()}),
+    );
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+pub struct UploadLabelerBlobParams {
+    did: String,
+}
+
+/// `uploadLabelerBlob?did=`: a PNG or JPEG image, at most a megabyte, for an
+/// account this cairn manages (an avatar or banner); 30 an hour per account.
+pub async fn upload_labeler_blob(
+    State(s): St,
+    headers: HeaderMap,
+    axum::extract::Query(p): axum::extract::Query<UploadLabelerBlobParams>,
+    body: Bytes,
+) -> XrpcResult<Json<Value>> {
+    let Entry { did: cairn, .. } = cairn_auth(&s, &headers, UPLOAD_BLOB, Some(&body), true).await?;
+    let account = managed_target(&s, &cairn, &p.did, false).await?;
+    if body.len() as u64 > MAX_BLOB_BYTES {
+        return Err(XrpcError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BlobTooLarge",
+            "An image is at most 1,000,000 bytes",
+        ));
+    }
+    let mime = locus_blob::mime_type(&body, None);
+    if mime != "image/png" && mime != "image/jpeg" {
+        return Err(XrpcError::invalid_request("Only PNG and JPEG images"));
+    }
+    crate::ratelimit::limit_always(
+        &s,
+        &[(
+            crate::ratelimit::buckets::LABELER_BLOB_HOUR,
+            &account.did,
+            1,
+        )],
+    )
+    .await?;
+    let Json(out) = crate::repo::store_blob(
+        &s,
+        &account.did,
+        Some(&mime),
+        axum::body::Body::from(body),
+        MAX_BLOB_BYTES,
+    )
+    .await?;
+    notify_written(
+        &s,
+        cairn,
+        json!({"did": account.did, "op": "blob", "cid": out["blob"]["ref"]["$link"],
+               "at": now_iso()}),
+    );
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct AccountInput {
+    did: String,
+}
+
+/// An operator call for the managing methods (admins only).
+async fn admin_op(
+    s: &AppState,
+    headers: &HeaderMap,
+    lxm: &str,
+) -> XrpcResult<crate::admin_auth::Caller> {
+    crate::admin_auth::require(
+        s,
+        headers,
+        lxm,
+        crate::admin_auth::Surface::Locus,
+        crate::admin_auth::Role::Admin,
+    )
+    .await
+}
+
+/// `admin.manageLabelerAccount`: locks an account a cairn created to that
+/// cairn (an account from before managed accounts existed). Every session
+/// ends.
+pub async fn manage_labeler_account(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<AccountInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = admin_op(&s, &headers, MANAGE).await?;
+    let Some(cairn) = s.store.audit_actor(AUDIT_ACTION, &input.did).await? else {
+        return Err(XrpcError::invalid_request(
+            "No cairn created that account here",
+        ));
+    };
+    crate::admin::any_account(&s, &input.did)
+        .await?
+        .ok_or_else(|| XrpcError::invalid_request("Account not found"))?;
+    s.store.set_managed(&input.did, &cairn).await?;
+    end_sessions(&s, &input.did).await?;
+    crate::admin_auth::audit(
+        &s,
+        &who,
+        "labeler.manage",
+        Some(&input.did),
+        Some(json!({"cairn": cairn})),
+    )
+    .await;
+    Ok(Json(json!({"did": input.did, "cairn": cairn})))
+}
+
+/// `admin.releaseLabelerAccount`: unlocks a managed account. It has no
+/// password until an operator sets one (or its email resets it); its cairn
+/// is told.
+pub async fn release_labeler_account(
+    State(s): St,
+    headers: HeaderMap,
+    Json(input): Json<AccountInput>,
+) -> XrpcResult<Json<Value>> {
+    let who = admin_op(&s, &headers, RELEASE).await?;
+    let Some(cairn) = s.store.managed_by(&input.did).await? else {
+        return Err(XrpcError::invalid_request("That account isn't managed"));
+    };
+    s.store.release_managed(&input.did).await?;
+    crate::admin_auth::audit(
+        &s,
+        &who,
+        "labeler.release",
+        Some(&input.did),
+        Some(json!({"cairn": cairn})),
+    )
+    .await;
+    spawn_notify(
+        Arc::clone(&s),
+        cairn.clone(),
+        NOTIFY_RELEASED,
+        json!({"did": input.did, "at": now_iso()}),
+    );
+    Ok(Json(json!({"did": input.did, "cairn": cairn})))
+}
+
+/// Tells the cairn something through its `nsid` (a new account, a write,
+/// a release), retrying with backoff.
+fn spawn_notify(s: Arc<AppState>, cairn: String, nsid: &'static str, body: Value) {
     tokio::spawn(async move {
         for (attempt, wait) in NOTIFY_BACKOFF_S.iter().enumerate() {
             tokio::time::sleep(Duration::from_secs(*wait)).await;
-            match notify_once(&s, &cairn, &body, attempt > 0).await {
+            match notify_once(&s, &cairn, nsid, &body, attempt > 0).await {
                 Ok(()) => return,
-                Err(e) => tracing::warn!(cairn, attempt, "labeler account notice failed: {e}"),
+                Err(e) => tracing::warn!(cairn, nsid, attempt, "labeler notice failed: {e}"),
             }
         }
-        tracing::error!(cairn, did = %body["did"], "gave up telling the cairn about a new labeler account");
+        tracing::error!(cairn, nsid, did = %body["did"], "gave up telling the cairn");
     });
 }
 
-async fn notify_once(s: &AppState, cairn: &str, body: &Value, fresh: bool) -> Result<(), String> {
+async fn notify_once(
+    s: &AppState,
+    cairn: &str,
+    nsid: &str,
+    body: &Value,
+    fresh: bool,
+) -> Result<(), String> {
     let doc = s
         .resolve_did_doc(cairn, fresh)
         .await
@@ -514,13 +821,13 @@ async fn notify_once(s: &AppState, cairn: &str, body: &Value, fresh: bool) -> Re
         &s.service_did,
         cairn,
         Some(now + 300),
-        Some(NOTIFY),
+        Some(nsid),
         now,
     )
     .map_err(|e| e.to_string())?;
     let client = crate::pipethrough::client(s, true).map_err(|e| e.message)?;
     let res = client
-        .post(format!("{}/xrpc/{NOTIFY}", endpoint.trim_end_matches('/')))
+        .post(format!("{}/xrpc/{nsid}", endpoint.trim_end_matches('/')))
         .bearer_auth(token)
         .json(body)
         .timeout(Duration::from_secs(15))
@@ -548,6 +855,26 @@ pub fn routes() -> axum::Router<Arc<AppState>> {
         .route(
             concat!("/xrpc/", locus_nsid!("deleteLabelerAccount")),
             post(delete_labeler_account),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("putLabelerRecord")),
+            post(put_labeler_record),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("deleteLabelerRecord")),
+            post(delete_labeler_record),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("uploadLabelerBlob")),
+            post(upload_labeler_blob),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("admin.manageLabelerAccount")),
+            post(manage_labeler_account),
+        )
+        .route(
+            concat!("/xrpc/", locus_nsid!("admin.releaseLabelerAccount")),
+            post(release_labeler_account),
         )
 }
 

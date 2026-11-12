@@ -324,6 +324,11 @@ pub enum CairnCmd {
     /// Pins the did:key a cairn's requests must be signed with, replacing
     /// any earlier one.
     SetKey { did: String, key: String },
+    /// Locks an account a cairn created to that cairn: no sign-in of any
+    /// kind, and every session ends.
+    Manage { account: String },
+    /// Unlocks a managed account (set a password for it afterwards).
+    Release { account: String },
     /// The registered cairn labelers, their caps and keys.
     List,
     /// Stops a cairn labeler from creating accounts here.
@@ -1040,7 +1045,35 @@ async fn cairn(c: &Client, cmd: CairnCmd) -> Result<(), String> {
                 return Err(format!("{did} isn't registered"));
             }
             save(cairns).await?;
-            println!("Removed {did}.");
+            println!("Removed {did}. Accounts it manages stay locked until released.");
+            Ok(())
+        }
+        CairnCmd::Manage { account } => {
+            let v = c
+                .call(
+                    locus_http::labeler_access::MANAGE,
+                    &[],
+                    Some(json!({"did": account.trim()})),
+                )
+                .await?;
+            println!(
+                "{} is now managed by {}: no sign-in, and its sessions ended.",
+                account.trim(),
+                v["cairn"].as_str().unwrap_or("its cairn")
+            );
+            Ok(())
+        }
+        CairnCmd::Release { account } => {
+            c.call(
+                locus_http::labeler_access::RELEASE,
+                &[],
+                Some(json!({"did": account.trim()})),
+            )
+            .await?;
+            println!(
+                "Released {}. It has no password: set one with the console's reset-password.",
+                account.trim()
+            );
             Ok(())
         }
     }

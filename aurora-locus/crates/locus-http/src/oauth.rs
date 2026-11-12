@@ -576,6 +576,11 @@ pub async fn authorize(
                 "This account has been deactivated",
             ));
         }
+        if s.store.managed_by(did).await.map_err(store_err)?.is_some() {
+            return Err(OAuthError::access_denied(
+                "This account is managed by its cairn and can't be signed in to",
+            ));
+        }
         if row.expires_at < locus_core::time::now_ms() {
             return Err(OAuthError::access_denied("This request has expired"));
         }
