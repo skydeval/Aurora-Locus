@@ -69,6 +69,19 @@ pub fn create(
     lxm: Option<&str>,
     now: i64,
 ) -> Result<String, ServiceJwtError> {
+    create_with(key, iss, aud, exp, lxm, now, None)
+}
+
+/// [`create`], plus the OAuth `client_id` of the session it's signed for.
+pub fn create_with(
+    key: &dyn Keypair,
+    iss: &str,
+    aud: &str,
+    exp: Option<i64>,
+    lxm: Option<&str>,
+    now: i64,
+    client_id: Option<&str>,
+) -> Result<String, ServiceJwtError> {
     let header = json!({"typ": "JWT", "alg": key.jwt_alg()});
     let mut payload = json!({
         "iat": now,
@@ -79,6 +92,9 @@ pub fn create(
     });
     if let Some(lxm) = lxm {
         payload["lxm"] = json!(lxm);
+    }
+    if let Some(c) = client_id {
+        payload["client_id"] = json!(c);
     }
     let signing_input = format!(
         "{}.{}",

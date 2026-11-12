@@ -13,6 +13,7 @@ mod keys;
 mod keys_shard;
 mod labeler_access;
 mod protocol;
+mod report_client;
 mod security;
 
 use std::collections::HashMap;

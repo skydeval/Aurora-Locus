@@ -134,6 +134,8 @@ pub fn private_appview(s: &AppState) -> Option<(String, String)> {
     configured(s, "appview.private_url", "appview.private_did")
 }
 
+const REPORT: &str = "com.atproto.moderation.createReport";
+
 /// The reference's default service for a method.
 fn default_service(s: &AppState, lxm: &str) -> (&'static str, Option<(String, String)>) {
     if MODERATION_METHODS.contains(&lxm) {
@@ -266,6 +268,10 @@ pub struct Outgoing<'a> {
     /// The stricter URL rule (no IP-literal hosts): `createReport` and push
     /// services resolved from a DID.
     pub strict: bool,
+    /// The OAuth client the request came from, carried in the service
+    /// token as `client_id`. Only `createReport` sets it, so a labeler can
+    /// take reports only from the apps it chooses.
+    pub client_id: Option<&'a str>,
 }
 
 /// Request headers the reference forwards.
@@ -329,7 +335,7 @@ async fn send_inner(s: &AppState, o: Outgoing<'_>) -> ProxyResult<reqwest::Respo
             .unwrap_or(reqwest::header::HeaderValue::from_static("identity")),
     );
     if let Some(iss) = o.iss {
-        let token = service_token(s, iss, o.aud.unwrap_or(&o.target.did), o.lxm)
+        let token = service_token_for(s, iss, o.aud.unwrap_or(&o.target.did), o.lxm, o.client_id)
             .await
             .map_err(err)?;
         if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
@@ -386,9 +392,20 @@ pub(crate) async fn service_token(
     aud: &str,
     lxm: &str,
 ) -> XrpcResult<String> {
+    service_token_for(s, iss, aud, lxm, None).await
+}
+
+/// [`service_token`] carrying an OAuth `client_id`.
+async fn service_token_for(
+    s: &AppState,
+    iss: &str,
+    aud: &str,
+    lxm: &str,
+    client_id: Option<&str>,
+) -> XrpcResult<String> {
     let key = s.signing_key(iss).await?;
     let now = locus_core::time::now_ms() / 1000;
-    locus_auth::service_jwt::create(&key, iss, aud, None, Some(lxm), now)
+    locus_auth::service_jwt::create_with(&key, iss, aud, None, Some(lxm), now, client_id)
         .map_err(|e| XrpcError::internal(e.to_string()))
 }
 
@@ -674,7 +691,12 @@ pub(crate) async fn proxy_inner(
             aud: None,
             target: &target,
             accept_encoding: accept,
-            strict: target.user_influenced && lxm == "com.atproto.moderation.createReport",
+            strict: target.user_influenced && lxm == REPORT,
+            client_id: authed
+                .oauth
+                .as_ref()
+                .filter(|_| lxm == REPORT)
+                .map(|g| g.client_id.as_str()),
         },
     )
     .await?;

@@ -422,6 +422,7 @@ async fn appview_get(
             target: &target,
             accept_encoding: None,
             strict: false,
+            client_id: None,
         },
     )
     .await
@@ -552,6 +553,7 @@ async fn forward(
             // Locus may read the answer, so it asks for it uncompressed.
             accept_encoding: None,
             strict: false,
+            client_id: None,
         },
     )
     .await
@@ -927,6 +929,7 @@ async fn get_feed_inner(
             target: &appview,
             accept_encoding: None,
             strict: false,
+            client_id: None,
         },
     )
     .await?;
@@ -957,6 +960,7 @@ async fn get_feed_inner(
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned),
             strict: false,
+            client_id: None,
         },
     )
     .await?;
@@ -1070,6 +1074,7 @@ async fn push_inner(
             target: &target,
             accept_encoding: None,
             strict,
+            client_id: None,
         },
     )
     .await?;

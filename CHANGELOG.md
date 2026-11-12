@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registered and how many accounts it has left. After each account, Locus
   calls the cairn's `tools.cairn.labeler.notifyAccountCreated`, so it can
   spot an account it didn't ask for.
+- A `createReport` proxied for an OAuth session carries the session's
+  client in the service JWT's `client_id` claim, so a labeler can take
+  reports only from the apps it chooses. Password sessions and other
+  proxied methods leave it out.
 
 ## [0.1.3] - 2026-11-12
 

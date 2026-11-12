@@ -66,6 +66,7 @@ async fn pipe(
             target: &target,
             accept_encoding: accept_encoding(headers),
             strict: false,
+            client_id: None,
         },
     )
     .await;

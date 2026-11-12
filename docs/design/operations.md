@@ -533,6 +533,14 @@ endpoint, with a service JWT from this PDS) with `{did, handle, createdAt,
 pds}`, retrying for about an hour and a half. Each account is also in the
 audit log as `labeler.createAccount`.
 
+When Locus proxies `com.atproto.moderation.createReport` for an OAuth
+session, the service JWT it signs for the labeler carries the session's
+client in a `client_id` claim (the client ID, as the client registered
+it). A labeler can use it to take reports only from the apps it chooses.
+Sessions with no OAuth client (passwords, app passwords) and every other
+proxied method leave it out. This applies to every labeler, registered or
+not.
+
 ### Importing a reference PDS
 
 ```sh
