@@ -101,6 +101,12 @@ Most API routes are under /xrpc/
 /// A rendered page with the UI's headers: the strict CSP, no framing, no
 /// caching, no referrer beyond this site.
 pub fn page(html: String, status: StatusCode) -> Response {
+    // A page that loads the one script may run it (and fetch this site).
+    let csp = if html.contains(assets::JS_TAG.as_str()) {
+        assets::CSP_LIVE
+    } else {
+        assets::CSP
+    };
     let mut res = (status, html).into_response();
     let h = res.headers_mut();
     h.insert(
@@ -109,7 +115,7 @@ pub fn page(html: String, status: StatusCode) -> Response {
     );
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(assets::CSP),
+        HeaderValue::from_static(csp),
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(

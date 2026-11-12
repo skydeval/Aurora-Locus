@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The console and portal are easier to move around: nested pages show a
+  breadcrumb trail and a link back up, saves return to the card they were
+  made in, and a failed action shows its whole page with the problem
+  instead of an empty one. Saving in a card now updates that card in place
+  without reloading the page (the built-in script, with its integrity
+  hash); removals ask first. Every form still works without JavaScript.
+
 ## [0.1.3] - 2026-11-12
 
 ### Added

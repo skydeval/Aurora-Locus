@@ -20,7 +20,7 @@ use locus_web::console_pages::{
     OperatorView, OperatorsPage, TokenRow,
 };
 use locus_web::setup::Choice;
-use locus_web::view::{ConfirmPage, Hidden};
+use locus_web::view::{ConfirmPage, Hidden, Link};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -378,7 +378,10 @@ async fn render_account(
         .into_iter()
         .map(invite_row)
         .collect();
-    let mut sh = shell(s, op, PageId::Accounts).await;
+    let mut sh = shell(s, op, PageId::Accounts).await.under(vec![Link {
+        href: PageId::Accounts.href().into(),
+        label: "Accounts".into(),
+    }]);
     sh.title = format!("@{}", a.handle);
     let page = AccountPage {
         shell: sh,
@@ -417,6 +420,20 @@ fn invite_row(c: locus_store::invites::InviteCode) -> InviteRow {
         for_account: c.for_account,
         created: when(c.created_at),
         disabled: c.disabled,
+    }
+}
+
+/// The account page's card an action belongs to (its redirect's anchor).
+fn account_card(action: &str) -> &'static str {
+    match action {
+        "takedown" => "a-takedown",
+        "suspend" | "unsuspend" => "a-suspend",
+        "deactivate" => "a-deactivate",
+        "private-block" | "invites" => "a-private",
+        "handle" => "a-handle",
+        "email" => "a-email",
+        "password" => "a-password",
+        _ => "main",
     }
 }
 
@@ -529,7 +546,11 @@ pub async fn account_action(
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     match result {
-        Ok(_) => web::redirect(&format!("{}?done={action}", account_href(&did))),
+        Ok(_) => web::redirect(&format!(
+            "{}?done={action}#{}",
+            account_href(&did),
+            account_card(&action)
+        )),
         Err(e) => render_account(&s, &op, &did, None, vec![e], StatusCode::BAD_REQUEST).await,
     }
 }
@@ -542,7 +563,16 @@ async fn delete_confirm(
     error: Option<String>,
     status: StatusCode,
 ) -> Response {
-    let mut sh = shell(s, op, PageId::Accounts).await;
+    let mut sh = shell(s, op, PageId::Accounts).await.under(vec![
+        Link {
+            href: PageId::Accounts.href().into(),
+            label: "Accounts".into(),
+        },
+        Link {
+            href: account_href(did),
+            label: format!("@{handle}"),
+        },
+    ]);
     sh.title = format!("Delete @{handle}?");
     web::render(
         &ConfirmPage {
@@ -761,7 +791,7 @@ pub async fn disable_invite(State(s): St, headers: HeaderMap, body: Bytes) -> Re
         )
         .await,
     ) {
-        Ok(_) => web::redirect("/admin/invites"),
+        Ok(_) => web::redirect("/admin/invites#invite-list"),
         Err(e) => {
             render_invites(
                 &s,
@@ -942,7 +972,15 @@ pub async fn operator_action(
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     match result {
-        Ok(_) => web::redirect("/admin/operators?done=1"),
+        Ok(_) => {
+            // Back to the part of the page the change was made in.
+            let card = match action.as_str() {
+                "create" => "op-add",
+                "revoke-token" => "token-list",
+                _ => "op-list",
+            };
+            web::redirect(&format!("/admin/operators?done=1#{card}"))
+        }
         Err(e) => render_operators(&s, &op, None, None, vec![e], StatusCode::BAD_REQUEST).await,
     }
 }

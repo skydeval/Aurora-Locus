@@ -453,12 +453,56 @@ pub struct Form {
     pub danger: bool,
 }
 
+/// Forms whose answer is another page on purpose: a wizard's next step, a
+/// theme change, a secret shown once, or leaving the account. They post the
+/// ordinary way; every other form saves in place.
+const FULL_PAGE: &[&str] = &[
+    "/admin/branding",
+    "/admin/hostname",
+    "/admin/import",
+    "/account/app-passwords",
+    "/account/appearance",
+    "/account/deactivate",
+    "/account/delete",
+    "/account/moving",
+    "/account/export",
+    "/account/identity",
+];
+
 impl Form {
     /// Whether it sends a file (and so `multipart/form-data`).
     #[must_use]
     pub fn has_file(&self) -> bool {
         self.inputs.iter().any(|i| i.kind == "file")
     }
+
+    /// Its card's id, from its action (`/admin/email/test` → `f-email-test`):
+    /// the redirect's anchor and the section a live save replaces.
+    #[must_use]
+    pub fn anchor(&self) -> String {
+        anchor_for(&self.action)
+    }
+
+    /// Whether it saves in place (see [`FULL_PAGE`]).
+    #[must_use]
+    pub fn live(&self) -> bool {
+        !self.get && !FULL_PAGE.iter().any(|p| self.action.starts_with(p))
+    }
+}
+
+/// A form card's id for its action.
+#[must_use]
+pub fn anchor_for(action: &str) -> String {
+    let path = action.split(['?', '#']).next().unwrap_or("");
+    let rest = path
+        .strip_prefix("/admin/")
+        .or_else(|| path.strip_prefix("/account/"))
+        .unwrap_or(path.trim_start_matches('/'));
+    let slug: String = rest
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("f-{slug}")
 }
 
 /// A preview of a page in a frame.

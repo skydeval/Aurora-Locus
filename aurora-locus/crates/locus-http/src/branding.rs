@@ -665,7 +665,8 @@ async fn editor_render(
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         status,
-        &format!("{}; frame-src 'self'", locus_web::assets::CSP),
+        // A console page: its one script, and the previews in frames.
+        &format!("{}; frame-src 'self'", locus_web::assets::CSP_LIVE),
     )
 }
 

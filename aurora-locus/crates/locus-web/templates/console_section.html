@@ -17,10 +17,10 @@
 {% endif %}
 {% if !forms.is_empty() %}
 <div class="settings-cards">
-{% for f in forms %}{% if !f.title.is_empty() || loop.first %}<div class="card">{% endif %}
+{% for f in forms %}{% if !f.title.is_empty() || loop.first %}<div class="card" id="{{ f.anchor() }}"{% if f.live() %} data-section{% endif %}>{% endif %}
 {% if !f.title.is_empty() %}<h2>{{ f.title }}</h2>{% endif %}
 {% if !f.text.is_empty() %}<p>{{ f.text }}</p>{% endif %}
-<form class="stack" method="{% if f.get %}get{% else %}post{% endif %}" action="{{ f.action }}"{% if f.has_file() %} enctype="multipart/form-data"{% endif %}>
+<form class="stack" method="{% if f.get %}get{% else %}post{% endif %}" action="{{ f.action }}"{% if f.has_file() %} enctype="multipart/form-data"{% endif %}{% if !f.live() %} data-full{% endif %}{% if f.danger %} data-confirm="{{ f.button }}?"{% endif %}>
 {% if !f.get %}<input type="hidden" name="csrf" value="{{ csrf }}">{% endif %}
 {% for (k, v) in f.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">
 {% endfor %}
@@ -44,12 +44,12 @@
 </div>
 {% endif %}
 {% for t in tables %}
-<div id="live-table-{{ loop.index }}" data-live-part>
+<div id="live-table-{{ loop.index }}" data-live-part data-section>
 <h2>{{ t.title }}</h2>
 <div class="scroll"><table>
 <thead><tr>{% for (class, label) in t.cols %}<th class="{{ class }}">{{ label }}</th>{% endfor %}</tr></thead>
 <tbody>
-{% for r in t.rows %}<tr>{% for c in r %}<td class="{{ c.class }}">{% if let Some(b) = c.button %}<form class="inline" method="post" action="{{ b.action }}"><input type="hidden" name="csrf" value="{{ csrf }}">{% for (k, v) in b.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}<button type="submit" class="{% if b.danger %}danger{% else %}secondary{% endif %}">{{ b.label }}</button></form>{% else %}{% if c.class == "text" %}<div class="cell-text">{% endif %}{% if !c.href.is_empty() %}<a href="{{ c.href }}">{% endif %}{% if !c.pill.is_empty() %}<span class="pill {{ c.pill }}">{{ c.text }}</span>{% else if c.code %}<code>{{ c.text }}</code>{% else %}{{ c.text }}{% endif %}{% if !c.href.is_empty() %}</a>{% endif %}{% if c.class == "text" %}</div>{% endif %}{% endif %}</td>{% endfor %}</tr>
+{% for r in t.rows %}<tr>{% for c in r %}<td class="{{ c.class }}">{% if let Some(b) = c.button %}<form class="inline" method="post" action="{{ b.action }}"{% if b.danger %} data-confirm="{{ b.label }}?"{% endif %}><input type="hidden" name="csrf" value="{{ csrf }}">{% for (k, v) in b.hidden %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}<button type="submit" class="{% if b.danger %}danger{% else %}secondary{% endif %}">{{ b.label }}</button></form>{% else %}{% if c.class == "text" %}<div class="cell-text">{% endif %}{% if !c.href.is_empty() %}<a href="{{ c.href }}">{% endif %}{% if !c.pill.is_empty() %}<span class="pill {{ c.pill }}">{{ c.text }}</span>{% else if c.code %}<code>{{ c.text }}</code>{% else %}{{ c.text }}{% endif %}{% if !c.href.is_empty() %}</a>{% endif %}{% if c.class == "text" %}</div>{% endif %}{% endif %}</td>{% endfor %}</tr>
 {% else %}<tr><td class="text" colspan="{{ t.cols.len() }}"><div class="cell-text">{{ t.empty }}</div></td></tr>
 {% endfor %}</tbody>
 </table></div>

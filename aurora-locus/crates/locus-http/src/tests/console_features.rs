@@ -52,11 +52,11 @@ async fn the_hostname_wizard_prepares_checks_confirms_and_cancels() {
 
     // Every role sees the page; only an owner gets the prepare form.
     for b in [&owner, &admin, &viewer] {
-        let (st, headers, page) = b.get(&h, "/admin/hostname").await;
+        let (st, _, page) = b.get(&h, "/admin/hostname").await;
         assert_eq!(st, StatusCode::OK, "{page}");
         assert!(page.contains("pds.example.com"), "{page}");
         assert!(
-            !csp(&headers).contains("script-src"),
+            !page.contains("data-live="),
             "nothing runs yet, so the page isn't live"
         );
     }
@@ -237,7 +237,11 @@ async fn the_hostname_wizard_prepares_checks_confirms_and_cancels() {
             && page.contains(&format!("<code>{new}</code>")),
         "{page}"
     );
-    assert!(!csp(&headers).contains("script-src"));
+    assert!(
+        !page.contains("data-live="),
+        "not refreshed while confirming"
+    );
+    assert_eq!(csp(&headers), locus_web::assets::CSP_LIVE, "{page}");
     assert_eq!(
         admin.get(&h, "/admin/hostname/confirm").await.0,
         StatusCode::FORBIDDEN,
@@ -373,8 +377,9 @@ async fn a_running_hostname_migration_shows_progress_stragglers_and_closes() {
     );
     assert!(page.contains(r#"data-live="/admin/live?page=/admin/hostname""#));
     assert!(page.contains(&format!(
-        r#"<script src="{}" defer></script>"#,
-        *locus_web::assets::JS_HREF
+        r#"<script src="{}" integrity="{}" defer></script>"#,
+        *locus_web::assets::JS_HREF,
+        *locus_web::assets::JS_SRI
     )));
     assert!(!page.contains("Close the migration"), "admins can't close");
     // The banner on every page.
@@ -561,13 +566,10 @@ async fn status_pages_refresh_over_server_sent_events() {
             "{path}: scripts and connections from this site only"
         );
     }
+    // Other pages load the script (to save in place) but don't listen.
     for path in ["/admin/settings", "/admin/audit", "/admin/import"] {
-        let (_, headers, page) = viewer.get(&h, path).await;
-        assert!(
-            !page.contains("<script") && !page.contains("data-live="),
-            "{path}"
-        );
-        assert_eq!(csp(&headers), locus_web::assets::CSP, "{path}");
+        let (_, _, page) = viewer.get(&h, path).await;
+        assert!(!page.contains("data-live="), "{path}");
     }
     let js = locus_web::assets::JS_HREF.clone();
     let (st, headers, body) = h.raw("GET", &js, None, vec![], &[]).await;
@@ -773,7 +775,7 @@ async fn the_console_shows_the_reference_import_report() {
     for b in [&owner, &admin, &mo, &viewer] {
         let (st, headers, page) = b.get(&h, "/admin/import").await;
         assert_eq!(st, StatusCode::OK, "{page}");
-        assert_eq!(csp(&headers), locus_web::assets::CSP);
+        assert_eq!(csp(&headers), locus_web::assets::CSP_LIVE);
         assert!(
             page.contains("records") && page.contains(">17<") && page.contains(">2<"),
             "{page}"

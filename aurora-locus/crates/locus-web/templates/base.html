@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="{{ shell.css }}">
 {% if let Some(d) = shell.dress %}{% if !d.css.is_empty() %}<link rel="stylesheet" href="{{ d.css }}">
 {% endif %}{% if !d.favicon.is_empty() %}<link rel="icon" href="{{ d.favicon }}">
-{% endif %}{% endif %}{% if !shell.live.is_empty() %}<script src="{{ shell.js() }}" defer></script>
+{% endif %}{% endif %}{% if shell.scripted() %}<script src="{{ shell.js() }}" integrity="{{ shell.js_sri() }}" defer></script>
 {% endif %}</head>
 <body>
 {% if let Some(nav) = shell.nav %}
@@ -47,6 +47,9 @@
 <div class="banner{% if b.bad %} bad{% endif %}">{{ b.text }}{% if let Some(link) = b.link %} <a href="{{ link.href }}">{{ link.label }}</a>.{% endif %}</div>
 {% endfor %}
 <p class="eyebrow">{{ nav.eyebrow() }}</p>
+{% endif %}
+{% if let Some(up) = shell.up() %}<nav class="crumbs" aria-label="Breadcrumb"><ol>{% for c in shell.crumbs %}<li><a href="{{ c.href }}">{{ c.label }}</a></li>{% endfor %}<li aria-current="page">{{ shell.title }}</li></ol></nav>
+<p class="back"><a href="{{ up.href }}">← {{ up.label }}</a></p>
 {% endif %}
 {% if let Some(d) = shell.dress %}{% if !d.blurb.is_empty() %}<p class="muted brand-blurb">{{ d.blurb }}</p>
 {% endif %}{% endif %}{% block content %}{% endblock %}

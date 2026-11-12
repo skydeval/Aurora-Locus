@@ -1111,15 +1111,22 @@ pub async fn save_setting(State(s): St, headers: HeaderMap, body: Bytes) -> Resp
         Ok(()) => {
             let _ = s.settings.refresh().await;
             let sep = if back.contains('?') { '&' } else { '?' };
+            // Back to the setting's own card on the page it came from.
             web::redirect(&format!(
-                "{back}{sep}saved={}",
+                "{back}{sep}saved={}#s-{key}",
                 url::form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>()
             ))
         }
         Err(e) => {
-            // Show the page it came from with the problem.
+            // The setting's card with the problem, under the page it came
+            // from (a live save swaps it into that page).
             let snap = s.snapshot();
-            let mut shell = shell(&s, &op, PageId::Settings).await;
+            let path = back.split('?').next().unwrap_or("");
+            let from = menu::locate(path).unwrap_or(PageId::Settings);
+            let mut shell = shell(&s, &op, from).await.under(vec![Link {
+                href: back.clone(),
+                label: from.title(),
+            }]);
             shell.title = "Not saved".into();
             let field = setting_field(&snap, def);
             web::render(
@@ -1571,7 +1578,7 @@ pub async fn end_session(State(s): St, headers: HeaderMap, body: Bytes) -> Respo
     if mine {
         let _ = s.store.delete_operator_session(target).await;
     }
-    web::redirect("/admin/security")
+    web::redirect("/admin/security#sec-sessions")
 }
 
 // ---------------------------------------------------------------- Account portal

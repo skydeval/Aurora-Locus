@@ -565,6 +565,14 @@ label.choice input { margin: 0; accent-color: var(--accent); }
 .skip:focus { top: 16px; }
 .eyebrow { margin: 0; font-size: 12.48px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); font-weight: 700; }
 
+/* A nested page's trail and its way back up. */
+.layout nav.crumbs ol { display: flex; flex-wrap: wrap; gap: 0.35rem; list-style: none; margin: 0.6rem 0 0; padding: 0; font-size: 0.9rem; color: var(--muted); }
+.layout nav.crumbs li + li::before { content: "·"; margin-right: 0.35rem; }
+.layout nav.crumbs li[aria-current="page"] { color: var(--fg); }
+.layout p.back { margin: 0.4rem 0 0; font-size: 0.9rem; }
+/* A section saving in place. */
+.layout [data-section][aria-busy="true"] { opacity: .6; transition: opacity .15s; }
+
 /* Tabs inside a page. */
 .layout nav.tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; margin: 0 0 1.25rem; border-bottom: 1px solid var(--line); }
 .layout nav.tabs a { display: inline-flex; align-items: center; gap: 0.4rem; padding: 0.45rem 0.85rem; margin-bottom: -1px; border-bottom: 2px solid transparent; color: var(--muted); font-weight: 600; font-size: 0.92rem; }

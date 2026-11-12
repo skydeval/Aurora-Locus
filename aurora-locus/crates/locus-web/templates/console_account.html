@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>@{{ handle }}</h1>
-<p class="muted"><code>{{ did }}</code> · <a href="/admin/accounts">All accounts</a></p>
+<p class="muted"><code>{{ did }}</code></p>
 {% for e in errors %}<div class="banner bad" role="alert">{{ e }}</div>
 {% endfor %}
 {% if let Some(n) = notice %}<div class="banner ok" role="status">{{ n }}</div>{% endif %}
-<div class="grid">
+<div class="grid" id="a-summary" data-follows>
 <div class="card">
 <h2>Account</h2>
 {% for f in facts %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v{% if !f.class.is_empty() %} {{ f.class }}{% endif %}">{{ f.value }}</span></div>
@@ -26,20 +26,20 @@
 {% if can_moderate %}
 <h2>Moderation</h2>
 <div class="settings-cards">
-<div class="card">
+<div class="card" id="a-takedown" data-section>
 <h3>Takedown</h3>
 {% if taken_down %}
 <p>The account is taken down: it can't sign in, and its repo isn't served.</p>
 <form method="post" action="{{ base }}/takedown"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="false">
 <div class="row"><button type="submit" class="secondary">Reverse the takedown</button></div></form>
 {% else %}
-<form class="stack" method="post" action="{{ base }}/takedown"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
+<form class="stack" method="post" action="{{ base }}/takedown" data-confirm="Take down @{{ handle }}?"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
 <label for="ref">Reference <span class="muted">(optional: a report or case id)</span></label>
 <input type="text" id="ref" name="ref">
 <div class="row"><button type="submit" class="danger">Take down</button></div></form>
 {% endif %}
 </div>
-<div class="card">
+<div class="card" id="a-suspend" data-section>
 <h3>Suspend</h3>
 {% if suspended %}
 <p>The account is suspended: it can't sign in, and its repo isn't served. The suspension lifts by itself at the time shown above.</p>
@@ -47,7 +47,7 @@
 <div class="row"><button type="submit" class="secondary">Lift the suspension now</button></div></form>
 {% else if active %}
 <p>A suspension works like a takedown for a set time: no sign-in, no writes, and its repo isn't served. It lifts by itself.</p>
-<form class="stack" method="post" action="{{ base }}/suspend"><input type="hidden" name="csrf" value="{{ csrf }}">
+<form class="stack" method="post" action="{{ base }}/suspend" data-confirm="Suspend @{{ handle }}?"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="days">Days</label>
 <input type="number" id="days" name="days" value="7" min="1" max="3650" required>
 <label for="note">Note <span class="muted">(optional: why, or a report id)</span></label>
@@ -57,7 +57,7 @@
 <p>Only an active account can be suspended.</p>
 {% endif %}
 </div>
-<div class="card">
+<div class="card" id="a-deactivate" data-section>
 <h3>Deactivate</h3>
 {% if deactivated %}
 <p>The account is deactivated.</p>
@@ -65,15 +65,15 @@
 <div class="row"><button type="submit" class="secondary">Reactivate</button></div></form>
 {% else %}
 <p>Deactivating stops the account's repo being served, as if its owner had deactivated it. Its owner can reactivate it by signing in; to keep it off, take it down instead.</p>
-<form method="post" action="{{ base }}/deactivate"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
+<form method="post" action="{{ base }}/deactivate" data-confirm="Deactivate @{{ handle }}?"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="applied" value="true">
 <div class="row"><button type="submit" class="secondary">Deactivate</button></div></form>
 {% endif %}
 </div>
-<div class="card">
+<div class="card" id="a-private" data-section>
 <h3>Private posts and invites</h3>
-<form method="post" action="{{ base }}/private-block"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="blocked" value="{% if blocked %}false{% else %}true{% endif %}">
+<form method="post" action="{{ base }}/private-block"{% if !blocked %} data-confirm="Block private posts for @{{ handle }}?"{% endif %}><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="blocked" value="{% if blocked %}false{% else %}true{% endif %}">
 <div class="row"><button type="submit" class="secondary">{% if blocked %}Allow private posts again{% else %}Block private posts here{% endif %}</button></div></form>
-<form method="post" action="{{ base }}/invites"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="disabled" value="{% if invites_disabled %}false{% else %}true{% endif %}">
+<form method="post" action="{{ base }}/invites"{% if !invites_disabled %} data-confirm="Stop @{{ handle }}'s invite codes?"{% endif %}><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="disabled" value="{% if invites_disabled %}false{% else %}true{% endif %}">
 <div class="row"><button type="submit" class="secondary">{% if invites_disabled %}Let it make invite codes again{% else %}Stop its invite codes{% endif %}</button></div></form>
 </div>
 </div>
@@ -82,19 +82,19 @@
 {% if can_admin %}
 <h2>Credentials</h2>
 <div class="settings-cards">
-<div class="card">
+<div class="card" id="a-handle" data-section>
 <form class="stack" method="post" action="{{ base }}/handle"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="handle">Handle</label>
 <input type="text" id="handle" name="handle" value="{{ handle }}" spellcheck="false">
 <div class="row"><button type="submit" class="secondary">Change handle</button></div></form>
 </div>
-<div class="card">
+<div class="card" id="a-email" data-section>
 <form class="stack" method="post" action="{{ base }}/email"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="email">Email</label>
 <input type="email" id="email" name="email" value="{{ email }}">
 <div class="row"><button type="submit" class="secondary">Change email</button></div></form>
 </div>
-<div class="card">
+<div class="card" id="a-password" data-section>
 <form class="stack" method="post" action="{{ base }}/password"><input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="password">New password</label>
 <input type="password" id="password" name="password" autocomplete="new-password" required>
