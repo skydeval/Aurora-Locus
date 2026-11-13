@@ -125,7 +125,10 @@ async fn a_nested_page_shows_its_trail_and_actions_land_on_their_card() {
         page.contains(r#"<li><a href="/admin/accounts">Accounts</a></li><li aria-current="page">@nav.pds.example.com</li>"#)
             && page.contains(r#"<p class="back"><a href="/admin/accounts">← Accounts</a></p>"#)
             && page.contains(r#"id="a-suspend" data-section"#)
-            && page.contains(r#"data-confirm="Take down @nav.pds.example.com?""#),
+            && page.contains(r#"data-confirm="Take down @nav.pds.example.com?""#)
+            // A new handle renames the whole page (title, trail, the
+            // confirm questions), so that form reloads it.
+            && page.contains(r#"/handle" data-full>"#),
         "{page}"
     );
     let csrf = hidden(&page, "csrf");
