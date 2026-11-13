@@ -19,10 +19,10 @@
 </div>
 {% endif %}
 <nav class="tabs" aria-label="Order"><a href="/admin/invites"{% if sort == "recent" %} aria-current="page"{% endif %}>Newest</a><a href="/admin/invites?sort=usage"{% if sort == "usage" %} aria-current="page"{% endif %}>Most used</a></nav>
-<div class="scroll"><table>
+<div class="scroll" id="invite-list" data-section><table>
 <thead><tr><th class="name">Code</th><th class="num">Left</th><th class="num">Used</th><th class="name">For</th><th class="when">Created</th><th class="state">State</th><th class="actions"></th></tr></thead>
 <tbody>
-{% for c in rows %}<tr><td class="name"><code>{{ c.code }}</code></td><td class="num">{{ c.available }}</td><td class="num">{{ c.uses }}</td><td class="name">{{ c.for_account }}</td><td class="when">{{ c.created }}</td><td class="state">{% if c.disabled %}<span class="pill off">disabled</span>{% else if c.available == 0 %}<span class="pill off">used up</span>{% else %}<span class="pill on">usable</span>{% endif %}</td><td class="actions">{% if can_moderate && !c.disabled && c.available > 0 %}<form class="inline" method="post" action="/admin/invites/disable"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ c.code }}"><button type="submit" class="secondary">Disable</button></form>{% endif %}</td></tr>
+{% for c in rows %}<tr><td class="name"><code>{{ c.code }}</code></td><td class="num">{{ c.available }}</td><td class="num">{{ c.uses }}</td><td class="name">{{ c.for_account }}</td><td class="when">{{ c.created }}</td><td class="state">{% if c.disabled %}<span class="pill off">disabled</span>{% else if c.available == 0 %}<span class="pill off">used up</span>{% else %}<span class="pill on">usable</span>{% endif %}</td><td class="actions">{% if can_moderate && !c.disabled && c.available > 0 %}<form class="inline" method="post" action="/admin/invites/disable" data-confirm="Disable {{ c.code }}?"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="code" value="{{ c.code }}"><button type="submit" class="secondary">Disable</button></form>{% endif %}</td></tr>
 {% else %}<tr><td class="text" colspan="7"><div class="cell-text">No invite codes yet.</div></td></tr>
 {% endfor %}</tbody>
 </table></div>

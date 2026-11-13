@@ -177,6 +177,11 @@ macro_rules! op_or_return {
 /// recent takedowns, and the moderation services.
 pub async fn moderation(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery>) -> Response {
     let op = op_or_return!(s, headers);
+    web::render(&moderation_page(s, op, q).await, StatusCode::OK)
+}
+
+/// The page itself (also shown, with the problem, when an action on it fails).
+async fn moderation_page(s: Arc<AppState>, op: Op, q: PageQuery) -> SectionPage {
     let mut p = section(&s, &op, PageId::Moderation, "Take down accounts, records and blobs, or reverse it. Reports from people go to the report service below, not here.").await;
     p.notice = q.done.map(|_| "Done.".into());
     let subject = q.subject.unwrap_or_default();
@@ -306,7 +311,7 @@ pub async fn moderation(State(s): St, headers: HeaderMap, Query(q): Query<PageQu
         ],
     ));
     p.fields = fields_under(&s, "moderation", &[]);
-    web::render(&p, StatusCode::OK)
+    p
 }
 
 /// `POST /admin/moderation/status`.
@@ -342,9 +347,14 @@ pub async fn moderation_status(State(s): St, headers: HeaderMap, body: Bytes) ->
     )
     .await)
     {
-        Ok(_) => web::redirect(&format!("{back}&done=1")),
+        Ok(_) => web::redirect(&format!("{back}&done=1#f-moderation-status")),
         Err(e) => {
-            let mut p = section(&s, &op, PageId::Moderation, "").await;
+            let q = PageQuery {
+                subject: Some(subject.to_owned()),
+                blob: Some(blob.to_owned()),
+                ..PageQuery::default()
+            };
+            let mut p = moderation_page(Arc::clone(&s), op, q).await;
             p.errors.push(e);
             web::render(&p, StatusCode::BAD_REQUEST)
         }
@@ -356,6 +366,11 @@ pub async fn moderation_status(State(s): St, headers: HeaderMap, body: Bytes) ->
 /// `GET /admin/scanning`: the scanner, and its matches waiting for review.
 pub async fn scanning(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery>) -> Response {
     let op = op_or_return!(s, headers);
+    web::render(&scanning_page(s, op, q).await, StatusCode::OK)
+}
+
+/// The page itself (also shown, with the problem, when an action on it fails).
+async fn scanning_page(s: Arc<AppState>, op: Op, q: PageQuery) -> SectionPage {
     let mut p = section(&s, &op, PageId::Scanning, "Uploads can go through a scanner before they're stored. A match is quarantined and waits here: clear a false positive to release it, or mark it reported to keep it held.").await;
     p.notice = q.done.map(|_| "Done.".into());
     let snap = s.snapshot();
@@ -425,7 +440,7 @@ pub async fn scanning(State(s): St, headers: HeaderMap, Query(q): Query<PageQuer
             "blobs.scan_unavailable",
         ],
     );
-    web::render(&p, StatusCode::OK)
+    p
 }
 
 /// `POST /admin/scanning/resolve`.
@@ -444,9 +459,9 @@ pub async fn resolve_review(State(s): St, headers: HeaderMap, body: Bytes) -> Re
     )
     .await)
     {
-        Ok(_) => web::redirect("/admin/scanning?done=1"),
+        Ok(_) => web::redirect("/admin/scanning?done=1#live-table-1"),
         Err(e) => {
-            let mut p = section(&s, &op, PageId::Scanning, "").await;
+            let mut p = scanning_page(Arc::clone(&s), op, PageQuery::default()).await;
             p.errors.push(e);
             web::render(&p, StatusCode::BAD_REQUEST)
         }
@@ -458,6 +473,11 @@ pub async fn resolve_review(State(s): St, headers: HeaderMap, body: Bytes) -> Re
 /// `GET /admin/private`: kryphocron's state, rotation and audit events.
 pub async fn private(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery>) -> Response {
     let op = op_or_return!(s, headers);
+    web::render(&private_page(s, op, q).await, StatusCode::OK)
+}
+
+/// The page itself (also shown, with the problem, when an action on it fails).
+async fn private_page(s: Arc<AppState>, op: Op, q: PageQuery) -> SectionPage {
     let mut p = section(&s, &op, PageId::Private, "Private posts are stored encoded and shown only to the audience their author picks. Their encoding rotates on a schedule.").await;
     p.notice = q.done.map(|_| {
         "A new generation started; posts are re-encoded under it over the rotation period.".into()
@@ -606,7 +626,7 @@ pub async fn private(State(s): St, headers: HeaderMap, Query(q): Query<PageQuery
             "kryphocron.rotation_period_days",
         ],
     );
-    web::render(&p, StatusCode::OK)
+    p
 }
 
 /// `POST /admin/private/rotate`.
@@ -616,9 +636,9 @@ pub async fn rotate(State(s): St, headers: HeaderMap, body: Bytes) -> Response {
         Err(r) => return r,
     };
     match api(crate::locus_admin::rotate_now(State(Arc::clone(&s)), op.api_headers()).await) {
-        Ok(_) => web::redirect("/admin/private?done=1"),
+        Ok(_) => web::redirect("/admin/private?done=1#f-private-rotate"),
         Err(e) => {
-            let mut p = section(&s, &op, PageId::Private, "").await;
+            let mut p = private_page(Arc::clone(&s), op, PageQuery::default()).await;
             p.errors.push(e);
             web::render(&p, StatusCode::BAD_REQUEST)
         }

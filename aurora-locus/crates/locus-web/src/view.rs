@@ -20,9 +20,11 @@ pub struct Shell {
     pub nav: Option<Nav>,
     /// The operator's branding, on the pages account holders see.
     pub dress: Option<Dress>,
-    /// A live status page's event stream (the page loads the one script);
-    /// empty for every other page.
+    /// A live status page's event stream; empty for every other page.
     pub live: String,
+    /// A nested page's ancestors, outermost first (a breadcrumb trail, and
+    /// the last one as the way back); empty on a top-level page.
+    pub crumbs: Vec<Link>,
 }
 
 /// Branding on a page: its stylesheet, icons, links and text.
@@ -52,6 +54,7 @@ impl Shell {
             nav: None,
             dress: None,
             live: String::new(),
+            crumbs: Vec::new(),
         }
     }
 
@@ -65,13 +68,40 @@ impl Shell {
             nav: Some(nav),
             dress: None,
             live: String::new(),
+            crumbs: Vec::new(),
         }
     }
 
-    /// The script's path (live pages only load it).
+    /// The same page nested under `crumbs` (outermost first).
+    #[must_use]
+    pub fn under(mut self, crumbs: Vec<Link>) -> Self {
+        self.crumbs = crumbs;
+        self
+    }
+
+    /// The page one level up, on a nested page.
+    #[must_use]
+    pub fn up(&self) -> Option<&Link> {
+        self.crumbs.last()
+    }
+
+    /// Whether the page loads the script: every signed-in page (live
+    /// saving) and the live status pages.
+    #[must_use]
+    pub fn scripted(&self) -> bool {
+        self.nav.is_some() || !self.live.is_empty()
+    }
+
+    /// The script's path.
     #[must_use]
     pub fn js(&self) -> String {
         crate::assets::JS_HREF.clone()
+    }
+
+    /// The script's subresource-integrity hash.
+    #[must_use]
+    pub fn js_sri(&self) -> String {
+        crate::assets::JS_SRI.clone()
     }
 
     /// Whether the branding has a logo (it replaces the built-in mark).
@@ -348,7 +378,10 @@ mod tests {
             let mut text = std::fs::read_to_string(&path).unwrap();
             // The script tags allowed are external, by path, nothing inline:
             // the bundled console script and the hCaptcha widget.
-            text = text.replace(r#"<script src="{{ shell.js() }}" defer></script>"#, "");
+            text = text.replace(
+                r#"<script src="{{ shell.js() }}" integrity="{{ shell.js_sri() }}" defer></script>"#,
+                "",
+            );
             text = text.replace(
                 r#"<script src="{{ hcaptcha_script }}" async defer></script>"#,
                 "",

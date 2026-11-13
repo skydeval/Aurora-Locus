@@ -449,7 +449,10 @@ async fn confirm_render(
     error: Option<String>,
     status: StatusCode,
 ) -> Response {
-    let mut sh = shell(s, op, PageId::Hostname).await;
+    let mut sh = shell(s, op, PageId::Hostname).await.under(vec![Link {
+        href: PageId::Hostname.href().into(),
+        label: PageId::Hostname.title(),
+    }]);
     sh.live.clear();
     sh.title = format!("Move this server to {host}?");
     web::render(

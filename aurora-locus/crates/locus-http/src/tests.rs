@@ -6,6 +6,7 @@ mod blobs;
 mod bulk;
 mod conformance;
 mod console_features;
+mod console_navigation;
 mod email_providers;
 mod getrepo_race;
 mod identity;
@@ -10864,13 +10865,12 @@ async fn every_console_page_renders_for_each_role_under_the_csp() {
                 continue;
             }
             assert_eq!(st, StatusCode::OK, "{who} {}: {body}", page.href);
-            // The base policy; the branding editor adds frame-src 'self' for
-            // its previews, and live status pages their one script.
+            // Every console page runs its one script (saving in place); the
+            // branding editor adds frame-src 'self' for its previews.
             let csp = headers["content-security-policy"].to_str().unwrap();
             assert!(
-                csp == locus_web::assets::CSP
-                    || csp == format!("{}; frame-src 'self'", locus_web::assets::CSP)
-                    || (page.id.live() && csp == locus_web::assets::CSP_LIVE),
+                csp == locus_web::assets::CSP_LIVE
+                    || csp == format!("{}; frame-src 'self'", locus_web::assets::CSP_LIVE),
                 "{}: {csp}",
                 page.href
             );

@@ -382,6 +382,20 @@ The pages are server-rendered HTML with all assets built into the binary.
 They load nothing from a CDN, work without JavaScript for core actions, and
 use a strict content security policy.
 
+In the console and the portal, a nested page (an account, its deletion, a
+confirmation) shows a breadcrumb trail and a link one level up, and every
+save lands back on the card it was made in (`#` its id). Signed-in pages
+load the one built-in script (with its integrity hash; the page's policy
+allows scripts from this site only): a form in a card then saves in place,
+replacing just that card with its new state and its notice or error, what
+was typed kept on an error, and parts elsewhere that the change affects
+updated too. Removals ask first. Forms that lead somewhere else on purpose
+stay full page loads: signing in and out, the theme and branding, wizard
+steps, and anything that shows a secret once (new invite codes, API
+tokens, app passwords, a sign-in code app's key). A new item opens its own
+page; a removal returns to the list. Without JavaScript every form posts
+and redirects as before.
+
 ### Operators and roles
 
 Operators are separate from atproto accounts. Each has a username, a

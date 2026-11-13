@@ -9,7 +9,7 @@
 <h2>Sign-in code app</h2>
 {% if totp_on %}
 <p><span class="pill on">On</span> Signing in asks for a code from your app after your password.</p>
-<form class="stack" method="post" action="/admin/security/totp/off">
+<form class="stack" method="post" action="/admin/security/totp/off" data-confirm="Turn off the sign-in code app?">
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="off-code">To turn it off, enter a current code</label>
 <input type="text" id="off-code" name="code" inputmode="numeric" autocomplete="one-time-code" required>
@@ -35,7 +35,7 @@
 </form>
 {% endif %}
 </div>
-<div class="card">
+<div class="card" id="sec-password" data-section>
 <h2>Password</h2>
 <form class="stack" method="post" action="/admin/security/password">
 <input type="hidden" name="csrf" value="{{ csrf }}">
@@ -51,10 +51,10 @@
 </div>
 </div>
 <h2>Where you're signed in</h2>
-<div class="scroll"><table>
+<div class="scroll" id="sec-sessions" data-section><table>
 <thead><tr><th class="when">Started</th><th class="when">Last used</th><th class="text">From</th><th class="actions"></th></tr></thead>
 <tbody>
-{% for s in sessions %}<tr><td class="when">{{ s.started }}</td><td class="when">{{ s.last_used }}</td><td class="text"><div class="cell-text">{{ s.from }}</div></td><td class="actions">{% if s.this_one %}<span class="pill info">This one</span>{% else %}<form class="inline" method="post" action="/admin/security/sign-out"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="session" value="{{ s.id }}"><button type="submit" class="secondary">Sign out</button></form>{% endif %}</td></tr>
+{% for s in sessions %}<tr><td class="when">{{ s.started }}</td><td class="when">{{ s.last_used }}</td><td class="text"><div class="cell-text">{{ s.from }}</div></td><td class="actions">{% if s.this_one %}<span class="pill info">This one</span>{% else %}<form class="inline" method="post" action="/admin/security/sign-out" data-confirm="Sign out that session?"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="session" value="{{ s.id }}"><button type="submit" class="secondary">Sign out</button></form>{% endif %}</td></tr>
 {% endfor %}</tbody>
 </table></div>
 {% endblock %}

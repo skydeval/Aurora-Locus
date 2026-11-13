@@ -15,7 +15,8 @@ pub static CSS_HREF: LazyLock<String> = LazyLock::new(|| {
     format!("/static/locus-{}.css", &hash[..12])
 });
 
-/// The one script: live refresh on the console's status pages.
+/// The one script: the console's live saving, and live refresh on its
+/// status pages.
 pub const JS: &str = include_str!("../static/locus.js");
 
 /// The script's path: its content hash in the name.
@@ -23,6 +24,19 @@ pub static JS_HREF: LazyLock<String> = LazyLock::new(|| {
     let hash = hex::encode(sha2::Sha256::digest(JS.as_bytes()));
     format!("/static/locus-{}.js", &hash[..12])
 });
+
+/// The script's subresource integrity (`integrity="sha256-..."`).
+pub static JS_SRI: LazyLock<String> = LazyLock::new(|| {
+    use base64::Engine;
+    format!(
+        "sha256-{}",
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(JS.as_bytes()))
+    )
+});
+
+/// What a page that loads the script contains (markup, so no escaped text
+/// can match it): such a page gets [`CSP_LIVE`].
+pub static JS_TAG: LazyLock<String> = LazyLock::new(|| format!("<script src=\"{}\"", *JS_HREF));
 
 /// Every page's `Content-Security-Policy`: nothing from anywhere else, no
 /// scripts, no inline anything.
